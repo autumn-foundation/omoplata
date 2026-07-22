@@ -67,3 +67,43 @@ fn status_uninitialized() {
         .success()
         .stdout(predicate::str::contains("not an omoplata repository"));
 }
+
+#[test]
+fn hash_object_then_cat_object() {
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let file = dir.path().join("hello.txt");
+    std::fs::write(&file, b"hello omoplata\n").unwrap();
+
+    let out = omo()
+        .args(["hash-object", "--repo"])
+        .arg(dir.path())
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let id = String::from_utf8(out.stdout).unwrap();
+    let id = id.trim();
+    assert!(id.starts_with("sha256:"), "unexpected id: {id}");
+
+    omo()
+        .args(["cat-object", "--repo"])
+        .arg(dir.path())
+        .arg(id)
+        .assert()
+        .success()
+        .stdout("hello omoplata\n");
+}
+
+#[test]
+fn cat_object_unknown_fails() {
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+    omo()
+        .args(["cat-object", "--repo"])
+        .arg(dir.path())
+        .arg("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        .assert()
+        .failure();
+}

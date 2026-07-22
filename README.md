@@ -21,10 +21,12 @@ cargo install --path crates/omoplata-cli
 ## Usage
 
 ```
-omo --help              # show usage and available subcommands
-omo --version           # print the version
-omo init [path]         # create a new omoplata repository (defaults to .)
-omo status [path]       # show repository status (defaults to .)
+omo --help                          # show usage and available subcommands
+omo --version                       # print the version
+omo init [path]                     # create a new omoplata repository (defaults to .)
+omo status [path]                   # show repository status (defaults to .)
+omo hash-object [--repo DIR] <path> # store a file as a blob, print its sha256: id (- reads stdin)
+omo cat-object [--repo DIR] <id>    # print a stored object: blob bytes, or a tree listing
 ```
 
 Example:
@@ -39,6 +41,10 @@ omo status myrepo
 ```
 
 `omo init` creates a `.omoplata/` control directory containing `objects/`, `refs/`, and a `config` file.
+
+## Object store
+
+Objects are content-addressed by a hash-agile `ObjectId` (`<alg>:<hex>`, SHA-256 in v1) computed over a canonical, self-describing serialization. They are persisted as loose files under `.omoplata/objects/<alg>/<xx>/<rest>`, and every read verifies that the stored bytes still hash to the requested id. Two object kinds exist today — **blobs** (opaque bytes) and **trees** (sorted, name-addressed entries pointing at blobs or subtrees) — with more kinds to come. See [`docs/adr/0002-loose-object-store.md`](docs/adr/0002-loose-object-store.md) for the storage decision.
 
 ## Layout
 

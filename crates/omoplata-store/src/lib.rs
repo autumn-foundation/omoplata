@@ -1,7 +1,16 @@
 //! On-disk repository store for omoplata.
 //!
-//! This is an early scaffold: it manages the `.omoplata/` control directory
-//! that later tiers (store, algebra, git interop) will build on.
+//! Per the design doc's §7 crate table, this crate owns the content-addressed
+//! **object store** and the **tree model** over it. [`Repository`] manages the
+//! `.omoplata/` control directory and reads and writes objects addressed by a
+//! hash-agile [`ObjectId`] (SHA-256 in v1). Objects are stored as loose files
+//! (see `docs/adr/0002-loose-object-store.md`).
+
+mod object;
+
+pub use object::{
+    Blob, EntryKind, HashAlg, Object, ObjectError, ObjectId, ObjectKind, Tree, TreeEntry,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +27,15 @@ pub enum StoreError {
     /// No control directory was found at the target root.
     #[error("no omoplata repository found at {0}")]
     NotInitialized(PathBuf),
+    /// The requested object is not present in the store.
+    #[error("object not found: {0}")]
+    ObjectNotFound(ObjectId),
+    /// A stored object's bytes do not hash to the id used to look it up.
+    #[error("integrity check failed for object {0}")]
+    Integrity(ObjectId),
+    /// An object could not be parsed.
+    #[error(transparent)]
+    Object(#[from] ObjectError),
     /// A filesystem operation failed.
     #[error("i/o error at {path}: {source}")]
     Io {
@@ -29,8 +47,8 @@ pub enum StoreError {
     },
 }
 
-fn io(path: impl Into<PathBuf>) -> impl FnOnce(std::io::Error) -> StoreError {
-    let path = path.into();
+fn io(path: impl AsRef<Path>) -> impl FnOnce(std::io::Error) -> StoreError {
+    let path = path.as_ref().to_path_buf();
     move |source| StoreError::Io { path, source }
 }
 
@@ -92,6 +110,81 @@ impl Repository {
     pub fn exists(root: impl AsRef<Path>) -> bool {
         root.as_ref().join(CONTROL_DIR).is_dir()
     }
+
+    /// Loose-object path for `id`: `.omoplata/objects/<alg>/<xx>/<rest>`.
+    fn object_path(&self, id: &ObjectId) -> PathBuf {
+        let hex = id.hex();
+        let (shard, rest) = hex.split_at(2);
+        self.control_dir()
+            .join("objects")
+            .join(id.alg().as_str())
+            .join(shard)
+            .join(rest)
+    }
+
+    /// Write an object into the store, returning its content address.
+    ///
+    /// Idempotent: an already-present object is left untouched. The write is
+    /// staged to a temp file and renamed into place so readers never observe a
+    /// partial object.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Io`] on any filesystem failure.
+    pub fn write_object(&self, object: &Object) -> Result<ObjectId, StoreError> {
+        let id = object.id();
+        let hex = id.hex();
+        let (shard, rest) = hex.split_at(2);
+        let dir = self
+            .control_dir()
+            .join("objects")
+            .join(id.alg().as_str())
+            .join(shard);
+        let path = dir.join(rest);
+        if path.exists() {
+            return Ok(id);
+        }
+        fs::create_dir_all(&dir).map_err(io(&dir))?;
+        let tmp = dir.join(format!(".tmp-{rest}"));
+        fs::write(&tmp, object.serialize()).map_err(io(&tmp))?;
+        fs::rename(&tmp, &path).map_err(io(&path))?;
+        Ok(id)
+    }
+
+    /// Read and verify an object by its content address.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::ObjectNotFound`] if absent, [`StoreError::Integrity`]
+    /// if the stored bytes do not hash to `id`, [`StoreError::Object`] if the
+    /// bytes are malformed, or [`StoreError::Io`] on filesystem failure.
+    pub fn read_object(&self, id: &ObjectId) -> Result<Object, StoreError> {
+        let path = self.object_path(id);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::ObjectNotFound(id.clone()));
+            }
+            Err(source) => return Err(StoreError::Io { path, source }),
+        };
+        let object = Object::deserialize(&bytes)?;
+        if &object.id_with(id.alg()) != id {
+            return Err(StoreError::Integrity(id.clone()));
+        }
+        Ok(object)
+    }
+
+    /// Whether an object with `id` is present.
+    #[must_use]
+    pub fn has_object(&self, id: &ObjectId) -> bool {
+        self.object_path(id).exists()
+    }
+
+    /// Convenience: store raw bytes as a blob and return its id.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::Io`] on any filesystem failure.
+    pub fn write_blob(&self, bytes: impl Into<Vec<u8>>) -> Result<ObjectId, StoreError> {
+        self.write_object(&Object::Blob(Blob::new(bytes)))
+    }
 }
 
 #[cfg(test)]
@@ -123,5 +216,77 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = Repository::open(dir.path()).unwrap_err();
         assert!(matches!(err, StoreError::NotInitialized(_)));
+    }
+
+    #[test]
+    fn blob_write_read_roundtrip() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let id = repo.write_blob(b"hello omoplata".to_vec()).unwrap();
+        assert!(repo.has_object(&id));
+        match repo.read_object(&id).unwrap() {
+            Object::Blob(b) => assert_eq!(b.bytes(), b"hello omoplata"),
+            other => panic!("expected blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_object_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let a = repo.write_blob(b"x".to_vec()).unwrap();
+        let b = repo.write_blob(b"x".to_vec()).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn read_missing_object_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let id = Object::Blob(Blob::new(b"nope".to_vec())).id();
+        assert!(matches!(
+            repo.read_object(&id),
+            Err(StoreError::ObjectNotFound(_))
+        ));
+        assert!(!repo.has_object(&id));
+    }
+
+    #[test]
+    fn tampered_object_fails_integrity() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let id = repo.write_blob(b"hello".to_vec()).unwrap();
+        let hex = id.hex();
+        let (shard, rest) = hex.split_at(2);
+        let path = repo
+            .control_dir()
+            .join("objects")
+            .join(id.alg().as_str())
+            .join(shard)
+            .join(rest);
+        fs::write(&path, b"blob 5\0HELLO").unwrap();
+        assert!(matches!(
+            repo.read_object(&id),
+            Err(StoreError::Integrity(_))
+        ));
+    }
+
+    #[test]
+    fn tree_write_read_roundtrip() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let blob_id = repo.write_blob(b"fn main() {}".to_vec()).unwrap();
+        let mut tree = Tree::new();
+        tree.insert("main.rs", EntryKind::Blob, blob_id.clone())
+            .unwrap();
+        let tree_id = repo.write_object(&Object::Tree(tree)).unwrap();
+        match repo.read_object(&tree_id).unwrap() {
+            Object::Tree(t) => {
+                let e = t.get("main.rs").unwrap();
+                assert_eq!(e.id, blob_id);
+                assert_eq!(e.kind, EntryKind::Blob);
+            }
+            other => panic!("expected tree, got {other:?}"),
+        }
     }
 }
