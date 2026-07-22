@@ -441,17 +441,21 @@ fn run() -> anyhow::Result<i32> {
 
 /// The path to the operation log inside a repository's control directory.
 fn oplog_path(repo: &Repository) -> PathBuf {
-    repo.control_dir().join("oplog.jsonl")
+    OpLog::path_in(repo)
 }
 
 /// `omo ref set <name> <commit>` — append a `SetRef` op and persist.
+///
+/// The whole load -> append -> save cycle runs under the repository's exclusive
+/// advisory lock ([`OpLog::mutate_locked`], ADR-0008) so concurrent `omo`
+/// processes serialize and no ref update is lost.
 fn cmd_ref_set(repo: Option<PathBuf>, name: String, commit: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
-    let path = oplog_path(&repo);
-    let mut log = OpLog::load(&path)?;
-    let op = log.set_ref(name.clone(), Some(CommitId::new(commit.clone())), None);
-    let seq = op.seq;
-    log.save(&path)?;
+    let seq = OpLog::mutate_locked(&repo, |log| {
+        Ok(log
+            .set_ref(name.clone(), Some(CommitId::new(commit.clone())), None)
+            .seq)
+    })?;
     println!("#{seq} set-ref {name} -> {commit}");
     Ok(())
 }
@@ -480,42 +484,51 @@ fn cmd_op_log(repo: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// `omo op undo` — undo the last op, reporting what was undone and the effect.
+///
+/// The whole load -> undo -> save cycle runs under the repository's exclusive
+/// advisory lock ([`OpLog::mutate_locked`], ADR-0008) so a concurrent writer's
+/// update cannot be lost. The `Undo` entry, target summary, and the resulting
+/// ref-change lines are computed inside the locked section and printed after it.
 fn cmd_op_undo(repo: Option<PathBuf>) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
-    let path = oplog_path(&repo);
-    let mut log = OpLog::load(&path)?;
-    let before = log.refs_now();
+    let outcome = OpLog::mutate_locked(&repo, |log| {
+        let before = log.refs_now();
 
-    let undo_op = log.undo()?;
-    let (undo_seq, target_seq) = match &undo_op.kind {
-        OpKind::Undo { target_seq } => (undo_op.seq, *target_seq),
-        // `undo` only ever appends an `Undo` variant.
-        _ => {
-            return Err(anyhow::anyhow!(
-                "internal error: undo did not append an Undo"
-            ))
+        let undo_op = log.undo()?;
+        // `undo` only ever appends an `Undo` variant; `None` marks the (unreachable)
+        // case so it can be surfaced as an error outside the lock, keeping the
+        // closure free of `anyhow`.
+        let (undo_seq, target_seq) = match &undo_op.kind {
+            OpKind::Undo { target_seq } => (undo_op.seq, *target_seq),
+            _ => return Ok(None),
+        };
+        let target_summary = log
+            .operations()
+            .get(target_seq as usize)
+            .map_or_else(|| format!("#{target_seq}"), |op| op.kind.summary());
+
+        let after = log.refs_now();
+        let mut lines = Vec::new();
+        for (name, old) in &before {
+            match after.get(name) {
+                None => lines.push(format!("  ref {name}: {old} -> (deleted)")),
+                Some(new) if new != old => lines.push(format!("  ref {name}: {old} -> {new}")),
+                Some(_) => {}
+            }
         }
-    };
-    let target_summary = log
-        .operations()
-        .get(target_seq as usize)
-        .map_or_else(|| format!("#{target_seq}"), |op| op.kind.summary());
+        for (name, new) in &after {
+            if !before.contains_key(name) {
+                lines.push(format!("  ref {name}: (created) -> {new}"));
+            }
+        }
+        Ok(Some((undo_seq, target_seq, target_summary, lines)))
+    })?
+    .ok_or_else(|| anyhow::anyhow!("internal error: undo did not append an Undo"))?;
 
-    let after = log.refs_now();
-    log.save(&path)?;
-
+    let (undo_seq, target_seq, target_summary, lines) = outcome;
     println!("#{undo_seq} undo of #{target_seq}: {target_summary}");
-    for (name, old) in &before {
-        match after.get(name) {
-            None => println!("  ref {name}: {old} -> (deleted)"),
-            Some(new) if new != old => println!("  ref {name}: {old} -> {new}"),
-            Some(_) => {}
-        }
-    }
-    for (name, new) in &after {
-        if !before.contains_key(name) {
-            println!("  ref {name}: (created) -> {new}");
-        }
+    for line in lines {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1052,6 +1065,11 @@ fn cmd_autorebase(
 ) -> anyhow::Result<i32> {
     // Require an initialized repository (this is content-on-a-base in the store).
     let repo = Repository::open(resolve(repo)?)?;
+
+    // Hold the exclusive advisory lock across the whole load -> mutate -> save
+    // critical section (ADR-0008) so a concurrent writer's op-log update is not
+    // lost. Released when `_guard` drops at the end of this function.
+    let _guard = repo.lock()?;
 
     // Store the three inputs as blobs; a commit id is the blob's object id.
     let base_commit = store_file_blob(&repo, &base)?;

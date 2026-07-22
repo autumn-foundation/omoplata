@@ -6,8 +6,10 @@
 //! hash-agile [`ObjectId`] (SHA-256 in v1). Objects are stored as loose files
 //! (see `docs/adr/0002-loose-object-store.md`).
 
+mod lock;
 mod object;
 
+pub use lock::{atomic_write, RepoLock};
 pub use object::{
     Blob, EntryKind, HashAlg, Object, ObjectError, ObjectId, ObjectKind, Tree, TreeEntry,
 };
@@ -17,6 +19,9 @@ use std::path::{Path, PathBuf};
 
 /// Name of the control directory placed at the root of an omoplata repository.
 pub const CONTROL_DIR: &str = ".omoplata";
+
+/// Name of the advisory lock file inside the control directory (ADR-0008).
+pub const LOCK_FILE: &str = "lock";
 
 /// Errors that can occur while operating on an omoplata store.
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +116,44 @@ impl Repository {
         root.as_ref().join(CONTROL_DIR).is_dir()
     }
 
+    /// Path to the advisory lock file (`.omoplata/lock`).
+    #[must_use]
+    pub fn lock_path(&self) -> PathBuf {
+        self.control_dir().join(LOCK_FILE)
+    }
+
+    /// Take an **exclusive**, blocking advisory lock on the repository's mutable
+    /// state, returning a guard that releases it on drop (ADR-0008).
+    ///
+    /// Hold the returned [`RepoLock`] across a whole `load -> mutate -> save`
+    /// critical section (ref updates, op-log appends, undo, auto-rebase) so the
+    /// read-modify-write cycle is atomic with respect to every other `omo`
+    /// process. Blocks until the lock is acquired; the lock is also released
+    /// automatically if the process dies while holding it, so there is no stale
+    /// lock to clean up. Read-only callers do not need the lock, because
+    /// [`atomic_write`] guarantees they never observe a torn file.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] if the lock file cannot be opened or locked.
+    pub fn lock(&self) -> Result<RepoLock, StoreError> {
+        RepoLock::acquire(self.lock_path())
+    }
+
+    /// Try to take the exclusive advisory lock **without blocking** (ADR-0008).
+    ///
+    /// Returns `Ok(Some(guard))` if the lock was free and is now held, or
+    /// `Ok(None)` if another process currently holds it — letting a caller
+    /// report "repository busy" instead of waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] if the lock file cannot be opened, or locking fails for
+    /// a reason other than the lock being held.
+    pub fn try_lock(&self) -> Result<Option<RepoLock>, StoreError> {
+        RepoLock::try_acquire(self.lock_path())
+    }
+
     /// Loose-object path for `id`: `.omoplata/objects/<alg>/<xx>/<rest>`.
     fn object_path(&self, id: &ObjectId) -> PathBuf {
         let hex = id.hex();
@@ -125,8 +168,9 @@ impl Repository {
     /// Write an object into the store, returning its content address.
     ///
     /// Idempotent: an already-present object is left untouched. The write is
-    /// staged to a temp file and renamed into place so readers never observe a
-    /// partial object.
+    /// crash-atomic (staged to a temp file, `fsync`ed, and `rename`d into place,
+    /// then the directory `fsync`ed — see [`atomic_write`]) so readers never
+    /// observe a partial object and a crash cannot leave a torn one.
     ///
     /// # Errors
     /// Returns [`StoreError::Io`] on any filesystem failure.
@@ -144,9 +188,7 @@ impl Repository {
             return Ok(id);
         }
         fs::create_dir_all(&dir).map_err(io(&dir))?;
-        let tmp = dir.join(format!(".tmp-{rest}"));
-        fs::write(&tmp, object.serialize()).map_err(io(&tmp))?;
-        fs::rename(&tmp, &path).map_err(io(&path))?;
+        atomic_write(&path, &object.serialize())?;
         Ok(id)
     }
 

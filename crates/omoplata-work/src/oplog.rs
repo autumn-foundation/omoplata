@@ -35,9 +35,10 @@
 //! in this environment, so each obligation is backed by an executable unit test.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use omoplata_identity::{ChangeId, CommitId, Phase};
+use omoplata_store::Repository;
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkError;
@@ -342,12 +343,63 @@ impl OpLog {
         self.fold_refs(seq)
     }
 
-    /// Persist the log to `path` as JSON-lines (one [`Operation`] per line).
+    /// The canonical op-log path within a repository: `.omoplata/oplog.jsonl`.
+    #[must_use]
+    pub fn path_in(repo: &Repository) -> PathBuf {
+        repo.control_dir().join("oplog.jsonl")
+    }
+
+    /// Perform a **locked, crash-atomic read-modify-append** on the repository's
+    /// op log (ADR-0008).
+    ///
+    /// Acquires the repository's exclusive advisory lock ([`Repository::lock`]),
+    /// loads the op log from its canonical path, runs `f` to mutate it, saves it
+    /// atomically, and releases the lock — all as one critical section. This is
+    /// the safe way for a writer to append: because the lock is held across the
+    /// whole `load -> mutate -> save`, two concurrent `omo` processes serialize,
+    /// so neither loses the other's update (closing the read-modify-write race)
+    /// and the mutation always folds its `old` state against the other writer's
+    /// committed result. The lock releases even if the process dies mid-section,
+    /// so there is no stale lock to clean up.
+    ///
+    /// `f` receives the freshly-loaded log and returns whatever value the caller
+    /// needs (e.g. the appended operation's `seq`); that value is returned once
+    /// the log has been persisted.
     ///
     /// # Errors
     ///
-    /// [`WorkError::Io`] on any filesystem failure, or [`WorkError::Decode`] if
-    /// an operation cannot be serialized (never expected for the closed set of
+    /// [`WorkError::Store`] if the lock cannot be acquired, and any error `f`
+    /// returns, or [`WorkError::Io`] / [`WorkError::Decode`] from the load/save.
+    pub fn mutate_locked<F, T>(repo: &Repository, f: F) -> Result<T, WorkError>
+    where
+        F: FnOnce(&mut OpLog) -> Result<T, WorkError>,
+    {
+        // Held for the whole load -> mutate -> save critical section; released on
+        // drop at the end of this function (and, inherently, on process death).
+        let _guard = repo.lock()?;
+        let path = Self::path_in(repo);
+        let mut log = OpLog::load(&path)?;
+        let out = f(&mut log)?;
+        log.save(&path)?;
+        Ok(out)
+    }
+
+    /// Persist the log to `path` as JSON-lines (one [`Operation`] per line).
+    ///
+    /// The write is **crash-atomic** (ADR-0008): the serialized log is staged to
+    /// a temp file, `fsync`ed, `rename`d over `path`, and the parent directory
+    /// `fsync`ed, via [`omoplata_store::atomic_write`]. A reader therefore always
+    /// observes either the complete previous log or the complete new log — never
+    /// a torn or truncated file — and a crash mid-write cannot corrupt the log.
+    /// This does **not** by itself provide mutual exclusion: a writer must hold
+    /// [`Repository::lock`] across `load -> mutate -> save` (see
+    /// [`mutate_locked`](Self::mutate_locked)) so a concurrent writer's update is
+    /// not lost.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkError::Store`] on any filesystem failure, or [`WorkError::Decode`]
+    /// if an operation cannot be serialized (never expected for the closed set of
     /// [`OpKind`] variants).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), WorkError> {
         let path = path.as_ref();
@@ -357,14 +409,17 @@ impl OpLog {
             buf.push_str(&line);
             buf.push('\n');
         }
-        std::fs::write(path, buf).map_err(|source| WorkError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        omoplata_store::atomic_write(path, buf.as_bytes())?;
+        Ok(())
     }
 
     /// Load a log from `path` (JSON-lines). A missing file yields an empty log,
     /// so callers can create the file lazily.
+    ///
+    /// Because [`save`](Self::save) publishes the file via an atomic `rename`,
+    /// `load` never observes a partially-written log even if a writer is saving
+    /// concurrently: it sees either the complete old file or the complete new
+    /// one.
     ///
     /// # Errors
     ///
@@ -607,6 +662,47 @@ mod tests {
     fn load_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let log = OpLog::load(dir.path().join("nope.jsonl")).unwrap();
+        assert!(log.operations().is_empty());
+    }
+
+    #[test]
+    fn mutate_locked_appends_and_persists_under_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Two sequential locked mutations both land and are folded correctly.
+        let seq0 = OpLog::mutate_locked(&repo, |log| {
+            Ok(log.set_ref("main", Some(commit("a")), None).seq)
+        })
+        .unwrap();
+        let seq1 = OpLog::mutate_locked(&repo, |log| {
+            Ok(log.set_ref("main", Some(commit("b")), None).seq)
+        })
+        .unwrap();
+        assert_eq!(seq0, 0);
+        assert_eq!(seq1, 1);
+
+        let log = OpLog::load(OpLog::path_in(&repo)).unwrap();
+        assert_eq!(log.operations().len(), 2);
+        assert_eq!(log.refs_now().get("main"), Some(&commit("b")));
+        // The second mutation captured the first's target as its `old` (I7): the
+        // lock made the read-modify-write see the committed state.
+        assert!(matches!(
+            log.operations()[1].kind,
+            OpKind::SetRef { old: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn mutate_locked_propagates_closure_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let err = OpLog::mutate_locked(&repo, |_log| -> Result<(), WorkError> {
+            Err(WorkError::NothingToUndo)
+        });
+        assert!(matches!(err, Err(WorkError::NothingToUndo)));
+        // A failed closure must not leave a partial op log; load stays empty.
+        let log = OpLog::load(OpLog::path_in(&repo)).unwrap();
         assert!(log.operations().is_empty());
     }
 }

@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 sha2 = "0.10"
+fs4 = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
