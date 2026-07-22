@@ -365,6 +365,55 @@ fn admit_conflicting_edits_exits_nonzero() {
 }
 
 #[test]
+fn rebase_over_independent_change_is_clean() {
+    // My change (edit line 1) and onto's change (edit line 3) are independent, so
+    // the rebase replays cleanly and both edits are present. Exit 0.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&mine, "a\nB\nc\nd\n").unwrap(); // I edit line 2
+    std::fs::write(&onto, "a\nb\nc\nD\n").unwrap(); // the branch edits line 4
+    omo()
+        .arg("rebase")
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .assert()
+        .success()
+        .stdout("a\nB\nc\nD\n")
+        .stderr(predicate::str::contains("rebase: clean"));
+}
+
+#[test]
+fn rebase_over_overlapping_change_carries_conflict() {
+    // My change and onto's change both edit line 2 differently: the rebase does
+    // NOT error — it carries the conflict forward as a value, renders mine/onto
+    // markers, and exits non-zero.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&mine, "a\nX\nc\n").unwrap();
+    std::fs::write(&onto, "a\nY\nc\n").unwrap();
+    omo()
+        .arg("rebase")
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< mine"))
+        .stdout(predicate::str::contains("======="))
+        .stdout(predicate::str::contains(">>>>>>> onto"))
+        .stdout(predicate::str::contains("X"))
+        .stdout(predicate::str::contains("Y"))
+        .stderr(predicate::str::contains("rebase: 1 conflict(s) carried"));
+}
+
+#[test]
 fn merge_file_txt_line_conflict_exits_nonzero() {
     // A non-.rs path uses the line fallback; a same-line divergent edit
     // conflicts and exits non-zero.

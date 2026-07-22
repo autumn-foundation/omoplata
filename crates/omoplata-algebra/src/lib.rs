@@ -43,12 +43,17 @@ mod doc;
 pub mod kernel;
 mod merge;
 mod patch;
+pub mod rebase;
 
 pub use commute::{combine, commute, Commutation};
 pub use doc::Doc;
 pub use kernel::{admit, certify, verify_witness, Admission, CommutationWitness};
 pub use merge::{merge3, Conflict, Merge, CONFLICT_END, CONFLICT_SEP, CONFLICT_START};
 pub use patch::{apply, diff, ApplyError, Hunk, Patch};
+pub use rebase::{
+    rebase, rebase_merge, rebase_stack, resolve, resolve_all, Rebased, REBASE_MINE, REBASE_ONTO,
+    REBASE_SEP,
+};
 
 #[cfg(test)]
 mod tests;

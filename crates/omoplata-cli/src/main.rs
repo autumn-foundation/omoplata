@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use omoplata_algebra::{diff, kernel, merge3, Admission, Doc};
+use omoplata_algebra::{diff, kernel, merge3, rebase, Admission, Doc};
 use omoplata_drivers::{select_driver, MergeInput};
 use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
 use omoplata_identity::{
@@ -112,6 +112,25 @@ enum Command {
         left: PathBuf,
         /// The right side.
         right: PathBuf,
+    },
+    /// Auto-rebase my change over a sibling `onto` change (§5.4, P3, I4).
+    ///
+    /// Replays my change (`base` → `mine`) on top of `onto` (which also derives
+    /// from `base`). Independent edits replay cleanly; overlaps are carried
+    /// forward as first-class **conflict values** rather than failing (§3 P3:
+    /// "merges and rebases never fail and never block"). Prints the rebased
+    /// document to stdout — conflicted spans rendered as
+    /// `<<<<<<< mine / ======= / >>>>>>> onto` marker blocks, though the
+    /// structured conflicts are the source of truth — and `rebase: clean` or
+    /// `rebase: <k> conflict(s) carried` to stderr. Exits 0 if clean, else
+    /// non-zero.
+    Rebase {
+        /// The common base file.
+        base: PathBuf,
+        /// My version (the change to replay).
+        mine: PathBuf,
+        /// The version to rebase onto (the new base).
+        onto: PathBuf,
     },
     /// List the Rust definitions in a source file, in source order.
     ///
@@ -296,6 +315,7 @@ fn run() -> anyhow::Result<i32> {
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
         Command::MergeFile { base, left, right } => cmd_merge_file(base, left, right),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
+        Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
         Command::Ref { action } => match action {
@@ -741,6 +761,35 @@ fn cmd_admit(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32
             eprintln!("conflict: {} region(s)", conflicts.len());
             Ok(1)
         }
+    }
+}
+
+/// `omo rebase <base> <mine> <onto>` — auto-rebase over conflict values
+/// (§5.4, §3 P3, invariant I4).
+///
+/// Replays my change (`base` → `mine`) on top of `onto`. A clean rebase prints
+/// the merged document and `rebase: clean` to stderr (exit 0). A rebase with
+/// overlaps carries the conflicts forward as values: the document is printed with
+/// `<<<<<<< mine / ======= / >>>>>>> onto` marker blocks (the structured conflicts
+/// remain the source of truth), `rebase: <k> conflict(s) carried` goes to stderr,
+/// and the exit code is non-zero — the rebase never errors on a conflict.
+fn cmd_rebase(base: PathBuf, mine: PathBuf, onto: PathBuf) -> anyhow::Result<i32> {
+    let base_doc = read_doc(&base)?;
+    let mine_doc = read_doc(&mine)?;
+    let onto_doc = read_doc(&onto)?;
+
+    let rebased = rebase(&base_doc, &mine_doc, &onto_doc);
+    // The result already renders conflicts with mine/onto markers (the human
+    // view); the structured `rebased.conflicts` are the source of truth.
+    print!("{}", rebased.result);
+
+    if rebased.clean {
+        eprintln!("rebase: clean");
+        Ok(0)
+    } else {
+        let k = rebased.conflicts.len();
+        eprintln!("rebase: {k} conflict(s) carried");
+        Ok(1)
     }
 }
 
