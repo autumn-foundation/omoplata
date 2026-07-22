@@ -258,8 +258,7 @@ fn import_tree_object(
                 let kind = mode_to_kind(&entry.mode)?;
                 let child_oid = GitOid::from_bytes(entry.oid);
                 let child_obj = resolve_object(child_oid, objects)?;
-                let child_id =
-                    import_tree_object(child_oid, &child_obj, objects, repo, oid_map)?;
+                let child_id = import_tree_object(child_oid, &child_obj, objects, repo, oid_map)?;
                 tree.insert(entry.name.clone(), kind, child_id)?;
             }
             repo.write_object(&Object::Tree(tree))?

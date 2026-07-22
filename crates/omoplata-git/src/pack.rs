@@ -204,7 +204,9 @@ pub fn parse_idx(bytes: &[u8]) -> Result<Vec<(GitOid, u64)>, GitError> {
         return Err(GitError::Pack("pack index: bad magic (not v2)"));
     }
     if read_be_u32(bytes, 4)? != 2 {
-        return Err(GitError::Pack("pack index: unsupported version (expected 2)"));
+        return Err(GitError::Pack(
+            "pack index: unsupported version (expected 2)",
+        ));
     }
     // Fanout: 256 big-endian u32; the last entry is the total object count.
     let fanout_start = 8;
@@ -273,7 +275,9 @@ fn parse_pack_header(bytes: &[u8]) -> Result<u32, GitError> {
     }
     let version = read_be_u32(bytes, 4)?;
     if version != 2 && version != 3 {
-        return Err(GitError::Pack("packfile: unsupported version (expected 2 or 3)"));
+        return Err(GitError::Pack(
+            "packfile: unsupported version (expected 2 or 3)",
+        ));
     }
     read_be_u32(bytes, 8)
 }
@@ -291,7 +295,8 @@ enum RawEntry {
 
 /// Read only the type id of the entry at `offset` (no inflate).
 fn peek_type(pack: &[u8], offset: u64) -> Result<u8, GitError> {
-    let mut pos = usize::try_from(offset).map_err(|_| GitError::Pack("packfile: offset overflow"))?;
+    let mut pos =
+        usize::try_from(offset).map_err(|_| GitError::Pack("packfile: offset overflow"))?;
     let (type_id, _) = read_entry_header(pack, &mut pos)?;
     Ok(type_id)
 }
@@ -311,9 +316,9 @@ fn parse_entry_at(pack: &[u8], offset: u64) -> Result<RawEntry, GitError> {
         }
         OBJ_OFS_DELTA => {
             let neg = read_ofs_delta_offset(pack, &mut pos)?;
-            let base_offset = offset
-                .checked_sub(neg)
-                .ok_or(GitError::Pack("packfile: ofs-delta base before start of pack"))?;
+            let base_offset = offset.checked_sub(neg).ok_or(GitError::Pack(
+                "packfile: ofs-delta base before start of pack",
+            ))?;
             let delta = inflate_at(pack, pos)?;
             if delta.len() as u64 != size {
                 return Err(GitError::Pack("packfile: delta size mismatch"));
@@ -356,7 +361,9 @@ fn resolve(
         return Ok(cached.clone());
     }
     if depth > MAX_DELTA_DEPTH {
-        return Err(GitError::Pack("packfile: delta chain too deep (possible cycle)"));
+        return Err(GitError::Pack(
+            "packfile: delta chain too deep (possible cycle)",
+        ));
     }
     let resolved = match parse_entry_at(pack, offset)? {
         RawEntry::Base { type_id, data } => (type_id, data),
@@ -501,9 +508,13 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitError> {
             if cp_size == 0 {
                 cp_size = 0x1_0000;
             }
-            let start = usize::try_from(cp_off).map_err(|_| GitError::Pack("delta: copy offset overflow"))?;
+            let start = usize::try_from(cp_off)
+                .map_err(|_| GitError::Pack("delta: copy offset overflow"))?;
             let end = start
-                .checked_add(usize::try_from(cp_size).map_err(|_| GitError::Pack("delta: copy size overflow"))?)
+                .checked_add(
+                    usize::try_from(cp_size)
+                        .map_err(|_| GitError::Pack("delta: copy size overflow"))?,
+                )
                 .ok_or(GitError::Pack("delta: copy range overflow"))?;
             let chunk = base
                 .get(start..end)
@@ -525,7 +536,9 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitError> {
         }
     }
     if out.len() as u64 != tgt_size {
-        return Err(GitError::Pack("delta: reconstructed size does not match target"));
+        return Err(GitError::Pack(
+            "delta: reconstructed size does not match target",
+        ));
     }
     Ok(out)
 }

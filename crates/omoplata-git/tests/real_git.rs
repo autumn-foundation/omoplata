@@ -6,8 +6,8 @@ use std::path::Path;
 use std::process::Command;
 
 use omoplata_git::{
-    decode, encode, export_matches_source, export_repo, import_repo, read_refs, verify_repo,
-    walk_loose, GitObject,
+    decode, encode, export_matches_source, export_repo, import_repo, oid, pack_paths,
+    read_pack_detailed, read_refs, verify_repo, walk_loose, GitObject,
 };
 use omoplata_store::{Object, Repository};
 
@@ -289,5 +289,135 @@ fn repo_level_roundtrip_export_is_byte_identical() {
     assert!(
         export_matches_source(&git_dir, out.path()).unwrap(),
         "exported loose objects must be byte-identical to the source"
+    );
+}
+
+/// Build a repo with several commits that repeatedly modify the same files (so
+/// git will delta-compress them on repack), run `git gc` to force a packfile,
+/// and return the `.git` dir plus the tempdir keeping it alive.
+fn gc_packed_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let work = tempfile::tempdir().unwrap();
+    let root = work.path().to_path_buf();
+    let root = root.as_path();
+    git(root, &["init", "-q"]);
+
+    // A file with substantial, evolving content across commits — repeated
+    // near-identical revisions are exactly what git stores as deltas on repack.
+    let mut lines: Vec<String> = (0..200)
+        .map(|i| format!("line {i}: original content"))
+        .collect();
+    for rev in 0..6 {
+        // Mutate a slice of the file each revision so successive blobs differ
+        // only in part (delta-friendly), and add a fresh sibling file too.
+        for i in (rev * 10)..(rev * 10 + 10) {
+            if let Some(slot) = lines.get_mut(i) {
+                *slot = format!("line {i}: revised at rev {rev}");
+            }
+        }
+        std::fs::write(root.join("big.txt"), lines.join("\n") + "\n").unwrap();
+        std::fs::write(
+            root.join(format!("file_{rev}.txt")),
+            format!("contents of file {rev}\n").repeat(20),
+        )
+        .unwrap();
+        git(root, &["add", "-A"]);
+        git_commit(root, &format!("commit {rev}"));
+    }
+
+    // Force everything into a single packfile and drop the now-redundant loose
+    // objects. `-ad` = aggressive repack, all objects into one pack, delete loose.
+    git(root, &["repack", "-adq"]);
+
+    (work, root.join(".git"))
+}
+
+#[test]
+fn gc_packed_repo_verifies_imports_and_exercises_deltas() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping gc'd-packfile integration test");
+        return;
+    }
+    let (_work, git_dir) = gc_packed_repo();
+
+    // A packfile must exist, and loose objects should be (almost) all gone.
+    let packs = pack_paths(&git_dir).unwrap();
+    assert!(!packs.is_empty(), "git repack must produce a .pack file");
+    let loose = walk_loose(&git_dir).unwrap();
+    assert!(
+        loose.len() < 5,
+        "after repack -ad most objects should be packed, got {} loose",
+        loose.len()
+    );
+
+    // Read the pack directly and confirm at least one delta object was decoded
+    // (a repo with repeatedly-modified files repacks with deltas). Also confirm
+    // every reconstructed object's recomputed oid matches its index oid.
+    let mut total_deltas = 0usize;
+    let mut total_objects = 0usize;
+    for pack in &packs {
+        let decoded = read_pack_detailed(pack).unwrap();
+        for (pack_oid, object) in &decoded.objects {
+            assert_eq!(oid(object), *pack_oid, "packed object oid must match index");
+        }
+        total_deltas += decoded.delta_objects();
+        total_objects += decoded.objects.len();
+    }
+    assert!(
+        total_deltas >= 1,
+        "expected >=1 delta object in the pack, got {total_deltas} (of {total_objects})"
+    );
+
+    // The I9 gate PASSes over the packed repo, counting packed objects.
+    let report = verify_repo(&git_dir).expect("gate passes over packed repo");
+    assert!(
+        report.commits >= 6,
+        "expected >=6 commits, got {}",
+        report.commits
+    );
+    assert!(report.blobs >= 1, "expected blobs from the pack");
+    assert!(report.trees >= 1, "expected trees from the pack");
+    assert!(report.packfiles >= 1, "packfiles field should be >=1");
+    assert!(
+        report.total() >= total_objects,
+        "gate total ({}) should cover the packed object set ({total_objects})",
+        report.total()
+    );
+
+    // Import walks the commit graph entirely from packed objects.
+    let omo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(omo_dir.path()).unwrap();
+    let import = import_repo(&git_dir, &repo).expect("import from pack succeeds");
+    assert_eq!(import.commits, 6, "all 6 commits imported from the pack");
+    assert!(
+        import.blobs >= 6,
+        "expected the evolving blobs, got {}",
+        import.blobs
+    );
+    assert!(import.trees >= 1);
+    assert!(import.mapping_count() >= import.blobs + import.trees);
+
+    // Every imported blob/tree oid recomputes correctly, and its bytes are in
+    // the store — a spot check that the reconstructed objects are real.
+    let (some_blob_oid, want) = import
+        .git_objects
+        .iter()
+        .find_map(|(o, obj)| match obj {
+            GitObject::Blob(b) => Some((*o, b.clone())),
+            _ => None,
+        })
+        .expect("at least one blob imported");
+    let store_id = import.oid_map.get(&some_blob_oid).expect("blob mapped");
+    match repo.read_object(store_id).unwrap() {
+        Object::Blob(b) => assert_eq!(b.bytes(), want.as_slice()),
+        other => panic!("expected blob, got {other:?}"),
+    }
+
+    // Round-trip export: the exported object set is byte-identical to the packed
+    // source (packed objects unpacked to loose, same oids and canonical bytes).
+    let out = tempfile::tempdir().unwrap();
+    export_repo(&import, out.path()).unwrap();
+    assert!(
+        export_matches_source(&git_dir, out.path()).unwrap(),
+        "exported objects must be byte-identical to the packed source"
     );
 }
