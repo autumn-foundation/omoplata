@@ -1,0 +1,44 @@
+//! omoplata's working-model layer (design doc §7 crate #4, `omoplata-work`).
+//!
+//! This crate is the "glue around the verified core" (§7): it wires the object
+//! store and the identity graphs into a mutable repository state, and records
+//! every mutation in a **bi-temporal operation log**. Two design-doc surfaces
+//! live here:
+//!
+//! * The **operation log** ([`oplog`]) — §5.6, principle **P4**, invariant
+//!   **I7**. The repository's mutable state is a set of refs
+//!   (`name -> `[`CommitId`]); every mutation is an [`Operation`] with a
+//!   monotonic **transaction time**. Undo is an *inverse operation, not history
+//!   erasure* — the log never shrinks and never lies about what was believed.
+//!   [`OpLog::refs_at`] answers the transaction-time query at the heart of
+//!   Thesis claim 3 ("what did we think the history was … as of last Tuesday").
+//!
+//! * The **revset** engine ([`revset`]) — §5.8, the `RV` node of the §4
+//!   architecture. A small revision-set query language over commits and refs:
+//!   `a & b`, `a | b`, `~a`, parentheses, the functions `all()` / `heads()` /
+//!   `draft()` / `public()`, bare ref names, and `id:<hex>` literals.
+//!
+//! # Bi-temporality (Thesis claim 3)
+//!
+//! > *"History is bi-temporal and queryable. The repository records both what
+//! > was true (valid time: the commit graph, supersession of changes) and what
+//! > was believed (transaction time: the operation log)."*
+//!
+//! Valid time is owned by `omoplata-identity` (the change graph); this crate
+//! owns the transaction-time axis. [`OpLog::refs_at`] makes "what was believed
+//! as of transaction time *t*" a first-class query.
+//!
+//! # Verification status
+//!
+//! As elsewhere in the workspace, Verus is not available in this environment,
+//! so invariant **I7** ("every operation has an inverse; `undo ∘ op ≡ identity`
+//! on repository state") is encoded as `// PROOF OBLIGATION (I7)` comments plus
+//! executable unit tests. No `unwrap`/`expect`/`panic` appears in non-test code.
+
+mod error;
+mod oplog;
+mod revset;
+
+pub use error::WorkError;
+pub use oplog::{OpKind, OpLog, Operation};
+pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};

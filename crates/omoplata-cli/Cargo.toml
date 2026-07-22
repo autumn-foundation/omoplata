@@ -13,6 +13,13 @@ path = "src/main.rs"
 clap = { workspace = true }
 anyhow = { workspace = true }
 omoplata-store = { path = "../omoplata-store" }
+omoplata-algebra = { path = "../omoplata-algebra" }
+omoplata-drivers = { path = "../omoplata-drivers" }
+omoplata-git = { path = "../omoplata-git" }
+omoplata-identity = { path = "../omoplata-identity" }
+omoplata-sem = { path = "../omoplata-sem" }
+omoplata-work = { path = "../omoplata-work" }
+tempfile = "3"
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -1,5 +1,5 @@
 [package]
-name = "omoplata-store"
+name = "omoplata-algebra"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,6 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-sha2 = "0.10"
 
 [dev-dependencies]
-tempfile = "3"
+proptest = "1"
