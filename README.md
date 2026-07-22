@@ -24,6 +24,11 @@ else degrades to an honest, first-class conflict.
 > [Reductions](#reductions-from-the-design-doc-in-this-build) for the full list of
 > what is and is not yet implemented.
 
+**New to omoplata?** The [User guide](docs/user-guide.md) walks a git user through
+installing `omo`, an everyday quick start, a git → omo command map, migrating an
+existing git repo, and the concepts (conflicts-as-values, kernel admission, the
+bi-temporal op log) — with every example shown as real executed output.
+
 ## Install
 
 Build the release binary (lands at `target/release/omo`):
