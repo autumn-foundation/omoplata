@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use crate::error::GitError;
+use crate::gitdir::resolve_git_dir;
 use crate::loose::{pack_file_count, walk_loose};
 use crate::object::{decode, encode, oid, GitObject, GitOid};
 use crate::pack::read_all_packs;
@@ -77,25 +78,38 @@ pub fn roundtrip_ok(bytes: &[u8]) -> Result<GitOid, GitError> {
 /// Run the round-trip gate over every object in a git repository — loose and
 /// packed alike.
 ///
+/// `path` may be a **worktree root** or a **git directory**: it is first passed
+/// through [`resolve_git_dir`], so `omo git verify <repo-root>` auto-descends
+/// into `<repo-root>/.git` instead of walking a non-existent `<repo-root>/objects`.
+///
 /// For each loose object under `<git_dir>/objects/<xx>/` and each object
 /// reconstructed from a packfile under `<git_dir>/objects/pack/`, this runs
 /// [`roundtrip_ok`] (decode → re-encode → assert byte-identical) and confirms
 /// the recomputed SHA-1 equals the oid the object was addressed by (its loose
 /// path, or its pack index entry). The gate **fails** — an error is returned —
-/// if any object does not round-trip byte-identically or mismatches its oid. On
-/// success it returns per-type counts across both sources.
+/// if any object does not round-trip byte-identically or mismatches its oid.
+///
+/// **I9 gate contract:** a returned [`GitReport`] means *at least one object was
+/// actually checked and round-tripped*. A path that resolves to no repository,
+/// or to a git directory holding **zero** objects and **zero** packfiles, is
+/// **not** a PASS — it is refused (`NotARepository` / `EmptyRepository`) rather
+/// than reported as a vacuous success over an empty set. On success it returns
+/// per-type counts across both sources.
 ///
 /// # Errors
-/// Returns [`GitError::Roundtrip`] on any non-identical re-encoding,
+/// Returns [`GitError::NotARepository`] if `path` is not a git repository,
+/// [`GitError::EmptyRepository`] if the resolved repository has no objects and
+/// no packfiles, [`GitError::Roundtrip`] on any non-identical re-encoding,
 /// [`GitError::OidMismatch`] on any content/oid disagreement,
 /// [`GitError::Pack`] on a malformed packfile, or an I/O / decode error while
 /// reading objects.
-pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
+pub fn verify_repo(path: &Path) -> Result<GitReport, GitError> {
+    let git_dir = resolve_git_dir(path)?;
     let mut report = GitReport {
-        packfiles: pack_file_count(git_dir),
+        packfiles: pack_file_count(&git_dir),
         ..GitReport::default()
     };
-    for (path_oid, object) in walk_loose(git_dir)? {
+    for (path_oid, object) in walk_loose(&git_dir)? {
         // Re-run the gate on the canonical encoded bytes and confirm the oid the
         // path claimed matches the oid the content produces.
         let gate_oid = roundtrip_ok(&encode(&object))?;
@@ -109,7 +123,7 @@ pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
     }
     // Packed objects go through the identical gate; `read_all_packs` already
     // checks each reconstructed object's SHA-1 against its pack-index oid.
-    for (pack_oid, object) in read_all_packs(git_dir)? {
+    for (pack_oid, object) in read_all_packs(&git_dir)? {
         let gate_oid = roundtrip_ok(&encode(&object))?;
         if gate_oid != pack_oid {
             return Err(GitError::OidMismatch {
@@ -118,6 +132,13 @@ pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
             });
         }
         report.tally(&object);
+    }
+    // I9 gate contract: PASS requires ≥1 object actually checked. Zero objects
+    // with zero packfiles means there was nothing to round-trip (an empty repo,
+    // or a mis-pointed path that resolved but holds nothing) — refuse rather
+    // than return a vacuous success.
+    if report.total() == 0 && report.packfiles == 0 {
+        return Err(GitError::EmptyRepository(path.to_path_buf()));
     }
     Ok(report)
 }

@@ -46,6 +46,23 @@ pub enum GitError {
     /// A malformed 40-hex git oid string.
     #[error("malformed git oid: {0}")]
     MalformedOid(String),
+    /// The supplied path is not a git repository: it has neither a `.git`
+    /// directory (worktree root) nor the `objects/`+`refs/` layout of a git
+    /// directory itself. Returned instead of a vacuous success when `omo git`
+    /// is pointed at a non-repository (a linked-worktree `.git` *file* also
+    /// lands here — it is not resolved in v1).
+    #[error(
+        "not a git repository: {0} \
+         (expected a worktree containing a `.git` directory, \
+         or a git directory with `objects/` and `refs/`)"
+    )]
+    NotARepository(PathBuf),
+    /// The path resolves to a real git directory, but it holds no objects (a
+    /// freshly-`init`ed repo with no commits, or a repo with no resolvable
+    /// refs). There is nothing to round-trip, so the I9 gate refuses rather
+    /// than reporting a vacuous PASS over an empty object set.
+    #[error("empty git repository: {0} (no objects found — nothing to round-trip)")]
+    EmptyRepository(PathBuf),
     /// zlib inflate/deflate failed.
     #[error("zlib error: {0}")]
     Zlib(String),

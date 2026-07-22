@@ -35,6 +35,7 @@ use omoplata_store::{Blob, EntryKind, Object, ObjectId, Repository, Tree};
 
 use crate::error::GitError;
 use crate::gate::verify_repo;
+use crate::gitdir::resolve_git_dir;
 use crate::loose::walk_loose;
 use crate::object::{encode, GitCommit, GitObject, GitOid};
 use crate::pack::read_all_packs;
@@ -137,40 +138,66 @@ pub fn mode_to_kind(mode: &str) -> Result<EntryKind, GitError> {
     }
 }
 
-/// Import the git repo at `git_dir` into `repo` by walking the commit graph from
+/// Import the git repo at `path` into `repo` by walking the commit graph from
 /// its refs.
 ///
-/// Enforces **I9**: [`verify_repo`] runs the round-trip gate over every loose
-/// object first, and each reachable object is re-checked with
+/// `path` may be a **worktree root** or a **git directory**: it is first passed
+/// through [`resolve_git_dir`], so `omo git import <repo-root>` auto-descends
+/// into `<repo-root>/.git` rather than importing nothing from a non-existent
+/// `<repo-root>/objects`.
+///
+/// Enforces **I9**: [`verify_repo`] runs the round-trip gate over every object
+/// first, and each reachable object is re-checked with
 /// [`crate::gate::roundtrip_ok`] as it is visited — import is refused (an error
 /// is returned) if any object fails. Starting from every ref, the walk follows
 /// commit parents, commit trees (and subtrees), and tag targets, importing
 /// blobs → [`Object::Blob`] and trees → [`Object::Tree`] and recording the
 /// commit DAG and ref list on the returned [`GitImport`].
 ///
+/// **Importing nothing is a failure, not a success.** A path with no resolvable
+/// refs (e.g. an unborn `HEAD`), or from which zero objects are imported, is
+/// refused with [`GitError::EmptyRepository`] rather than returning an empty
+/// [`GitImport`] that claims success.
+///
 /// # Errors
-/// Returns [`GitError::MissingObject`] if a reachable object is absent from both
+/// Returns [`GitError::NotARepository`] if `path` is not a git repository;
+/// [`GitError::EmptyRepository`] if the repository is empty or has no walkable
+/// refs; [`GitError::MissingObject`] if a reachable object is absent from both
 /// the loose store and the packfiles; [`GitError::Pack`] on a malformed
 /// packfile; [`GitError::Roundtrip`] on any object that does not re-encode
 /// byte-identically; or any error from the gate, ref reading, an unsupported
 /// tree-entry mode, or writing into the omoplata store.
-pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitError> {
+pub fn import_repo(path: &Path, repo: &Repository) -> Result<GitImport, GitError> {
+    let git_dir = resolve_git_dir(path)?;
+
     // I9 enforcement: refuse to import a repo whose objects do not round-trip
-    // byte-identically (the gate now covers both loose and packed objects).
-    verify_repo(git_dir)?;
+    // byte-identically (the gate now covers both loose and packed objects). The
+    // gate also refuses an object-less repository, so a truly empty directory is
+    // rejected here before any ref walk.
+    verify_repo(&git_dir)?;
 
     // Load every loose *and* packed object into one oid-keyed map so the walk can
     // resolve children regardless of on-disk representation or order.
     let mut objects: HashMap<GitOid, GitObject> = HashMap::new();
-    for (oid, object) in walk_loose(git_dir)? {
+    for (oid, object) in walk_loose(&git_dir)? {
         objects.insert(oid, object);
     }
-    for (oid, object) in read_all_packs(git_dir)? {
+    for (oid, object) in read_all_packs(&git_dir)? {
         objects.entry(oid).or_insert(object);
     }
 
-    let refs = read_refs(git_dir)?;
-    import_objects(&objects, refs, repo)
+    let refs = read_refs(&git_dir)?;
+    if refs.is_empty() {
+        // Objects may exist, but with no resolvable refs there are no roots to
+        // walk: the import would silently import nothing. Refuse instead.
+        return Err(GitError::EmptyRepository(path.to_path_buf()));
+    }
+    let import = import_objects(&objects, refs, repo)?;
+    if import.commits + import.trees + import.blobs + import.tags == 0 {
+        // Refs resolved but nothing reachable was imported — treat as empty.
+        return Err(GitError::EmptyRepository(path.to_path_buf()));
+    }
+    Ok(import)
 }
 
 /// Import an **in-memory** object set into `repo` by walking the reachable graph

@@ -32,8 +32,14 @@
 //!   `git gc`'d repository imports and verifies through the same I9 gate as
 //!   loose objects.
 //! - Ref reading ([`read_refs`]): `HEAD`, loose refs, and `packed-refs`.
+//! - Git-directory resolution ([`resolve_git_dir`]): maps a worktree root or a
+//!   git directory to the directory that actually holds `objects/`+`refs/`, so
+//!   `omo git verify`/`import` auto-descend into `.git` instead of silently
+//!   walking a non-existent `objects/` and reporting a vacuous PASS.
 //! - The round-trip gate: [`roundtrip_ok`] for one object and [`verify_repo`]
-//!   for a whole repository — the executable form of I9.
+//!   for a whole repository — the executable form of I9. `verify_repo` reports
+//!   PASS only when ≥1 object was actually checked; an empty or non-repository
+//!   path is refused, never PASSed.
 //! - Commit-graph import ([`import_repo`]): walks the commit DAG from refs,
 //!   importing every reachable object through the I9 gate and recording the DAG.
 //! - Exact-mode export ([`export_repo`]) and the repo-level round-trip gate
@@ -51,6 +57,7 @@
 mod error;
 mod export;
 mod gate;
+mod gitdir;
 mod import;
 mod loose;
 mod object;
@@ -61,6 +68,7 @@ mod wire;
 pub use error::GitError;
 pub use export::{export_matches_source, export_repo, GitExport};
 pub use gate::{roundtrip_ok, verify_repo, GitReport};
+pub use gitdir::resolve_git_dir;
 pub use import::{import_objects, import_repo, mode_to_kind, GitImport};
 pub use loose::{
     loose_path, oid_from_loose_path, pack_file_count, read_loose, walk_loose, write_loose,

@@ -9,7 +9,9 @@ use omoplata_algebra::{
     diff, dynamic_validate, kernel, merge3, rebase, Admission, Conflict, Doc, Validated,
 };
 use omoplata_drivers::{select_driver, MergeInput};
-use omoplata_git::{export_matches_source, export_repo, fetch_local, import_repo, verify_repo};
+use omoplata_git::{
+    export_matches_source, export_repo, fetch_local, import_repo, verify_repo, GitError,
+};
 use omoplata_identity::{
     extract_definitions, match_definitions, ChangeId, CommitId, Definition, MatchStatus,
 };
@@ -279,7 +281,8 @@ enum GitCommand {
     /// Prints per-type object counts and `round-trip gate: PASS` (exit 0), or
     /// the failing object and `round-trip gate: FAIL` (exit non-zero).
     Verify {
-        /// The git directory to verify, e.g. `path/to/.git`.
+        /// The repo to verify: a worktree root (`path/to/repo`) or a git
+        /// directory (`path/to/repo/.git`). Auto-descends into `.git`.
         git_dir: PathBuf,
     },
     /// Import a git repository by walking its commit graph from refs.
@@ -288,7 +291,8 @@ enum GitCommand {
     /// commit DAG from every ref, and imports every reachable object. Prints the
     /// commit/tag/tree/blob counts and the number of git→omoplata oid mappings.
     Import {
-        /// The git directory to import, e.g. `path/to/.git`.
+        /// The repo to import: a worktree root (`path/to/repo`) or a git
+        /// directory (`path/to/repo/.git`). Auto-descends into `.git`.
         git_dir: PathBuf,
         /// Destination omoplata repository (defaults to the current directory).
         #[arg(long)]
@@ -298,7 +302,8 @@ enum GitCommand {
     ///
     /// Each line is `<short-oid> <subject>  (parents: <short-oids>)`.
     Log {
-        /// The git directory to read, e.g. `path/to/.git`.
+        /// The repo to read: a worktree root (`path/to/repo`) or a git
+        /// directory (`path/to/repo/.git`). Auto-descends into `.git`.
         git_dir: PathBuf,
     },
     /// Exact-mode export: import a git repo, then write every object back out.
@@ -308,7 +313,8 @@ enum GitCommand {
     /// repo-level round-trip gate. Prints `exported <N> objects; round-trip vs
     /// source: PASS/FAIL` and exits non-zero on FAIL.
     Export {
-        /// The git directory to import and export, e.g. `path/to/.git`.
+        /// The repo to import and export: a worktree root (`path/to/repo`) or a
+        /// git directory (`path/to/repo/.git`). Auto-descends into `.git`.
         git_dir: PathBuf,
         /// The output directory to write the reconstructed objects and refs to.
         out_dir: PathBuf,
@@ -617,11 +623,16 @@ fn cmd_cat_object(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `omo git verify <git-dir>` — run the I9 round-trip gate over a git repo.
+/// `omo git verify <path>` — run the I9 round-trip gate over a git repo.
 ///
-/// On success prints per-type counts and `round-trip gate: PASS` (exit 0). On
-/// failure prints the failing object to stderr and `round-trip gate: FAIL`
-/// (exit 1).
+/// `<path>` may be a worktree root (e.g. `path/to/repo`) or a git directory
+/// (e.g. `path/to/repo/.git`); the gate auto-descends into `.git` as needed.
+///
+/// On success prints per-type counts and `round-trip gate: PASS` (exit 0). A
+/// genuine round-trip failure prints the failing object to stderr and
+/// `round-trip gate: FAIL` (exit 1). Pointing at a non-repository or an empty
+/// repository is **not** a PASS: it exits non-zero with a clear error and never
+/// prints `PASS` (the I9 gate reports PASS only when ≥1 object was checked).
 fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
     match verify_repo(&git_dir) {
         Ok(report) => {
@@ -641,6 +652,10 @@ fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
             println!("round-trip gate: PASS");
             Ok(0)
         }
+        // Not-a-repository / empty-repository is a refusal, not a gate failure:
+        // there was nothing to round-trip, so we must NOT print `PASS`. Surface
+        // it as a clear error and a non-zero exit rather than a green verdict.
+        Err(e @ (GitError::NotARepository(_) | GitError::EmptyRepository(_))) => Err(e.into()),
         Err(e) => {
             eprintln!("failing object: {e}");
             println!("round-trip gate: FAIL");
