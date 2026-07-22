@@ -855,3 +855,101 @@ fn similar_ranks_the_rectangle_function_first() {
         "expected an area function ranked first, got: {first:?}"
     );
 }
+
+#[test]
+fn autorebase_clean_records_rebase_op() {
+    // R4 end to end: mine and onto edit disjoint regions, so the autorebase is
+    // clean (exit 0), both edits are present, the op log gains a Rebase entry with
+    // a supersession (new tip), and `omo op log` shows it afterward.
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&mine, "a\nB\nc\nd\n").unwrap(); // I edit line 2
+    std::fs::write(&onto, "a\nb\nc\nD\n").unwrap(); // base advanced line 4
+
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout("a\nB\nc\nD\n") // both edits present
+        .stderr(predicate::str::contains("autorebase: clean"))
+        .stderr(predicate::str::contains("autorebase: new tip"))
+        .stderr(predicate::str::contains("op-log: "));
+
+    // The persisted op log now shows the Rebase entry (transaction time).
+    omo()
+        .args(["op", "log", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rebase change"))
+        .stdout(predicate::str::contains("(clean)"));
+}
+
+#[test]
+fn autorebase_conflict_exits_nonzero_with_markers() {
+    // mine and onto edit the same line differently: the conflict is carried as a
+    // value (markers in the output), the op log still records the Rebase, and the
+    // command exits non-zero.
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&mine, "a\nX\nc\n").unwrap();
+    std::fs::write(&onto, "a\nY\nc\n").unwrap();
+
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< mine"))
+        .stdout(predicate::str::contains(">>>>>>> onto"))
+        .stderr(predicate::str::contains("conflict(s) carried"));
+
+    // The Rebase entry is still recorded, marked with its conflict count.
+    omo()
+        .args(["op", "log", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rebase change"))
+        .stdout(predicate::str::contains("1 conflict(s)"));
+}
+
+#[test]
+fn autorebase_requires_initialized_repo() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\n").unwrap();
+    std::fs::write(&mine, "b\n").unwrap();
+    std::fs::write(&onto, "a\n").unwrap();
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no omoplata repository"));
+}

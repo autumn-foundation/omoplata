@@ -11,13 +11,13 @@ use omoplata_algebra::{
 use omoplata_drivers::{select_driver, MergeInput};
 use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
 use omoplata_identity::{
-    extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
+    extract_definitions, match_definitions, ChangeId, CommitId, Definition, MatchStatus,
 };
 use omoplata_sem::{
     embed_definitions, find_duplicates, search, Embedded, Embedder, HashingEmbedder,
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
-use omoplata_work::{MapContext, OpKind, OpLog};
+use omoplata_work::{MapContext, OpKind, OpLog, RebaseEngine};
 
 /// omoplata: a version control system with a verified merge kernel.
 #[derive(Debug, Parser)]
@@ -150,6 +150,36 @@ enum Command {
         mine: PathBuf,
         /// The version to rebase onto (the new base).
         onto: PathBuf,
+    },
+    /// Auto-rebase a change through the change graph and op log (R4; §5.3,
+    /// §5.4, §5.6).
+    ///
+    /// Stores `base`, `mine` and `onto` as blobs in the repository's object
+    /// store (a commit id is the blob's object id), replays the change with the
+    /// verified rebase algebra, and records the move on **both** of the design
+    /// doc's time axes: a `Rebase` entry in the bi-temporal op log (transaction
+    /// time) and a supersession edge in the change graph (valid time). Conflicts
+    /// are carried forward as **values**, never blocking (§3 P3).
+    ///
+    /// Prints the rebased content to stdout — conflicted spans as
+    /// `<<<<<<< mine / ======= / >>>>>>> onto` marker blocks — and to stderr the
+    /// new tip commit id, `autorebase: clean` or `autorebase: <k> conflict(s)
+    /// carried`, and the appended op-log entry. The op log is persisted, so
+    /// `omo op log` shows the `Rebase` entry afterward. Exits 0 if clean, else
+    /// non-zero. Requires an initialized repository.
+    Autorebase {
+        /// The common base file.
+        base: PathBuf,
+        /// My version (the change to replay).
+        mine: PathBuf,
+        /// The version to rebase onto (the advanced base).
+        onto: PathBuf,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The change id to record the rebase under (default: `change`).
+        #[arg(long)]
+        change: Option<String>,
     },
     /// List the Rust definitions in a source file, in source order.
     ///
@@ -354,6 +384,13 @@ fn run() -> anyhow::Result<i32> {
         } => cmd_merge_file(base, left, right, validate),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
+        Command::Autorebase {
+            base,
+            mine,
+            onto,
+            repo,
+            change,
+        } => cmd_autorebase(repo, base, mine, onto, change),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
         Command::Ref { action } => match action {
@@ -941,6 +978,90 @@ fn cmd_rebase(base: PathBuf, mine: PathBuf, onto: PathBuf) -> anyhow::Result<i32
         eprintln!("rebase: {k} conflict(s) carried");
         Ok(1)
     }
+}
+
+/// Store a file's bytes as a blob and return the commit id (== object id).
+fn store_file_blob(repo: &Repository, path: &Path) -> anyhow::Result<CommitId> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let id = repo.write_blob(bytes)?;
+    Ok(CommitId::new(id.to_string()))
+}
+
+/// Read a stored blob back as UTF-8 text (the content-addressed round trip).
+fn read_blob_text(repo: &Repository, commit: &CommitId) -> anyhow::Result<String> {
+    let id: ObjectId = commit
+        .as_str()
+        .parse()
+        .with_context(|| format!("malformed commit id {commit}"))?;
+    match repo.read_object(&id)? {
+        Object::Blob(b) => {
+            Ok(String::from_utf8(b.bytes().to_vec()).context("rebased content is not UTF-8")?)
+        }
+        other => anyhow::bail!("expected a blob for {commit}, got {other:?}"),
+    }
+}
+
+/// `omo autorebase <base> <mine> <onto>` — the R4 loop end to end (§5.3/§5.4/§5.6).
+fn cmd_autorebase(
+    repo: Option<PathBuf>,
+    base: PathBuf,
+    mine: PathBuf,
+    onto: PathBuf,
+    change: Option<String>,
+) -> anyhow::Result<i32> {
+    // Require an initialized repository (this is content-on-a-base in the store).
+    let repo = Repository::open(resolve(repo)?)?;
+
+    // Store the three inputs as blobs; a commit id is the blob's object id.
+    let base_commit = store_file_blob(&repo, &base)?;
+    let old_tip = store_file_blob(&repo, &mine)?;
+    let onto_commit = store_file_blob(&repo, &onto)?;
+
+    let change_id = ChangeId::new(change.unwrap_or_else(|| "change".to_owned()));
+
+    // Continue the persisted, bi-temporal op log.
+    let path = oplog_path(&repo);
+    let log = OpLog::load(&path)?;
+    let mut engine = RebaseEngine::with_log(repo.clone(), log);
+
+    // Anchor the change's ref at its pre-rebase tip on first sight, so undo can
+    // later restore it and `refs_at` reports the pre-rebase tip (bi-temporal).
+    if !engine.log().refs_now().contains_key(change_id.as_str()) {
+        engine
+            .log_mut()
+            .set_ref(change_id.to_string(), Some(old_tip.clone()), None);
+    }
+
+    let outcome = engine.auto_rebase(&change_id, &base_commit, &old_tip, &onto_commit)?;
+
+    // The op-log entry summary (the Rebase we just appended).
+    let entry = engine
+        .log()
+        .operations()
+        .last()
+        .map(|op| format!("#{} {}", op.seq, op.kind.summary()));
+
+    // Persist the op log so `omo op log` shows the Rebase entry afterward.
+    engine.log().save(&path)?;
+
+    // The rebased content, read back from the store (markers included).
+    let text = read_blob_text(&repo, &outcome.new_tip)?;
+    print!("{text}");
+
+    eprintln!("autorebase: new tip {}", outcome.new_tip);
+    if outcome.clean {
+        eprintln!("autorebase: clean");
+    } else {
+        eprintln!(
+            "autorebase: {} conflict(s) carried",
+            outcome.conflicts.len()
+        );
+    }
+    if let Some(entry) = entry {
+        eprintln!("op-log: {entry}");
+    }
+
+    Ok(i32::from(!outcome.clean))
 }
 
 /// The 1-based line number containing byte offset `at` in `source`.

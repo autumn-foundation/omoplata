@@ -1822,7 +1822,9 @@ dependencies = [
 name = "omoplata-work"
 version = "0.1.0"
 dependencies = [
+ "omoplata-algebra",
  "omoplata-identity",
+ "omoplata-store",
  "serde",
  "serde_json",
  "tempfile",

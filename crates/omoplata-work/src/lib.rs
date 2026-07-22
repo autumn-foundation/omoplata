@@ -13,6 +13,14 @@
 //!   [`OpLog::refs_at`] answers the transaction-time query at the heart of
 //!   Thesis claim 3 ("what did we think the history was … as of last Tuesday").
 //!
+//! * The **auto-rebase engine** ([`RebaseEngine`], reduction **R4**) — §5.3 +
+//!   §5.4 + §5.6. It ties the object store, the verified rebase algebra, the
+//!   change graph, and the op log together so a change auto-rebases onto an
+//!   advancing base, recording each rebase as an [`OpKind::Rebase`] op
+//!   (transaction time) *and* a supersession edge (valid time). Conflicts are
+//!   carried as **values**, never blocking. [`RebaseEngine::history`] exposes the
+//!   two axes as one jointly-queryable surface.
+//!
 //! * The **revset** engine ([`revset`]) — §5.8, the `RV` node of the §4
 //!   architecture. A small revision-set query language over commits and refs:
 //!   `a & b`, `a | b`, `~a`, parentheses, the functions `all()` / `heads()` /
@@ -35,10 +43,12 @@
 //! on repository state") is encoded as `// PROOF OBLIGATION (I7)` comments plus
 //! executable unit tests. No `unwrap`/`expect`/`panic` appears in non-test code.
 
+mod autorebase;
 mod error;
 mod oplog;
 mod revset;
 
+pub use autorebase::{ChangeHistory, RebaseEngine, RebaseOutcome, RebaseRecord, StackItem};
 pub use error::WorkError;
 pub use oplog::{OpKind, OpLog, Operation};
 pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};
