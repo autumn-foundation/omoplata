@@ -142,168 +142,213 @@ renamed compute_area -> area_of_rect (fn)
 
 ---
 
-## 3. The everyday loop today: commits, branches, switching (and what's missing)
+## 3. The everyday loop: workspaces, commit, branch, switch
 
 If you come from git, the first muscle-memory you reach for is the everyday loop:
-commit your work, branch off, switch between branches. **Be warned up front:**
-omoplata today is closer to git's *plumbing* than its *porcelain*. There is **no
-`omo commit`** (no verb that snapshots a working directory into a change with a
-message and advances a ref), **no `omo branch`**, and **no `omo switch` /
-`checkout`** (omo never writes a stored tree back out into your working files).
-Those are exactly what git users want first — and they aren't here yet:
+commit your work, branch off, switch between branches. As of the **workspaces
+milestone (design-doc M2)** these are first-class verbs — `omo commit`,
+`omo branch`, and an `omo switch` that really checks a commit back out into your
+working files. This section teaches that loop. Every block below is real executed
+output.
+
+The one structural difference from git is the **workspace**: rather than a single
+working tree bound to `.git`, omoplata lets several working directories share one
+`.omoplata` object store, op log, and ref set (jj-style). Each workspace has its
+own working dir and its own *current change*. For a single-workspace repo this is
+invisible — you just `commit` / `branch` / `switch` — but it is what makes the
+N-agent workflow safe (see the multi-agent note at the end).
+
+### Set up a workspace
+
+Initialize a repo, then register a workspace with its own working directory. The
+workspace gets a fresh *current change* (`ws/<name>`) that the loop advances:
 
 ```console
-$ omo commit
-error: unrecognized subcommand 'commit'
+$ omo init store
+Initialized empty omoplata repository in store/.omoplata
 
-  tip: a similar subcommand exists: 'admit'
+$ cd store
 
-$ omo switch
-error: unrecognized subcommand 'switch'
+$ omo workspace add main ./wt
+registered workspace main at /…/store/wt (change ws/main)
 
-Usage: omo <COMMAND>
+$ omo workspace list
+main  /…/store/wt  change=ws/main  tip=(none)
 ```
 
-These ergonomic verbs are being built as part of **workspaces (design-doc M2)**;
-this section will be rewritten against them when they land (see the note at the
-end). Until then, here is the honest raw-plumbing flow you assemble by hand from
-the commands that *do* exist. Every block below is real executed output.
+`tip=(none)` because nothing is committed yet — the current change has no commit
+under it.
 
-### "Committing" a snapshot today
+### Commit: snapshot the working directory
 
-There is no working-directory snapshot commit with a message. What you have is:
-store content as a **content-addressed object** with `omo hash-object`, then point
-a **named ref** at that object id with `omo ref set`. That ref-move is recorded in
-the op log.
+Edit a file in the workspace's working dir and `omo commit`. Unlike the raw
+`hash-object` + `ref set` on a single file, this **snapshots the whole working
+directory into a tree** (the tree's object id *is* the commit id), advances the
+workspace's current change to that commit, and appends a locked `Commit` op to the
+shared log:
 
 ```console
-$ printf 'title: notes\nbody: first draft\n' > notes.txt
+$ printf 'title: notes\nbody: first draft\n' > wt/notes.txt
 
-$ omo hash-object notes.txt
-sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo ref set main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-#0 set-ref main -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo op log
-#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo ref list
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+$ omo commit -m "first draft"
+#0 [main] committed sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634
+  message: first draft
 ```
 
-**What this is and isn't.** `omo hash-object` stores a **single object** (one
-file's bytes), and `omo ref set` points a name at that one object id — it does
-**not** snapshot a whole working directory into a tree, and there is **no commit
-message, author, or parent link**. It's the moral equivalent of `git hash-object
--w` followed by `git update-ref`, with no `git commit` on top yet. That
-message-bearing, working-tree-snapshotting `omo commit` is the missing verb coming
-with workspaces.
-
-### "Branching" today
-
-A "branch" here is just a second named ref. There is **no `omo branch` verb** —
-you name refs directly with `omo ref set`. Store a variant, point a new ref at it,
-and now two names coexist:
+Edit again and commit a second time. The new commit records the previous one as
+its **parent** — the supersession link the first commit lacked:
 
 ```console
-$ printf 'title: notes\nbody: feature draft\n' > notes.feature.txt
+$ printf 'title: notes\nbody: second draft\n' > wt/notes.txt
 
-$ omo hash-object notes.feature.txt
-sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-
-$ omo ref set feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-#1 set-ref feature -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-
-$ omo ref list
-feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+$ omo commit -m "second draft"
+#1 [main] committed sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d
+  parent sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634
+  message: second draft
 ```
 
-Query across your "branches" with a revset, and compare their states by diffing
-the files directly:
+The workspace's tip now points at the second commit:
 
 ```console
-$ omo revset 'main | feature'
-sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-
-$ omo diff notes.txt notes.feature.txt
-@@ -2,1 +2,1 @@
--body: first draft
-+body: feature draft
+$ omo workspace list
+main  /…/store/wt  change=ws/main  tip=sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d
 ```
 
-Missing verb flagged: `omo branch` (create/list/delete branches by name). Today a
-branch is a ref you set by hand; there's no first-class branch command over it.
+### Branch: name a commit
 
-### "Switching" / "checking out" today — the biggest gap
-
-Be direct: there is **no `omo switch` / `checkout`**. omo does **not** materialize
-a stored tree back into your working files — nothing writes a ref's content over
-your working directory. So you never "check out" `feature` into the working dir
-the way `git switch feature` would.
-
-What you *can* do is inspect stored state without touching your working files —
-list refs, and read an object's bytes back with `omo cat-object`:
+`omo branch <name>` creates a named ref at a commit — by default the current
+workspace's tip, or an explicit `--from <ref-or-commit>`. `omo branch --list`
+prints the refs (the same view as `omo ref list`):
 
 ```console
-$ omo ref list
-feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+$ omo branch feature
+#2 branch feature -> sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d
 
-$ omo cat-object sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+$ omo branch v1 --from sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634
+#3 branch v1 -> sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634
+
+$ omo branch --list
+feature sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d
+v1 sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634
+ws/main sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d
+```
+
+`feature` points at the second draft; `v1` at the first. The workspace's own
+current change shows up as the `ws/main` ref.
+
+### Switch: a real checkout
+
+This is the verb that was missing before: `omo switch` moves the workspace's
+current change to a commit **and materializes that commit's tree back into the
+working directory**. The working copy currently holds the second draft:
+
+```console
+$ cat wt/notes.txt
 title: notes
-body: feature draft
+body: second draft
 ```
 
-To act on a ref's content you redirect `omo cat-object` into a file yourself and
-diff it — there is no command that swaps your working tree to match a ref. This is
-the single biggest gap versus git, and the one workspaces is designed to close.
+Switch to `v1` (the first commit) and the working file is rewritten to match —
+this is the checkout actually happening on disk:
 
-### Undo and history
+```console
+$ omo switch v1
+#4 [main] switched to sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634 (working copy updated)
 
-The op log is your history, and unlike git's reflog `omo op undo` is a **true
-inverse** — it computes and applies the inverse operation and records *that* as a
-new op, rather than leaving you a pointer you can read but not cleanly reverse:
+$ cat wt/notes.txt
+title: notes
+body: first draft
+```
+
+Switch back to `feature` and the second draft returns:
+
+```console
+$ omo switch feature
+#5 [main] switched to sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d (working copy updated)
+
+$ cat wt/notes.txt
+title: notes
+body: second draft
+```
+
+**The dirty guard.** Like `git switch`, `omo switch` refuses to clobber
+uncommitted work. Make an edit you haven't committed, and the switch is blocked:
+
+```console
+$ printf 'title: notes\nbody: uncommitted edit\n' > wt/notes.txt
+
+$ omo switch v1
+error: workspace "main" has uncommitted changes (working copy sha256:663182833a04efb2dd06b593cb2016a3d9859625d23c2126c196f6c7b2e12d14 != tip sha256:ffcc10b54fdf51cb7739b27d58c4400e75a9a87cfe9bea6515bb28cf0993859d); commit first or pass --force
+(exit 2)
+```
+
+Commit first, or pass `--force` to discard the working-copy edit and check the
+target out anyway:
+
+```console
+$ omo switch v1 --force
+#6 [main] switched to sha256:016d76444f0afdf669e834183e3fe5252491c4be3cab3b3ffedef202dddc8634 (working copy updated)
+
+$ cat wt/notes.txt
+title: notes
+body: first draft
+```
+
+### History and undo
+
+Every `commit`, `branch`, and `switch` is an entry in the shared op log. It reads
+newest-first, with the `Commit` and `Switch` ops carrying the workspace and change
+they moved (ids truncated here for width):
 
 ```console
 $ omo op log
-#1 set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo op undo
-#2 undo of #1: set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-  ref feature: sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120 -> (deleted)
-
-$ omo ref list
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo op log
-#2 undo #1
-#1 set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+#6 switch [main] ws/main sha256:ffcc… -> sha256:016d…
+#5 switch [main] ws/main sha256:016d… -> sha256:ffcc…
+#4 switch [main] ws/main sha256:ffcc… -> sha256:016d…
+#3 set-ref v1 ∅ -> sha256:016d…
+#2 set-ref feature ∅ -> sha256:ffcc…
+#1 commit [main] ws/main sha256:016d… -> sha256:ffcc… "second draft"
+#0 commit [main] ws/main ∅ -> sha256:016d… "first draft"
 ```
 
-The undo (`#2`) removed the `feature` ref, and the log keeps *all three* entries —
-history is a bi-temporal record you can query and invert, not a mutable pointer
-you rewrite. (More on the op log vs the reflog in §6.)
+Unlike git's reflog, `omo op undo` is a **true inverse**: it inverts the most
+recent operation and records *that* inversion as a new op. Undoing the `--force`
+switch (`#6`) moves the current change back to where it was and appends the undo:
 
-### Coming with workspaces (M2)
+```console
+$ omo op undo
+#7 undo of #6: switch [main] ws/main sha256:ffcc… -> sha256:016d…
+  ref ws/main: sha256:016d… -> sha256:ffcc…
+```
 
-The section above is a stopgap. The workspaces milestone (design-doc M2) brings
-the ergonomic verbs a git user actually reaches for:
+`op undo` reverses the **recorded pointer move** (transaction time) — the current
+change is back at the second draft. It does not re-run the checkout, so use
+`omo switch` if you also want the working files brought into line. The log keeps
+every entry, undo included, rather than rewriting a mutable pointer. (More on the
+op log vs the reflog in §6.)
 
-- **`omo commit`** — snapshot a working copy into a change (a whole-tree snapshot
-  with a message), advancing a ref in one step instead of `hash-object` +
-  `ref set` on a single file.
-- **`omo branch`** — first-class create / list / delete of named branches, instead
-  of setting refs by hand.
-- **`omo switch` / `checkout`** — materialize a change back into working files, and
-  move between multiple working copies over one shared object store.
+### How this maps to git
 
-When those land, this section will be **rewritten against the real verbs**. For
-now, treat the flow above as the honest truth of what runs today.
+| git | omoplata | What changed |
+|-----|----------|--------------|
+| `git commit -m` | `omo commit -m` | Snapshots the whole working dir into a tree; parent-linked. |
+| `git branch` | `omo branch [--from] [--list]` | Names a commit; a branch is still a ref underneath. |
+| `git switch` / `git checkout` | `omo switch [--force]` | Moves the current change and materializes the tree; dirty-guarded. |
+| *(git: one working tree)* | `omo workspace add/list/remove` | Several working dirs over one shared object store. |
+
+These rows are folded into the fuller git → omo command map in §4.
+
+### Multi-agent note
+
+Because workspaces share one `.omoplata` and every mutating verb takes the
+repository lock before it appends to the op log, **multiple workspaces driven by
+separate processes are safe to run concurrently**. Give each agent its own
+`omo workspace add <agent> <dir>`; they commit, branch, and switch against the
+shared store without losing each other's op-log updates. This concurrency is
+proven, not assumed — the suite exercises 12 workspaces mutating one repository at
+once — and it is the intended N-agent workflow: many agents working in parallel on
+one history, with the lock plus the bi-temporal op log keeping the record
+consistent.
 
 ---
 
@@ -312,6 +357,10 @@ now, treat the flow above as the honest truth of what runs today.
 | You know (git) | omoplata | Notes |
 |----------------|----------|-------|
 | `git init` | `omo init [path]` | Creates a `.omoplata/` control dir. |
+| *(git: one working tree)* | `omo workspace add/list/remove` | Several working dirs over one shared `.omoplata` (M2, §3). |
+| `git commit -m` | `omo commit -m <msg>` | Snapshots the workspace's whole working dir into a tree; parent-linked (§3). |
+| `git branch` | `omo branch [--from] [--list]` | Names a commit at the workspace tip or `--from`; lists with `--list` (§3). |
+| `git switch` / `git checkout` | `omo switch [--force]` | Moves the current change and materializes the tree; dirty-guarded (§3). |
 | `git hash-object -w` | `omo hash-object <path>` | Prints a `sha256:` object id (`-` reads stdin). |
 | `git cat-file -p` | `omo cat-object <id>` | Blob bytes, or a tree listing. |
 | `git diff` | `omo diff <base> <target>` | Unified-ish line diff. |
@@ -685,13 +734,6 @@ lower `--threshold` (e.g. `0.5`) when using `--real-embeddings`.
 This build scaffolds the design doc faithfully but is explicit about what is not
 yet the real thing:
 
-- **No everyday `commit` / `branch` / `switch` verbs yet.** There is no `omo
-  commit` (a message-bearing, working-tree snapshot), no `omo branch`, and no `omo
-  switch` / `checkout` — omo never materializes a stored tree back into your
-  working files. Today you assemble the loop by hand from `hash-object`,
-  `ref set`, `cat-object`, and `diff`, as documented in §3. These ergonomic verbs
-  are coming with **workspaces (design-doc M2)**, and §3 will be rewritten against
-  them when they land.
 - **Git transport is read-only and local.** There is no `git push` / `receive-pack`,
   and no networked (http/ssh) transports. `omo git fetch` works over the local
   `file://` / path transport shown in §5 — a real pkt-line / upload-pack clone —
