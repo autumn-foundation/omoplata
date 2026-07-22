@@ -13,12 +13,13 @@ else degrades to an honest, first-class conflict.
 > CLI — an 8-crate workspace covering the object store, patch algebra, definition
 > identity, the bi-temporal operation log, Tier-2 merge drivers, git interop, and
 > the semantic layer. It is honest about its reductions: the merge kernel's
-> **formal Verus proofs are deferred to property tests** (ADR-0003), the
-> per-language structural-merge fallback is a **built-in line/diff3 driver**
-> standing in for Mergiraf (ADR-0004), and the semantic layer uses a
-> **deterministic hashing embedder** standing in for a real embedding model
-> (ADR-0006). See [Reductions](#reductions-from-the-design-doc-in-this-build) for
-> the full list of what is and is not yet implemented.
+> **formal Verus proofs are deferred to property tests** (ADR-0003) and the
+> semantic layer uses a **deterministic hashing embedder** standing in for a real
+> embedding model (ADR-0006). The per-language structural-merge fallback is the
+> real **Mergiraf** tool, integrated as a PATH-detected shell-out driver with the
+> built-in line/diff3 driver as the no-tool fallback (ADR-0004). See
+> [Reductions](#reductions-from-the-design-doc-in-this-build) for the full list of
+> what is and is not yet implemented.
 
 ## Install
 
@@ -62,7 +63,7 @@ directory); `init`/`status` take a positional path.
 |---------|-------------|---------|
 | `omo diff <base> <target>` | Show the line diff turning `base` into `target`, unified-ish. | `omo diff a.txt b.txt` |
 | `omo merge <base> <left> <right>` | Three-way line merge; conflicts render as markers and exit non-zero. | `omo merge base left right` |
-| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver, everything else the line fallback. | `omo merge-file base.rs left.rs right.rs` |
+| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver; supported non-Rust files use the Mergiraf shell-out when it is on `PATH`, else the line fallback. | `omo merge-file base.json left.json right.json` |
 
 ### History and revsets
 
@@ -103,7 +104,7 @@ never a silently wrong merge.
 | 2 | `omoplata-algebra` | Canonical diff, patch algebra, commutation checker, conflicts-as-values — the verified core. | §5.2, §5.4, §7 #2 |
 | 3 | `omoplata-identity` | Change graph, supersession, phases, and the definition graph with structural matching. | §5.3, §5.5, §7 #3 |
 | 4 | `omoplata-work` | Working model: the bi-temporal operation log, total undo, and the revset engine. | §5.6, §5.8, §7 #4 |
-| 5 | `omoplata-drivers` | Tier-2 structural merge (Rust via tree-sitter) with a line/diff3 fallback — untrusted by design. | §4, §7 #5 |
+| 5 | `omoplata-drivers` | Tier-2 structural merge (Rust via tree-sitter; Mergiraf shell-out for 45+ other languages) with a line/diff3 fallback — untrusted by design. | §4, §7 #5 |
 | 6 | `omoplata-git` | Git object codec (blobs/trees/commits/tags), round-trip fidelity gate (I9), commit-graph import, and exact-mode export. | §7 #6, P8 |
 | 7 | `omoplata-sem` | Embedding pipeline, semantic search, and duplicate-work detection. | §5.7, §7 #7 |
 | 8 | `omoplata-cli` | The `omo` binary: command dispatch and the revset front-end. | §7 #8 |
@@ -136,9 +137,6 @@ the definitive statement of what is *not* yet the real thing:
   property tests against the executable code, not machine-checked Verus theorems.
   The design doc's central claim — a *proven* kernel — is therefore approximated,
   not delivered.
-- **Mergiraf fallback → built-in line/diff3 driver (ADR-0004).** Tier-2 structural
-  merge is implemented for Rust; everything else falls back to a built-in
-  line/diff3 driver rather than the Mergiraf adapter the doc names.
 - **Real embedding model → deterministic hashing stand-in (ADR-0006).** The
   semantic layer (`dup`, `similar`) uses a deterministic hashing embedder behind a
   pluggable `Embedder` trait. It is good enough to demonstrate duplicate-work

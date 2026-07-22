@@ -436,6 +436,7 @@ version = "0.1.0"
 dependencies = [
  "omoplata-algebra",
  "omoplata-identity",
+ "tempfile",
  "thiserror",
 ]
 

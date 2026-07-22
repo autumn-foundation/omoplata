@@ -15,9 +15,10 @@
 //!
 //! Per §8 scope, v1 implements "Tier-2 structural merge for **Rust only** (one
 //! grammar, dogfooded on the Autumn stack), **Mergiraf as the fallback driver**
-//! for everything else". Mergiraf is an external binary not vendored here; see
-//! `docs/adr/0004-merge-drivers.md` — this crate's built-in [`LineDriver`]
-//! stands in for it.
+//! for everything else". Mergiraf is an external binary that is **not** vendored
+//! or linked here; when it is present on `PATH` the [`MergirafDriver`] shells out
+//! to it for supported non-Rust files, and the built-in [`LineDriver`] is the
+//! no-tool fallback when it is absent. See `docs/adr/0004-merge-drivers.md`.
 //!
 //! # Trust boundary
 //!
@@ -35,9 +36,14 @@
 //! * [`RustStructuralDriver`] — Tier-2 structural merge for Rust, at definition
 //!   granularity via tree-sitter. Merges cleanly where a line merge conflicts
 //!   (e.g. two branches each appending a new item at the same location).
-//! * [`LineDriver`] — the diff3 fallback (Mergiraf stand-in) for everything else.
+//! * [`MergirafDriver`] — a PATH-detected shell-out to the external
+//!   [Mergiraf](https://mergiraf.org) tool, the Tier-2 structural fallback for
+//!   45+ non-Rust languages. Selected only when the binary is available.
+//! * [`LineDriver`] — the diff3 line fallback used when Mergiraf is absent or
+//!   the extension is unsupported, so the crate needs no external tool.
 //!
-//! [`select_driver`] picks the driver by file extension.
+//! [`select_driver`] picks the driver by file extension (and, for non-Rust
+//! paths, by whether Mergiraf is available and supports the extension).
 //!
 //! # Example
 //!
@@ -59,10 +65,12 @@
 
 mod error;
 mod line;
+mod mergiraf;
 pub mod rust;
 
 pub use error::DriverError;
 pub use line::LineDriver;
+pub use mergiraf::{mergiraf_available, parse_diff3_conflicts, supports_extension, MergirafDriver};
 pub use rust::RustStructuralDriver;
 
 /// The three sides of a three-way merge plus the path being merged.
@@ -126,13 +134,21 @@ pub trait MergeDriver {
 
 /// Select a driver for `path` by file extension.
 ///
-/// `.rs` files use the [`RustStructuralDriver`] (Tier-2 structural, the point of
-/// M5); everything else uses the [`LineDriver`] fallback (the Mergiraf
-/// stand-in). Matching is on the final `.rs` extension only.
+/// * `.rs` files use the [`RustStructuralDriver`] (Tier-2 structural, the point
+///   of M5).
+/// * Any other path uses the [`MergirafDriver`] **if** the `mergiraf` binary is
+///   available on `PATH` ([`mergiraf_available`]) **and** the extension is one
+///   Mergiraf supports ([`supports_extension`]).
+/// * Otherwise it falls back to the built-in [`LineDriver`], so selection always
+///   returns a working driver even with no external tool present.
+///
+/// Matching is on the final extension only.
 #[must_use]
 pub fn select_driver(path: &str) -> Box<dyn MergeDriver> {
     if has_extension(path, "rs") {
         Box::new(RustStructuralDriver::new())
+    } else if mergiraf_available() && supports_extension(path) {
+        Box::new(MergirafDriver::new())
     } else {
         Box::new(LineDriver::new())
     }

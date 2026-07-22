@@ -1,7 +1,11 @@
-# ADR-0004: Tier-2 merge drivers — Rust structural + built-in line fallback (Mergiraf stand-in)
+# ADR-0004: Tier-2 merge drivers — Rust structural + Mergiraf shell-out (line fallback when absent)
 
 - Status: Accepted
 - Date: 2026-07-22
+- Updated: 2026-07-22 — Mergiraf is now integrated as a real, PATH-detected
+  shell-out driver (`MergirafDriver`), replacing the built-in line stand-in for
+  supported non-Rust files. The built-in `LineDriver` remains the fallback used
+  only when the `mergiraf` binary is absent or the extension is unsupported.
 
 ## Context
 The design doc's merge pipeline (§4) escalates surviving conflicts to a
@@ -21,15 +25,20 @@ conflict, never a silently wrong merge.
 
 Two facts shape this milestone (M5):
 
-1. **Mergiraf is an external binary and is not vendored into this environment.**
-   Wiring a hard dependency on a tool that is not present would make the crate
-   unbuildable/untestable here.
+1. **Mergiraf is an external tool with a GPL license and an unstable library
+   API.** It ships as a Rust crate, but (a) it is **GPL-3.0-only**, so linking
+   it into `omoplata-drivers` would force the whole workspace's license posture
+   to the GPL, and (b) its library API is explicitly documented as unstable and
+   not for external consumers. Its **command-line interface is the stable,
+   supported contract**. It is also not guaranteed to be present in every
+   environment, so a hard dependency (crate *or* binary) would make the crate
+   unbuildable/untestable where it is absent.
 2. **tree-sitter is error-tolerant.** It recovers from malformed input and
    still returns a best-effort tree with `ERROR` / `MISSING` nodes, so a naive
    structural driver would happily merge partially-parsed trees.
 
 ## Decision
-`omoplata-drivers` ships two drivers behind a `MergeDriver` trait, selected by
+`omoplata-drivers` ships three drivers behind a `MergeDriver` trait, selected by
 file extension (`select_driver`):
 
 - **`RustStructuralDriver` (`"rust-structural"`)** — the Tier-2 structural merge
@@ -44,18 +53,44 @@ file extension (`select_driver`):
   `Conflict` value. This succeeds where a pure line merge conflicts — e.g. two
   branches each appending a new item at the same textual location.
 
-- **`LineDriver` (`"line"`)** — a diff3-style line merge wrapping the verified
-  `omoplata_algebra::merge3`, used for every non-`.rs` path.
+- **`MergirafDriver` (`"mergiraf"`)** — a **PATH-detected shell-out** to the
+  external [Mergiraf](https://mergiraf.org) tool, the Tier-2 structural fallback
+  for the 45+ non-Rust languages it supports (Java, Go, JSON, YAML, TOML,
+  JS/TS, Python, C/C++, …). It writes base/left/right into a per-call tempdir
+  (named with the real extension so Mergiraf picks the right grammar) and runs
+  `mergiraf merge <base> <left> <right> -p <path> -o <out>` with stable marker
+  labels (`-s base -x left -y right`) and a `-t` timeout. Exit 0 is a clean
+  merge; exit 1 leaves diff3-style markers in the output, which the driver parses
+  into first-class `Conflict` values (the source of truth). Any other outcome
+  (missing binary, spawn failure, abnormal exit) surfaces as a `DriverError` so a
+  misbehaving tool is *visible*, not silently degraded.
 
-### The Mergiraf substitution (flagged)
-**The built-in `LineDriver` stands in for the design doc's named Mergiraf
-fallback.** Mergiraf is an external binary not bundled in this environment, so
-the honest built-in fallback (diff3 over lines) is the *current* fallback
-driver. In the full system the fallback slot would delegate to `mergiraf` when
-it is available on `PATH`; that shelling-out is **not** implemented here, and
-the built-in fallback is designed to work with no external tool. This is a
-deliberate substitution and is called out as such rather than pretending
-Mergiraf is wired.
+- **`LineDriver` (`"line"`)** — a diff3-style line merge wrapping the verified
+  `omoplata_algebra::merge3`, used for a non-`.rs` path when Mergiraf is **absent
+  from `PATH`** or the extension is not one Mergiraf supports.
+
+### Mergiraf: integrated as a shell-out, not linked (why)
+`MergirafDriver` earlier stood in as the built-in `LineDriver`; it **is now the
+real Mergiraf**, wired as a subprocess. We shell out to the `mergiraf` binary
+rather than depending on the crate for two reasons stated in Context: Mergiraf
+is **GPL-3.0-only** (a process boundary keeps it a program we *invoke*, not a
+library we *incorporate*, so it does not relicense the workspace), and its
+**library API is unstable** while its CLI is the supported contract.
+
+The process boundary is also the right **trust posture**. A Tier-2 driver is an
+*untrusted proposer* (P1); Mergiraf additionally parses attacker-influenceable
+input coming from an untrusted proposer. Running it out-of-process across a
+filesystem boundary means a crash or misbehaviour in the child is an exit status
+we observe, not memory we share. Its output remains a *candidate* the verified
+kernel still gates.
+
+**No hard dependency.** `mergiraf` is optional. A cached (`OnceLock`)
+`mergiraf --version` probe (`mergiraf_available()`) decides at selection time
+whether a supported non-Rust path uses `MergirafDriver` or falls back to the
+built-in `LineDriver`. The crate therefore stays buildable and testable with no
+external tool present — the integration tests that exercise the real binary are
+guarded and skip when it is absent. This preserves the original
+no-hard-dependency guarantee while delivering the real tool where it exists.
 
 ### Parse fallback for the structural driver
 Because tree-sitter recovers from malformed input, the structural driver checks
@@ -81,6 +116,15 @@ merging a broken tree. This keeps the driver safe on partial/invalid sources.
   during reassembly, but the design doc's full Roslyn-style trivia-ownership
   policy and the kernel's I11 conservation check are not yet implemented here.
   This matches the doc's staging (§4 Tier 2, Q2) and is a documented gap.
-- **Optional Mergiraf detection is deferred.** Detecting `mergiraf` on `PATH`
-  and shelling out is a clean future addition behind the same `MergeDriver`
-  trait; the built-in fallback must (and does) work without it.
+- **Mergiraf is integrated (was deferred).** Detecting `mergiraf` on `PATH` and
+  shelling out is now implemented as `MergirafDriver` behind the same
+  `MergeDriver` trait; the built-in `LineDriver` fallback still works (and is
+  used) without it. Selection is extension-based, so grammars Mergiraf keys off a
+  *bare filename* (e.g. `Makefile`, `go.mod`, `CMakeLists.txt`) route to the line
+  fallback — a documented, safe conservatism.
+- **Structural merges are "provisional/downgraded" at the CLI's kernel gate.**
+  `omo merge-file`'s M9 kernel-certify step uses the *line* kernel, which cannot
+  witness a structural (Mergiraf or Rust) merge and may downgrade a clean
+  structural result to a conflict / non-zero exit. This is expected: the driver's
+  merged text is still emitted, and callers assert on merged content, not the
+  exit code. Hosting a structural kernel admission check is later work.
