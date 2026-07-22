@@ -102,6 +102,47 @@ pub enum OpKind {
         /// How many conflict values the rebase carried forward (0 == clean).
         conflicts: usize,
     },
+    /// Snapshot a workspace's working copy into a new commit (§5.1, P4).
+    ///
+    /// This is the transaction-time record of the everyday-loop `omo commit`
+    /// verb: a workspace's working directory was snapshotted into a `tree`
+    /// object (whose [`ObjectId`](omoplata_store::ObjectId), rendered as a
+    /// [`CommitId`], *is* the new commit), advancing that workspace's
+    /// current-change tip from `parent` to `tree`.
+    ///
+    /// Like every other variant it is invertible on its own (I7): it names both
+    /// the `parent` tip (restored on undo) and the new `tree` tip, and when
+    /// folded it points the change's ref (keyed by [`ChangeId`]) at `tree`. The
+    /// valid-time half — that `tree` supersedes `parent` — is the `parent` field
+    /// itself, mirroring how [`Rebase`](OpKind::Rebase) records `old_tip`.
+    Commit {
+        /// The workspace whose working copy was snapshotted.
+        workspace: String,
+        /// The change whose tip advances (the workspace's current change).
+        change: ChangeId,
+        /// The new commit: the snapshot tree's object id, as a [`CommitId`].
+        tree: CommitId,
+        /// The change's tip before this commit (`None` for the first commit).
+        parent: Option<CommitId>,
+        /// The commit message, if one was supplied.
+        message: Option<String>,
+    },
+    /// Move a workspace's current-change pointer to another commit (checkout).
+    ///
+    /// The transaction-time record of `omo switch`: the workspace's
+    /// current-change tip moved from `from` to `to`, and its working directory
+    /// was re-materialized to `to`'s tree. Both endpoints are stored so the move
+    /// is invertible (I7); when folded it points the change's ref at `to`.
+    Switch {
+        /// The workspace whose current pointer moved.
+        workspace: String,
+        /// The change whose tip pointer moved.
+        change: ChangeId,
+        /// The tip before the switch (`None` if the change had no tip).
+        from: Option<CommitId>,
+        /// The tip after the switch (the checkout target).
+        to: CommitId,
+    },
     /// Invert the operation at transaction time `target_seq`.
     ///
     /// This is how undo (and, when `target_seq` names another `Undo`, redo) is
@@ -140,6 +181,32 @@ impl OpKind {
                     format!("{conflicts} conflict(s)")
                 };
                 format!("rebase {change} {old_tip} -> {new_tip} onto {onto} ({carried})")
+            }
+            OpKind::Commit {
+                workspace,
+                change,
+                tree,
+                parent,
+                message,
+            } => {
+                let from = parent
+                    .as_ref()
+                    .map_or_else(|| "∅".to_owned(), ToString::to_string);
+                let msg = message
+                    .as_ref()
+                    .map_or_else(String::new, |m| format!(" \"{m}\""));
+                format!("commit [{workspace}] {change} {from} -> {tree}{msg}")
+            }
+            OpKind::Switch {
+                workspace,
+                change,
+                from,
+                to,
+            } => {
+                let from = from
+                    .as_ref()
+                    .map_or_else(|| "∅".to_owned(), ToString::to_string);
+                format!("switch [{workspace}] {change} {from} -> {to}")
             }
             OpKind::Undo { target_seq } => format!("undo #{target_seq}"),
         }
@@ -318,6 +385,18 @@ impl OpLog {
                     change, new_tip, ..
                 } => {
                     refs.insert(change.to_string(), new_tip.clone());
+                }
+                // A `Commit` advances the change's ref (keyed by [`ChangeId`]) to
+                // the snapshot tree. Deactivating it (undo) drops this insert, so
+                // the prior active operation restores `parent` — invertibility
+                // (I7).
+                OpKind::Commit { change, tree, .. } => {
+                    refs.insert(change.to_string(), tree.clone());
+                }
+                // A `Switch` repoints the change's ref at the checkout target.
+                // Deactivating it restores `from` via the prior active op (I7).
+                OpKind::Switch { change, to, .. } => {
+                    refs.insert(change.to_string(), to.clone());
                 }
                 OpKind::SetPhase { .. } | OpKind::Undo { .. } => {}
             }

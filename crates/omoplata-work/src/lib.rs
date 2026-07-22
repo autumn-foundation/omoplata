@@ -47,8 +47,10 @@ mod autorebase;
 mod error;
 mod oplog;
 mod revset;
+mod workspace;
 
 pub use autorebase::{ChangeHistory, RebaseEngine, RebaseOutcome, RebaseRecord, StackItem};
 pub use error::WorkError;
 pub use oplog::{OpKind, OpLog, Operation};
 pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};
+pub use workspace::{is_dirty, materialize, snapshot, Workspace, WorkspaceRegistry};
