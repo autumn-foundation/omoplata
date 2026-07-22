@@ -129,8 +129,8 @@ kernel: downgraded to conflict (rust-structural proposal not independently witne
 
 Note the last line: the structural driver produced a clean answer, but the
 *kernel* would not independently witness it, so it is honestly downgraded rather
-than shipped. (More on this in §5.) A merge the kernel *can* re-derive is
-admitted — see §5.
+than shipped. (More on this in §6.) A merge the kernel *can* re-derive is
+admitted — see §6.
 
 **Track a definition across a rename** (git sees a modified line; `omo` sees a
 renamed definition):
@@ -142,7 +142,172 @@ renamed compute_area -> area_of_rect (fn)
 
 ---
 
-## 3. git → omo command map
+## 3. The everyday loop today: commits, branches, switching (and what's missing)
+
+If you come from git, the first muscle-memory you reach for is the everyday loop:
+commit your work, branch off, switch between branches. **Be warned up front:**
+omoplata today is closer to git's *plumbing* than its *porcelain*. There is **no
+`omo commit`** (no verb that snapshots a working directory into a change with a
+message and advances a ref), **no `omo branch`**, and **no `omo switch` /
+`checkout`** (omo never writes a stored tree back out into your working files).
+Those are exactly what git users want first — and they aren't here yet:
+
+```console
+$ omo commit
+error: unrecognized subcommand 'commit'
+
+  tip: a similar subcommand exists: 'admit'
+
+$ omo switch
+error: unrecognized subcommand 'switch'
+
+Usage: omo <COMMAND>
+```
+
+These ergonomic verbs are being built as part of **workspaces (design-doc M2)**;
+this section will be rewritten against them when they land (see the note at the
+end). Until then, here is the honest raw-plumbing flow you assemble by hand from
+the commands that *do* exist. Every block below is real executed output.
+
+### "Committing" a snapshot today
+
+There is no working-directory snapshot commit with a message. What you have is:
+store content as a **content-addressed object** with `omo hash-object`, then point
+a **named ref** at that object id with `omo ref set`. That ref-move is recorded in
+the op log.
+
+```console
+$ printf 'title: notes\nbody: first draft\n' > notes.txt
+
+$ omo hash-object notes.txt
+sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo ref set main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+#0 set-ref main -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo op log
+#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo ref list
+main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+```
+
+**What this is and isn't.** `omo hash-object` stores a **single object** (one
+file's bytes), and `omo ref set` points a name at that one object id — it does
+**not** snapshot a whole working directory into a tree, and there is **no commit
+message, author, or parent link**. It's the moral equivalent of `git hash-object
+-w` followed by `git update-ref`, with no `git commit` on top yet. That
+message-bearing, working-tree-snapshotting `omo commit` is the missing verb coming
+with workspaces.
+
+### "Branching" today
+
+A "branch" here is just a second named ref. There is **no `omo branch` verb** —
+you name refs directly with `omo ref set`. Store a variant, point a new ref at it,
+and now two names coexist:
+
+```console
+$ printf 'title: notes\nbody: feature draft\n' > notes.feature.txt
+
+$ omo hash-object notes.feature.txt
+sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+
+$ omo ref set feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+#1 set-ref feature -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+
+$ omo ref list
+feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+```
+
+Query across your "branches" with a revset, and compare their states by diffing
+the files directly:
+
+```console
+$ omo revset 'main | feature'
+sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+
+$ omo diff notes.txt notes.feature.txt
+@@ -2,1 +2,1 @@
+-body: first draft
++body: feature draft
+```
+
+Missing verb flagged: `omo branch` (create/list/delete branches by name). Today a
+branch is a ref you set by hand; there's no first-class branch command over it.
+
+### "Switching" / "checking out" today — the biggest gap
+
+Be direct: there is **no `omo switch` / `checkout`**. omo does **not** materialize
+a stored tree back into your working files — nothing writes a ref's content over
+your working directory. So you never "check out" `feature` into the working dir
+the way `git switch feature` would.
+
+What you *can* do is inspect stored state without touching your working files —
+list refs, and read an object's bytes back with `omo cat-object`:
+
+```console
+$ omo ref list
+feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo cat-object sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+title: notes
+body: feature draft
+```
+
+To act on a ref's content you redirect `omo cat-object` into a file yourself and
+diff it — there is no command that swaps your working tree to match a ref. This is
+the single biggest gap versus git, and the one workspaces is designed to close.
+
+### Undo and history
+
+The op log is your history, and unlike git's reflog `omo op undo` is a **true
+inverse** — it computes and applies the inverse operation and records *that* as a
+new op, rather than leaving you a pointer you can read but not cleanly reverse:
+
+```console
+$ omo op log
+#1 set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo op undo
+#2 undo of #1: set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+  ref feature: sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120 -> (deleted)
+
+$ omo ref list
+main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+
+$ omo op log
+#2 undo #1
+#1 set-ref feature ∅ -> sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+```
+
+The undo (`#2`) removed the `feature` ref, and the log keeps *all three* entries —
+history is a bi-temporal record you can query and invert, not a mutable pointer
+you rewrite. (More on the op log vs the reflog in §6.)
+
+### Coming with workspaces (M2)
+
+The section above is a stopgap. The workspaces milestone (design-doc M2) brings
+the ergonomic verbs a git user actually reaches for:
+
+- **`omo commit`** — snapshot a working copy into a change (a whole-tree snapshot
+  with a message), advancing a ref in one step instead of `hash-object` +
+  `ref set` on a single file.
+- **`omo branch`** — first-class create / list / delete of named branches, instead
+  of setting refs by hand.
+- **`omo switch` / `checkout`** — materialize a change back into working files, and
+  move between multiple working copies over one shared object store.
+
+When those land, this section will be **rewritten against the real verbs**. For
+now, treat the flow above as the honest truth of what runs today.
+
+---
+
+## 4. git → omo command map
 
 | You know (git) | omoplata | Notes |
 |----------------|----------|-------|
@@ -151,10 +316,10 @@ renamed compute_area -> area_of_rect (fn)
 | `git cat-file -p` | `omo cat-object <id>` | Blob bytes, or a tree listing. |
 | `git diff` | `omo diff <base> <target>` | Unified-ish line diff. |
 | `git merge` | `omo merge <base> <left> <right>` | Three-way line merge; conflicts become values, exit non-zero. |
-| `git merge-file` | `omo merge-file <base> <left> <right>` | Tier-2 structural merge by extension, then kernel-checked (§5). |
+| `git merge-file` | `omo merge-file <base> <left> <right>` | Tier-2 structural merge by extension, then kernel-checked (§6). |
 | `git update-ref` | `omo ref set <name> <commit>` | Appends a `SetRef` op to the log. |
 | `git show-ref` | `omo ref list` | Lists refs as `name commit`. |
-| `git reflog` | `omo op log` | Bi-temporal op log, newest first (§5). |
+| `git reflog` | `omo op log` | Bi-temporal op log, newest first (§6). |
 | *(no clean analog)* | `omo op undo` | True inverse of the last op; not just a pointer you read. |
 | `git rev-list` / set ops | `omo revset '<expr>'` | `a & b`, `a \| b`, `~a`, `all()`, `heads()`, `draft()`, `public()`. |
 | `git rebase` | `omo rebase <base> <mine> <onto>` | Never fails; overlaps carried as conflict values. |
@@ -174,7 +339,7 @@ works at the definition and value layer, not the file-and-line layer.
 
 ---
 
-## 4. Migrating an existing git repo
+## 5. Migrating an existing git repo
 
 omoplata reads a real `.git` directory and can write one back out byte-identically,
 so you can adopt it incrementally and keep using git side-by-side.
@@ -268,7 +433,7 @@ round-trip gate: PASS
 
 ---
 
-## 5. Concepts a git user must reframe
+## 6. Concepts a git user must reframe
 
 ### Conflicts are values, not marker-soup you must resolve now
 
@@ -515,14 +680,21 @@ lower `--threshold` (e.g. `0.5`) when using `--real-embeddings`.
 
 ---
 
-## 6. Current limitations (honest)
+## 7. Current limitations (honest)
 
 This build scaffolds the design doc faithfully but is explicit about what is not
 yet the real thing:
 
+- **No everyday `commit` / `branch` / `switch` verbs yet.** There is no `omo
+  commit` (a message-bearing, working-tree snapshot), no `omo branch`, and no `omo
+  switch` / `checkout` — omo never materializes a stored tree back into your
+  working files. Today you assemble the loop by hand from `hash-object`,
+  `ref set`, `cat-object`, and `diff`, as documented in §3. These ergonomic verbs
+  are coming with **workspaces (design-doc M2)**, and §3 will be rewritten against
+  them when they land.
 - **Git transport is read-only and local.** There is no `git push` / `receive-pack`,
   and no networked (http/ssh) transports. `omo git fetch` works over the local
-  `file://` / path transport shown in §4 — a real pkt-line / upload-pack clone —
+  `file://` / path transport shown in §5 — a real pkt-line / upload-pack clone —
   but not over the network.
 - **Real embeddings need the network on first use.** The offline default is a
   deterministic hashing stand-in (fully reproducible, no download). The real
