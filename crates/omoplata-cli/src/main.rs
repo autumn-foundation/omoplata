@@ -17,7 +17,15 @@ use omoplata_work::{MapContext, OpKind, OpLog};
 
 /// omoplata: a version control system with a verified merge kernel.
 #[derive(Debug, Parser)]
-#[command(name = "omo", version, about, long_about = None)]
+#[command(
+    name = "omo",
+    version,
+    about = "omoplata: a version control system with a verified merge kernel",
+    long_about = "omoplata (omo) is a version control system built on a verified merge kernel \
+        — no silent wrong answers. It is definition-level (it tracks durable definitions, not \
+        files, across renames), bi-temporal (history is queryable in both valid and \
+        transaction time), and git-interoperable (git objects round-trip through a release gate)."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -606,36 +614,28 @@ fn cmd_track(old: PathBuf, new: PathBuf) -> anyhow::Result<()> {
     let describe = |d: &Definition| format!("{} ({})", d.path, d.kind.label());
 
     for m in match_definitions(&old_defs, &new_defs) {
-        let line = match m.status {
-            MatchStatus::Renamed => {
-                let o = &old_defs[m.old.expect("renamed has old")];
-                let n = &new_defs[m.new.expect("renamed has new")];
+        // Each status carries the side indices its meaning implies; a match that
+        // does not is a matcher bug, so we skip it rather than emit a misleading
+        // line or panic in a production path.
+        let line = match (m.status, m.old, m.new) {
+            (MatchStatus::Renamed, Some(o), Some(n)) => {
+                let o = &old_defs[o];
+                let n = &new_defs[n];
                 format!("renamed {} -> {} ({})", o.path, n.path, n.kind.label())
             }
-            MatchStatus::Modified => {
-                format!(
-                    "modified {}",
-                    describe(&new_defs[m.new.expect("modified has new")])
-                )
+            (MatchStatus::Modified, _, Some(n)) => {
+                format!("modified {}", describe(&new_defs[n]))
             }
-            MatchStatus::Unchanged => {
-                format!(
-                    "unchanged {}",
-                    describe(&new_defs[m.new.expect("unchanged has new")])
-                )
+            (MatchStatus::Unchanged, _, Some(n)) => {
+                format!("unchanged {}", describe(&new_defs[n]))
             }
-            MatchStatus::Added => {
-                format!(
-                    "added {}",
-                    describe(&new_defs[m.new.expect("added has new")])
-                )
+            (MatchStatus::Added, _, Some(n)) => {
+                format!("added {}", describe(&new_defs[n]))
             }
-            MatchStatus::Deleted => {
-                format!(
-                    "deleted {}",
-                    describe(&old_defs[m.old.expect("deleted has old")])
-                )
+            (MatchStatus::Deleted, Some(o), _) => {
+                format!("deleted {}", describe(&old_defs[o]))
             }
+            _ => continue,
         };
         println!("{line}");
     }
