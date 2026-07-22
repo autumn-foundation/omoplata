@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use omoplata_algebra::{diff, merge3, Doc};
+use omoplata_drivers::{select_driver, MergeInput};
 use omoplata_identity::{
     extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
 };
@@ -61,6 +62,20 @@ enum Command {
     /// with conflicts renders conflict markers into the output, prints a
     /// summary to stderr, and exits with a non-zero status.
     Merge {
+        /// The common base file.
+        base: PathBuf,
+        /// The left side.
+        left: PathBuf,
+        /// The right side.
+        right: PathBuf,
+    },
+    /// Three-way merge three files with the Tier-2 driver chosen by extension.
+    ///
+    /// Selects the driver from the base path's extension (§4 Tier 2): `.rs`
+    /// files use the Rust structural driver, everything else the line fallback.
+    /// Prints the merged output to stdout and `<driver> merge: N conflict(s)` to
+    /// stderr; exits 0 if clean, non-zero otherwise.
+    MergeFile {
         /// The common base file.
         base: PathBuf,
         /// The left side.
@@ -170,6 +185,7 @@ fn run() -> anyhow::Result<i32> {
         Command::CatObject { id, repo } => cmd_cat_object(repo, id).map(|()| 0),
         Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
+        Command::MergeFile { base, left, right } => cmd_merge_file(base, left, right),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
         Command::Ref { action } => match action {
@@ -405,6 +421,40 @@ fn cmd_merge(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32
     } else {
         let n = result.conflicts.len();
         eprintln!("{n} conflict(s)");
+        Ok(1)
+    }
+}
+
+/// `omo merge-file <base> <left> <right>` — Tier-2 driver merge (§4).
+///
+/// The driver is chosen from the base path's extension: `.rs` uses the Rust
+/// structural driver, everything else the line fallback. The merged output goes
+/// to stdout; a `<driver> merge: N conflict(s)` summary goes to stderr. Exit 0
+/// if clean, 1 if conflicted.
+fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32> {
+    let base_text =
+        std::fs::read_to_string(&base).with_context(|| format!("reading {}", base.display()))?;
+    let left_text =
+        std::fs::read_to_string(&left).with_context(|| format!("reading {}", left.display()))?;
+    let right_text =
+        std::fs::read_to_string(&right).with_context(|| format!("reading {}", right.display()))?;
+
+    let path = base.to_string_lossy();
+    let driver = select_driver(&path);
+    let out = driver.merge(&MergeInput {
+        base: &base_text,
+        left: &left_text,
+        right: &right_text,
+        path: &path,
+    })?;
+
+    print!("{}", out.merged);
+
+    let n = out.conflicts.len();
+    eprintln!("{} merge: {n} conflict(s)", out.driver);
+    if out.is_clean() {
+        Ok(0)
+    } else {
         Ok(1)
     }
 }

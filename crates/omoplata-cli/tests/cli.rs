@@ -260,6 +260,55 @@ fn revset_unknown_ref_fails() {
 }
 
 #[test]
+fn merge_file_rust_structural_clean_merge() {
+    // Both sides append a new top-level fn at the same location: the line
+    // driver would conflict, but the Rust structural driver merges cleanly.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.rs");
+    let left = dir.path().join("left.rs");
+    let right = dir.path().join("right.rs");
+    std::fs::write(&base, "fn a() {}\n\nfn b() {}\n").unwrap();
+    std::fs::write(&left, "fn a() {}\n\nfn b() {}\n\nfn c() {}\n").unwrap();
+    std::fs::write(&right, "fn a() {}\n\nfn b() {}\n\nfn d() {}\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fn a()"))
+        .stdout(predicate::str::contains("fn b()"))
+        .stdout(predicate::str::contains("fn c()"))
+        .stdout(predicate::str::contains("fn d()"))
+        .stderr(predicate::str::contains(
+            "rust-structural merge: 0 conflict(s)",
+        ));
+}
+
+#[test]
+fn merge_file_txt_line_conflict_exits_nonzero() {
+    // A non-.rs path uses the line fallback; a same-line divergent edit
+    // conflicts and exits non-zero.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&left, "a\nX\nc\n").unwrap();
+    std::fs::write(&right, "a\nY\nc\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< left"))
+        .stderr(predicate::str::contains("line merge: 1 conflict(s)"));
+}
+
+#[test]
 fn merge_conflict_exits_nonzero_with_markers() {
     let dir = tempdir().unwrap();
     let base = dir.path().join("base.txt");

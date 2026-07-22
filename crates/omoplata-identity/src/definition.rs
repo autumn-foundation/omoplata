@@ -203,6 +203,29 @@ pub fn extract_definitions(source: &str) -> Result<Vec<Definition>, IdentityErro
     Ok(out)
 }
 
+/// Whether `source` parses as Rust with no error nodes.
+///
+/// tree-sitter is deliberately error-tolerant: it recovers from malformed input
+/// and still returns a tree (with `ERROR` / `MISSING` nodes), so
+/// [`extract_definitions`] succeeds even on invalid source. Callers that must
+/// not operate on a best-effort parse — notably the Tier-2 structural merge
+/// driver, which would otherwise merge partially-parsed trees — use this to
+/// detect malformed input and degrade to a safer path.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Grammar`] if the grammar cannot be loaded, or
+/// [`IdentityError::Parse`] if the source yields no tree at all.
+pub fn parses_cleanly(source: &str) -> Result<bool, IdentityError> {
+    let mut parser = Parser::new();
+    let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+    parser
+        .set_language(&language)
+        .map_err(|e| IdentityError::Grammar(e.to_string()))?;
+    let tree = parser.parse(source, None).ok_or(IdentityError::Parse)?;
+    Ok(!tree.root_node().has_error())
+}
+
 /// Recursively collect definitions under `node`, qualifying names with `prefix`.
 fn collect(node: Node, source: &str, prefix: &str, out: &mut Vec<Definition>) {
     let mut cursor = node.walk();

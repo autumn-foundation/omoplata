@@ -40,7 +40,7 @@ mod error;
 
 pub use change::{Change, ChangeGraph, ChangeId, CommitId, Phase};
 pub use definition::{
-    extract_definitions, match_definitions, DefMatch, Definition, DefinitionGraph, DefinitionId,
-    DefinitionKind, MatchStatus, OccurrenceId,
+    extract_definitions, match_definitions, parses_cleanly, DefMatch, Definition, DefinitionGraph,
+    DefinitionId, DefinitionKind, MatchStatus, OccurrenceId,
 };
 pub use error::IdentityError;

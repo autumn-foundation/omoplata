@@ -14,6 +14,7 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 omoplata-store = { path = "../omoplata-store" }
 omoplata-algebra = { path = "../omoplata-algebra" }
+omoplata-drivers = { path = "../omoplata-drivers" }
 omoplata-identity = { path = "../omoplata-identity" }
 omoplata-work = { path = "../omoplata-work" }
 

@@ -385,11 +385,21 @@ dependencies = [
  "assert_cmd",
  "clap",
  "omoplata-algebra",
+ "omoplata-drivers",
  "omoplata-identity",
  "omoplata-store",
  "omoplata-work",
  "predicates",
  "tempfile",
+]
+
+[[package]]
+name = "omoplata-drivers"
+version = "0.1.0"
+dependencies = [
+ "omoplata-algebra",
+ "omoplata-identity",
+ "thiserror",
 ]
 
 [[package]]
