@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::IdentityError;
 
 /// A stable change identity that survives rebase and amend (§5.3, P5).
@@ -23,7 +25,7 @@ use crate::error::IdentityError;
 /// Unlike a [`CommitId`], a `ChangeId` is not content-addressed: it is minted
 /// once and then carried across every revision of the logical change. Explicit
 /// construction is provided so tests are deterministic.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChangeId(String);
 
 impl ChangeId {
@@ -59,7 +61,7 @@ impl std::fmt::Display for ChangeId {
 ///
 /// The identity layer treats a commit id as an opaque hash string; the object
 /// store owns the actual hashing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CommitId(String);
 
 impl CommitId {
@@ -84,7 +86,7 @@ impl std::fmt::Display for CommitId {
 ///
 /// Phases are ordered: `Draft < Public`. A change may advance `Draft -> Public`
 /// but never regress — enforced by [`ChangeGraph::set_phase`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Phase {
     /// A rewritable change: its commits may be superseded.
     Draft,

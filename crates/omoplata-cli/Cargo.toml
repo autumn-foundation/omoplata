@@ -15,6 +15,7 @@ anyhow = { workspace = true }
 omoplata-store = { path = "../omoplata-store" }
 omoplata-algebra = { path = "../omoplata-algebra" }
 omoplata-identity = { path = "../omoplata-identity" }
+omoplata-work = { path = "../omoplata-work" }
 
 [dev-dependencies]
 assert_cmd = "2"

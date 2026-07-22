@@ -182,6 +182,84 @@ fn track_detects_rename() {
 }
 
 #[test]
+fn ref_set_list_undo_and_op_log() {
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let a = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let b = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+    // Set two refs.
+    omo()
+        .args(["ref", "set", "a", a, "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    omo()
+        .args(["ref", "set", "b", b, "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    // `ref list` shows both.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("a {a}")))
+        .stdout(predicate::str::contains(format!("b {b}")));
+
+    // `revset 'a | b'` prints the two commit ids.
+    omo()
+        .args(["revset", "a | b", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(a))
+        .stdout(predicate::str::contains(b));
+
+    // `op undo` reverts the last op (deletes ref b).
+    omo()
+        .args(["op", "undo", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("undo of #1"));
+
+    // `ref list` now shows only a.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("a {a}")))
+        .stdout(predicate::str::contains("b ").not());
+
+    // `op log` shows the growing history (3 entries: two sets + the undo).
+    omo()
+        .args(["op", "log", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#2 undo #1"))
+        .stdout(predicate::str::contains("#1 set-ref b"))
+        .stdout(predicate::str::contains("#0 set-ref a"));
+}
+
+#[test]
+fn revset_unknown_ref_fails() {
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+    omo()
+        .args(["revset", "nope", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown ref"));
+}
+
+#[test]
 fn merge_conflict_exits_nonzero_with_markers() {
     let dir = tempdir().unwrap();
     let base = dir.path().join("base.txt");

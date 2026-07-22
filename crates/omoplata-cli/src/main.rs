@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use omoplata_algebra::{diff, merge3, Doc};
-use omoplata_identity::{extract_definitions, match_definitions, Definition, MatchStatus};
+use omoplata_identity::{
+    extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
+};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
+use omoplata_work::{MapContext, OpKind, OpLog};
 
 /// omoplata: a version control system with a verified merge kernel.
 #[derive(Debug, Parser)]
@@ -82,6 +85,66 @@ enum Command {
         /// The new version of the file.
         new: PathBuf,
     },
+    /// Inspect and update the repository's refs via the operation log (§5.6).
+    Ref {
+        #[command(subcommand)]
+        action: RefCommand,
+    },
+    /// Inspect and undo entries in the bi-temporal operation log (§5.6).
+    Op {
+        #[command(subcommand)]
+        action: OpCommand,
+    },
+    /// Evaluate a revset expression over the current refs (§5.8).
+    ///
+    /// Prints the matching commit ids, one per line. Supports `a & b`, `a | b`,
+    /// `~a`, parentheses, `all()`, `heads()`, `draft()`, `public()`, bare ref
+    /// names, and `id:<hex>` literals.
+    Revset {
+        /// The revset expression, e.g. `'main | feature'`.
+        expr: String,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+/// `omo ref …` — ref subcommands backed by the operation log.
+#[derive(Debug, Subcommand)]
+enum RefCommand {
+    /// Point `name` at `commit`, appending a `SetRef` operation.
+    Set {
+        /// The ref name, e.g. `main`.
+        name: String,
+        /// The target commit id, e.g. `sha256:<hex>`.
+        commit: String,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List the current refs as `name commit`.
+    List {
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
+/// `omo op …` — operation-log subcommands.
+#[derive(Debug, Subcommand)]
+enum OpCommand {
+    /// Print the operation log, newest first.
+    Log {
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Undo the most recent operation still in effect.
+    Undo {
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -109,7 +172,109 @@ fn run() -> anyhow::Result<i32> {
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
+        Command::Ref { action } => match action {
+            RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
+            RefCommand::List { repo } => cmd_ref_list(repo).map(|()| 0),
+        },
+        Command::Op { action } => match action {
+            OpCommand::Log { repo } => cmd_op_log(repo).map(|()| 0),
+            OpCommand::Undo { repo } => cmd_op_undo(repo).map(|()| 0),
+        },
+        Command::Revset { expr, repo } => cmd_revset(repo, expr).map(|()| 0),
     }
+}
+
+/// The path to the operation log inside a repository's control directory.
+fn oplog_path(repo: &Repository) -> PathBuf {
+    repo.control_dir().join("oplog.jsonl")
+}
+
+/// `omo ref set <name> <commit>` — append a `SetRef` op and persist.
+fn cmd_ref_set(repo: Option<PathBuf>, name: String, commit: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let path = oplog_path(&repo);
+    let mut log = OpLog::load(&path)?;
+    let op = log.set_ref(name.clone(), Some(CommitId::new(commit.clone())), None);
+    let seq = op.seq;
+    log.save(&path)?;
+    println!("#{seq} set-ref {name} -> {commit}");
+    Ok(())
+}
+
+/// `omo ref list` — print `name commit` for the current ref state.
+fn cmd_ref_list(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let log = OpLog::load(oplog_path(&repo))?;
+    for (name, commit) in log.refs_now() {
+        println!("{name} {commit}");
+    }
+    Ok(())
+}
+
+/// `omo op log` — print the operation log newest-first.
+fn cmd_op_log(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let log = OpLog::load(oplog_path(&repo))?;
+    for op in log.operations().iter().rev() {
+        match &op.note {
+            Some(note) => println!("#{} {} [{note}]", op.seq, op.kind.summary()),
+            None => println!("#{} {}", op.seq, op.kind.summary()),
+        }
+    }
+    Ok(())
+}
+
+/// `omo op undo` — undo the last op, reporting what was undone and the effect.
+fn cmd_op_undo(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let path = oplog_path(&repo);
+    let mut log = OpLog::load(&path)?;
+    let before = log.refs_now();
+
+    let undo_op = log.undo()?;
+    let (undo_seq, target_seq) = match &undo_op.kind {
+        OpKind::Undo { target_seq } => (undo_op.seq, *target_seq),
+        // `undo` only ever appends an `Undo` variant.
+        _ => {
+            return Err(anyhow::anyhow!(
+                "internal error: undo did not append an Undo"
+            ))
+        }
+    };
+    let target_summary = log
+        .operations()
+        .get(target_seq as usize)
+        .map_or_else(|| format!("#{target_seq}"), |op| op.kind.summary());
+
+    let after = log.refs_now();
+    log.save(&path)?;
+
+    println!("#{undo_seq} undo of #{target_seq}: {target_summary}");
+    for (name, old) in &before {
+        match after.get(name) {
+            None => println!("  ref {name}: {old} -> (deleted)"),
+            Some(new) if new != old => println!("  ref {name}: {old} -> {new}"),
+            Some(_) => {}
+        }
+    }
+    for (name, new) in &after {
+        if !before.contains_key(name) {
+            println!("  ref {name}: (created) -> {new}");
+        }
+    }
+    Ok(())
+}
+
+/// `omo revset <expr>` — evaluate over current refs and print matching ids.
+fn cmd_revset(repo: Option<PathBuf>, expr: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let log = OpLog::load(oplog_path(&repo))?;
+    // Phase lookup is empty for now (phases live in `omoplata-identity`).
+    let ctx = MapContext::new(log.refs_now());
+    for commit in omoplata_work::query(&expr, &ctx)? {
+        println!("{commit}");
+    }
+    Ok(())
 }
 
 fn resolve(path: Option<PathBuf>) -> anyhow::Result<PathBuf> {
