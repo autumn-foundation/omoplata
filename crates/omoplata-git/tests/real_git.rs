@@ -7,7 +7,7 @@ use std::process::Command;
 
 use omoplata_git::{
     decode, encode, export_matches_source, export_repo, import_repo, oid, pack_paths,
-    read_pack_detailed, read_refs, verify_repo, walk_loose, GitObject,
+    read_pack_detailed, read_refs, resolve_git_dir, verify_repo, walk_loose, GitError, GitObject,
 };
 use omoplata_store::{Object, Repository};
 
@@ -421,4 +421,123 @@ fn gc_packed_repo_verifies_imports_and_exercises_deltas() {
         export_matches_source(&git_dir, out.path()).unwrap(),
         "exported objects must be byte-identical to the packed source"
     );
+}
+
+// --- Regression tests for the vacuous-PASS bug (I9 false gate) --------------
+//
+// Historically `omo git verify <worktree-root>` walked `<root>/objects` (which
+// does not exist — the objects live under `<root>/.git/objects`), found zero
+// objects, and reported `total: 0` + `round-trip gate: PASS`: a silent wrong
+// answer with a green checkmark. These tests pin the fixed behavior.
+
+/// `verify_repo` on a **worktree root** (not `.git`) auto-descends into `.git`
+/// and PASSes with the *real* non-zero counts — the exact wrong invocation that
+/// used to report `total: 0` + PASS.
+#[test]
+fn verify_worktree_root_autodescends_with_real_counts() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping worktree-root verify test");
+        return;
+    }
+    let (work, git_dir) = two_commit_repo();
+    let root = work.path();
+
+    // Point at the worktree ROOT, not `<root>/.git`.
+    let via_root = verify_repo(root).expect("verify auto-descends into .git and PASSes");
+    // Non-zero, real counts — not the old vacuous `total: 0`.
+    assert!(
+        via_root.total() > 0,
+        "expected non-zero total from the root"
+    );
+    assert!(via_root.commits >= 2, "expected the 2 commits");
+    assert!(via_root.blobs >= 1);
+    assert!(via_root.trees >= 1);
+
+    // And it is identical to verifying `<root>/.git` directly (backward compat).
+    let via_git_dir = verify_repo(&git_dir).expect("verify on .git still works");
+    assert_eq!(
+        via_root, via_git_dir,
+        "verifying the worktree root and its .git must agree"
+    );
+}
+
+/// `verify_repo` against an **empty directory** (no git) is refused — it does
+/// **not** report PASS. The old code returned an all-zero `GitReport` (→ PASS).
+#[test]
+fn verify_empty_dir_is_refused_never_pass() {
+    let empty = tempfile::tempdir().unwrap();
+    match verify_repo(empty.path()) {
+        Err(GitError::NotARepository(_)) => {}
+        Ok(report) => panic!("empty dir must not PASS; got a report {report:?}"),
+        Err(other) => panic!("expected NotARepository, got {other:?}"),
+    }
+}
+
+/// A git directory that exists but holds **zero objects** (a freshly-`init`ed
+/// repo with no commits) is refused with `EmptyRepository`, not PASSed — there
+/// is nothing to round-trip.
+#[test]
+fn verify_initialized_but_empty_repo_is_refused() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping empty-init verify test");
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    git(work.path(), &["init", "-q"]);
+    // No commits → no objects. Both the root and the `.git` must be refused.
+    match verify_repo(work.path()) {
+        Err(GitError::EmptyRepository(_)) => {}
+        other => panic!("expected EmptyRepository for an empty init, got {other:?}"),
+    }
+    match verify_repo(&work.path().join(".git")) {
+        Err(GitError::EmptyRepository(_)) => {}
+        other => panic!("expected EmptyRepository for the empty .git, got {other:?}"),
+    }
+}
+
+/// `import_repo` against an **empty directory** errors (imports nothing) rather
+/// than returning a success with zero refs walked.
+#[test]
+fn import_empty_dir_errors() {
+    let empty = tempfile::tempdir().unwrap();
+    let omo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(omo_dir.path()).unwrap();
+    match import_repo(empty.path(), &repo) {
+        Err(GitError::NotARepository(_)) => {}
+        Ok(import) => panic!(
+            "import of an empty dir must fail; imported {} refs",
+            import.refs.len()
+        ),
+        Err(other) => panic!("expected NotARepository, got {other:?}"),
+    }
+}
+
+/// `import_repo` on a **worktree root** auto-descends and imports the real
+/// object graph (the import-side half of the auto-descend fix).
+#[test]
+fn import_worktree_root_autodescends() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping worktree-root import test");
+        return;
+    }
+    let (work, _git_dir) = two_commit_repo();
+    let omo_dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(omo_dir.path()).unwrap();
+    let import = import_repo(work.path(), &repo).expect("import auto-descends into .git");
+    assert_eq!(import.commits, 2, "both commits imported via the root");
+    assert!(import.blobs >= 1);
+    assert!(!import.refs.is_empty(), "refs were walked");
+}
+
+/// `resolve_git_dir` maps a worktree root to its `.git`, and leaves an
+/// already-resolved `.git` unchanged (idempotent — backward compatible).
+#[test]
+fn resolve_git_dir_root_and_dot_git() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping resolve_git_dir test");
+        return;
+    }
+    let (work, git_dir) = two_commit_repo();
+    assert_eq!(resolve_git_dir(work.path()).unwrap(), git_dir);
+    assert_eq!(resolve_git_dir(&git_dir).unwrap(), git_dir);
 }

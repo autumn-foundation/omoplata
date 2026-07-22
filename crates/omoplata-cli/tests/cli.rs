@@ -657,6 +657,82 @@ fn git_verify_and_import_against_real_repo() {
         .stdout(predicate::str::contains("git -> omoplata mappings:"));
 }
 
+/// Regression: `omo git verify <worktree-root>` (the natural wrong invocation,
+/// pointing at the repo root rather than its `.git`) must auto-descend and
+/// PASS with real non-zero counts — not report `total: 0` + PASS.
+#[test]
+fn git_verify_against_worktree_root_autodescends() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping worktree-root verify CLI test");
+        return;
+    }
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q"]);
+    std::fs::write(root.join("f.txt"), b"content\n").unwrap();
+    run_git(root, &["add", "f.txt"]);
+    git_commit(root, "initial");
+
+    // Point at the ROOT, not `<root>/.git`.
+    omo()
+        .arg("git")
+        .arg("verify")
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("round-trip gate: PASS"))
+        // Real, non-zero counts (the old bug printed `total:   0`).
+        .stdout(predicate::str::is_match(r"total:\s+[1-9]").unwrap())
+        .stdout(predicate::str::is_match(r"blobs:\s+[1-9]").unwrap());
+}
+
+/// Regression: `omo git verify <empty-dir>` must NOT PASS — it exits non-zero
+/// and its output never contains `PASS`. A false "found nothing → PASS" gate
+/// is a silent wrong answer.
+#[test]
+fn git_verify_against_empty_dir_is_not_pass() {
+    let empty = tempdir().unwrap();
+    let assert = omo()
+        .arg("git")
+        .arg("verify")
+        .arg(empty.path())
+        .assert()
+        .failure();
+    // Neither stdout nor stderr may contain "PASS".
+    let out = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("PASS"),
+        "verify of an empty dir must never say PASS; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("not a git repository"),
+        "expected a clear not-a-repository error; got:\n{combined}"
+    );
+}
+
+/// Regression: `omo git import <empty-dir>` errors (non-zero exit) and imports
+/// nothing, rather than succeeding with `refs walked: 0`.
+#[test]
+fn git_import_against_empty_dir_errors() {
+    let empty = tempdir().unwrap();
+    let omo_dir = tempdir().unwrap();
+    omo().arg("init").arg(omo_dir.path()).assert().success();
+    omo()
+        .arg("git")
+        .arg("import")
+        .arg(empty.path())
+        .arg("--repo")
+        .arg(omo_dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a git repository"));
+}
+
 fn git_commit(dir: &std::path::Path, message: &str) {
     run_git(
         dir,
