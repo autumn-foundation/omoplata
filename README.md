@@ -167,9 +167,18 @@ the definitive statement of what is *not* yet the real thing:
   and deterministic. On a semantic duplicate with different vocabulary the real
   model scores 0.72 where the stand-in scores 0.35 (and mis-ranks it below an
   unrelated pair) — the lexical-only limitation the stand-in still has by default.
-- **AletheiaDB substrate → loose-object store (ADR-0002).** The object store is a
-  git-style loose-object directory, not the bi-temporal AletheiaDB graph the doc
-  assumes as the substrate (P7).
+- **AletheiaDB substrate → loose-object store, external-by-design (ADR-0002).**
+  The object store is a git-style loose-object directory rather than an
+  AletheiaDB engine — and this is not a shortfall. §3 P7 is explicit that
+  *"omoplata does not build a storage engine; it defines a schema"*: AletheiaDB
+  is an external substrate omoplata *targets*, not something the design doc
+  specifies enough to build. So the loose store is the concrete v1 substrate,
+  `Repository::{read,write}_object` is the swap-in point for a real AletheiaDB
+  backend, and the bi-temporal / typed-embedding capabilities the doc ascribes
+  to AletheiaDB are realized at the *schema* level here — by `omoplata-work`'s
+  bi-temporal op log (§5.6) and `omoplata-sem`'s typed embeddings (§5.7) over
+  the object store. The schema exists even though the named engine does not;
+  building that engine is out-of-scope-by-design (ADR-0002, R5).
 
 **Genuinely not yet implemented from the design doc:**
 
