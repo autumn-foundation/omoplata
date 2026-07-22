@@ -21,11 +21,12 @@
 //! oid) — [`crate::export::export_repo`] reconstructs from those, not from the
 //! omoplata trees.
 //!
-//! ## Packfile scope
-//! v1 decodes **loose objects only**. If the walk reaches an object that is not
-//! a loose object and the repo has packfiles, import fails with
-//! [`GitError::PackedObject`] rather than silently skipping it (§8; ADR-0005).
-//! Packfile (and delta) decoding is future work.
+//! ## Packfiles
+//! Both loose objects and packed objects (from `objects/pack/*.pack`, including
+//! `OFS_DELTA`/`REF_DELTA` deltas) are decoded and merged into one oid-keyed
+//! map before the walk, so a `git gc`'d repository imports identically to a
+//! loose one. A reachable object absent from both sources is a genuine
+//! corruption and fails with [`GitError::MissingObject`].
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -34,8 +35,9 @@ use omoplata_store::{Blob, EntryKind, Object, ObjectId, Repository, Tree};
 
 use crate::error::GitError;
 use crate::gate::verify_repo;
-use crate::loose::{pack_file_count, walk_loose};
+use crate::loose::walk_loose;
 use crate::object::{encode, GitCommit, GitObject, GitOid};
+use crate::pack::read_all_packs;
 use crate::refs::read_refs;
 
 /// The result of importing a git repository into an omoplata store.
@@ -147,23 +149,25 @@ pub fn mode_to_kind(mode: &str) -> Result<EntryKind, GitError> {
 /// commit DAG and ref list on the returned [`GitImport`].
 ///
 /// # Errors
-/// Returns [`GitError::PackedObject`] if a reachable object is not loose and the
-/// repo has packfiles; [`GitError::MissingObject`] if a reachable object is
-/// absent entirely; [`GitError::Roundtrip`] on any object that does not
-/// re-encode byte-identically; or any error from the gate, ref reading, an
-/// unsupported tree-entry mode, or writing into the omoplata store.
+/// Returns [`GitError::MissingObject`] if a reachable object is absent from both
+/// the loose store and the packfiles; [`GitError::Pack`] on a malformed
+/// packfile; [`GitError::Roundtrip`] on any object that does not re-encode
+/// byte-identically; or any error from the gate, ref reading, an unsupported
+/// tree-entry mode, or writing into the omoplata store.
 pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitError> {
-    // I9 enforcement: refuse to import a repo whose loose objects do not
-    // round-trip byte-identically.
+    // I9 enforcement: refuse to import a repo whose objects do not round-trip
+    // byte-identically (the gate now covers both loose and packed objects).
     verify_repo(git_dir)?;
 
-    // Load every loose object into an oid-keyed map so the walk can resolve
-    // children regardless of on-disk order.
-    let mut loose: HashMap<GitOid, GitObject> = HashMap::new();
+    // Load every loose *and* packed object into one oid-keyed map so the walk can
+    // resolve children regardless of on-disk representation or order.
+    let mut objects: HashMap<GitOid, GitObject> = HashMap::new();
     for (oid, object) in walk_loose(git_dir)? {
-        loose.insert(oid, object);
+        objects.insert(oid, object);
     }
-    let packfiles = pack_file_count(git_dir);
+    for (oid, object) in read_all_packs(git_dir)? {
+        objects.entry(oid).or_insert(object);
+    }
 
     let refs = read_refs(git_dir)?;
 
@@ -184,7 +188,7 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
         if import.git_objects.contains_key(&oid) {
             continue;
         }
-        let object = resolve_loose(oid, &loose, packfiles)?;
+        let object = resolve_object(oid, &objects)?;
         // I9: every reachable object must round-trip byte-identically.
         crate::gate::roundtrip_ok(&encode(&object))?;
         match &object {
@@ -203,7 +207,7 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
             }
             GitObject::Tree(entries) => {
                 import.trees += 1;
-                import_tree_object(oid, &object, &loose, packfiles, repo, &mut import.oid_map)?;
+                import_tree_object(oid, &object, &objects, repo, &mut import.oid_map)?;
                 for entry in entries {
                     stack.push(GitOid::from_bytes(entry.oid));
                 }
@@ -220,18 +224,13 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
     Ok(import)
 }
 
-/// Resolve `oid` to a loose [`GitObject`], or report it as packed/missing.
-fn resolve_loose(
+/// Resolve `oid` from the merged loose+packed object map, or report it missing.
+fn resolve_object(
     oid: GitOid,
-    loose: &HashMap<GitOid, GitObject>,
-    packfiles: usize,
+    objects: &HashMap<GitOid, GitObject>,
 ) -> Result<GitObject, GitError> {
-    match loose.get(&oid) {
+    match objects.get(&oid) {
         Some(object) => Ok(object.clone()),
-        None if packfiles > 0 => Err(GitError::PackedObject {
-            oid: oid.hex(),
-            packfiles,
-        }),
         None => Err(GitError::MissingObject(oid.hex())),
     }
 }
@@ -244,8 +243,7 @@ fn resolve_loose(
 fn import_tree_object(
     oid: GitOid,
     object: &GitObject,
-    loose: &HashMap<GitOid, GitObject>,
-    packfiles: usize,
+    objects: &HashMap<GitOid, GitObject>,
     repo: &Repository,
     oid_map: &mut HashMap<GitOid, ObjectId>,
 ) -> Result<ObjectId, GitError> {
@@ -259,9 +257,9 @@ fn import_tree_object(
             for entry in entries {
                 let kind = mode_to_kind(&entry.mode)?;
                 let child_oid = GitOid::from_bytes(entry.oid);
-                let child_obj = resolve_loose(child_oid, loose, packfiles)?;
+                let child_obj = resolve_object(child_oid, objects)?;
                 let child_id =
-                    import_tree_object(child_oid, &child_obj, loose, packfiles, repo, oid_map)?;
+                    import_tree_object(child_oid, &child_obj, objects, repo, oid_map)?;
                 tree.insert(entry.name.clone(), kind, child_id)?;
             }
             repo.write_object(&Object::Tree(tree))?
