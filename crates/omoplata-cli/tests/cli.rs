@@ -681,6 +681,68 @@ fn git_log_and_export_against_two_commit_repo() {
         .stdout(predicate::str::is_match(r"exported \d+ objects").unwrap());
 }
 
+#[test]
+fn git_verify_and_import_against_gc_packed_repo() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping git verify/import CLI test on a packed repo");
+        return;
+    }
+    // A repo with several commits touching the same file, then `git repack -ad`
+    // to force everything into a packfile and drop the loose objects.
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q"]);
+    for rev in 0..4 {
+        let body: String = (0..80)
+            .map(|i| {
+                if i < rev * 10 {
+                    format!("line {i}: revised at {rev}\n")
+                } else {
+                    format!("line {i}: original\n")
+                }
+            })
+            .collect();
+        std::fs::write(root.join("big.txt"), body).unwrap();
+        run_git(root, &["add", "-A"]);
+        git_commit(root, &format!("commit {rev}"));
+    }
+    run_git(root, &["repack", "-adq"]);
+    let git_dir = root.join(".git");
+
+    // A packfile must now exist.
+    let packs: Vec<_> = std::fs::read_dir(git_dir.join("objects").join("pack"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+        .collect();
+    assert!(!packs.is_empty(), "repack must produce a .pack file");
+
+    // `omo git verify` decodes the pack, PASSes, and reports non-zero counts.
+    omo()
+        .arg("git")
+        .arg("verify")
+        .arg(&git_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("round-trip gate: PASS"))
+        .stdout(predicate::str::is_match(r"commits:\s+[1-9]").unwrap())
+        .stdout(predicate::str::contains("packfile(s) decoded"));
+
+    // `omo git import` imports objects reconstructed from the pack.
+    let omo_dir = tempdir().unwrap();
+    omo().arg("init").arg(omo_dir.path()).assert().success();
+    omo()
+        .arg("git")
+        .arg("import")
+        .arg(&git_dir)
+        .arg("--repo")
+        .arg(omo_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"imported commits:\s+[1-9]").unwrap())
+        .stdout(predicate::str::is_match(r"imported blobs:\s+[1-9]").unwrap());
+}
+
 /// Two files whose first function is essentially the same under a different
 /// name, plus an unrelated function in each — the fixtures for `dup`/`similar`.
 const FILE_A: &str = "fn area_of_rect(width: f64, height: f64) -> f64 {\n    let area = width * height;\n    area\n}\n\nfn greet(name: &str) -> String {\n    format!(\"hello, {name}!\")\n}\n";

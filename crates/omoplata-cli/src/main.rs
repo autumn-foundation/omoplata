@@ -539,9 +539,10 @@ fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
             println!("tags:    {}", report.tags);
             println!("total:   {}", report.total());
             if report.packfiles > 0 {
-                // The gate covers loose objects only; be honest about packed ones.
+                // Packed objects are decoded and gated exactly like loose ones;
+                // report how many packs the counts were drawn from.
                 println!(
-                    "note: {} packfile(s) present — not decoded (loose-object gate only)",
+                    "note: {} packfile(s) decoded and included in the counts above",
                     report.packfiles
                 );
             }

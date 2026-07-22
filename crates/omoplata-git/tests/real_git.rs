@@ -366,6 +366,7 @@ fn gc_packed_repo_verifies_imports_and_exercises_deltas() {
         total_deltas >= 1,
         "expected >=1 delta object in the pack, got {total_deltas} (of {total_objects})"
     );
+    eprintln!("gc'd pack: {total_objects} objects, {total_deltas} delta object(s)");
 
     // The I9 gate PASSes over the packed repo, counting packed objects.
     let report = verify_repo(&git_dir).expect("gate passes over packed repo");
