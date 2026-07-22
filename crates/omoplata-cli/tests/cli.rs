@@ -399,3 +399,71 @@ fn git_verify_and_import_against_real_repo() {
         .stdout(predicate::str::is_match(r"imported blobs:\s+[1-9]").unwrap())
         .stdout(predicate::str::contains("git -> omoplata mappings:"));
 }
+
+/// Two files whose first function is essentially the same under a different
+/// name, plus an unrelated function in each — the fixtures for `dup`/`similar`.
+const FILE_A: &str = "fn area_of_rect(width: f64, height: f64) -> f64 {\n    let area = width * height;\n    area\n}\n\nfn greet(name: &str) -> String {\n    format!(\"hello, {name}!\")\n}\n";
+const FILE_B: &str = "fn rectangle_area(width: f64, height: f64) -> f64 {\n    let area = width * height;\n    area\n}\n\nfn factorial(n: u64) -> u64 {\n    let mut acc = 1;\n    for k in 2..=n {\n        acc *= k;\n    }\n    acc\n}\n";
+
+#[test]
+fn dup_flags_the_near_identical_pair() {
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    std::fs::write(&a, FILE_A).unwrap();
+    std::fs::write(&b, FILE_B).unwrap();
+
+    // The two rectangle-area functions are flagged as a cross-file duplicate;
+    // the unrelated greet/factorial are not.
+    omo()
+        .arg("dup")
+        .arg(&a)
+        .arg(&b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("area_of_rect"))
+        .stdout(predicate::str::contains("rectangle_area"))
+        .stdout(predicate::str::contains(" ~ "))
+        .stdout(predicate::str::contains("factorial").not());
+}
+
+#[test]
+fn dup_reports_none_when_all_distinct() {
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("only.rs");
+    std::fs::write(
+        &a,
+        "fn greet(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n",
+    )
+    .unwrap();
+    omo()
+        .arg("dup")
+        .arg(&a)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no likely duplicate definitions"));
+}
+
+#[test]
+fn similar_ranks_the_rectangle_function_first() {
+    let dir = tempdir().unwrap();
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    std::fs::write(&a, FILE_A).unwrap();
+    std::fs::write(&b, FILE_B).unwrap();
+
+    // The top hit for a rectangle-area query is one of the area functions.
+    let out = omo()
+        .arg("similar")
+        .arg("compute area of rectangle")
+        .arg(&a)
+        .arg(&b)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let first = stdout.lines().next().unwrap_or("");
+    assert!(
+        first.contains("area_of_rect") || first.contains("rectangle_area"),
+        "expected an area function ranked first, got: {first:?}"
+    );
+}

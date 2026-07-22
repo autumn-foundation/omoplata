@@ -17,6 +17,7 @@ omoplata-algebra = { path = "../omoplata-algebra" }
 omoplata-drivers = { path = "../omoplata-drivers" }
 omoplata-git = { path = "../omoplata-git" }
 omoplata-identity = { path = "../omoplata-identity" }
+omoplata-sem = { path = "../omoplata-sem" }
 omoplata-work = { path = "../omoplata-work" }
 
 [dev-dependencies]

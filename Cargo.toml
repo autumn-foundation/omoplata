@@ -6,6 +6,7 @@ members = [
     "crates/omoplata-drivers",
     "crates/omoplata-git",
     "crates/omoplata-identity",
+    "crates/omoplata-sem",
     "crates/omoplata-store",
     "crates/omoplata-work",
 ]

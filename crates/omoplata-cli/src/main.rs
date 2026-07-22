@@ -11,6 +11,7 @@ use omoplata_git::{import_repo, verify_repo};
 use omoplata_identity::{
     extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
 };
+use omoplata_sem::{embed_definitions, find_duplicates, search, Embedded, HashingEmbedder};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{MapContext, OpKind, OpLog};
 
@@ -128,6 +129,36 @@ enum Command {
         #[command(subcommand)]
         action: GitCommand,
     },
+    /// Detect likely duplicate work across Rust files (§5.7, §8).
+    ///
+    /// Extracts and embeds every definition across all the given files, then
+    /// flags definition pairs whose embeddings are more similar than
+    /// `--threshold` — the design's "two agents implementing the same thing"
+    /// detector (conflict avoidance before textual collision). Prints each pair
+    /// as `<score>  <file>:<def> ~ <file>:<def>`, or `no likely duplicate
+    /// definitions` if none.
+    Dup {
+        /// The Rust source files to scan (two or more for cross-file duplicates).
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Cosine-similarity threshold in [0, 1]; pairs at or above are flagged.
+        #[arg(long, default_value_t = 0.85)]
+        threshold: f32,
+    },
+    /// Semantic search: rank definitions by similarity to a query (§5.7).
+    ///
+    /// Embeds the query, extracts and embeds every definition across the given
+    /// files, and prints the top-k as `<score> <file>:<def>`.
+    Similar {
+        /// The free-text query, e.g. `"compute area of rectangle"`.
+        query: String,
+        /// The Rust source files to search.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// How many results to print.
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+    },
 }
 
 /// `omo git …` — git interop subcommands (§3 P8, invariant I9).
@@ -232,6 +263,8 @@ fn run() -> anyhow::Result<i32> {
             GitCommand::Verify { git_dir } => cmd_git_verify(git_dir),
             GitCommand::Import { git_dir, repo } => cmd_git_import(git_dir, repo).map(|()| 0),
         },
+        Command::Dup { files, threshold } => cmd_dup(files, threshold).map(|()| 0),
+        Command::Similar { query, files, top } => cmd_similar(query, files, top).map(|()| 0),
     }
 }
 
@@ -605,6 +638,60 @@ fn cmd_track(old: PathBuf, new: PathBuf) -> anyhow::Result<()> {
             }
         };
         println!("{line}");
+    }
+    Ok(())
+}
+
+/// Build a combined corpus of embedded definitions across `files`, together
+/// with a parallel `<file>:<defpath>` label for each entry.
+///
+/// The embedder is a deterministic local stand-in; see
+/// `docs/adr/0006-semantic-embeddings.md`.
+fn embed_corpus(
+    embedder: &HashingEmbedder,
+    files: &[PathBuf],
+) -> anyhow::Result<(Vec<Embedded<Definition>>, Vec<String>)> {
+    let mut corpus: Vec<Embedded<Definition>> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for file in files {
+        let source =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let label_prefix = file.display();
+        for entry in embed_definitions(embedder, &source)? {
+            labels.push(format!("{label_prefix}:{}", entry.item.path));
+            corpus.push(entry);
+        }
+    }
+    Ok((corpus, labels))
+}
+
+/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
+fn cmd_dup(files: Vec<PathBuf>, threshold: f32) -> anyhow::Result<()> {
+    // NOTE (stand-in model): deterministic hashing embedder standing in for a
+    // real transformer model behind the `Embedder` trait (ADR-0006).
+    let embedder = HashingEmbedder::default();
+    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+
+    let dups = find_duplicates(&corpus, threshold);
+    if dups.is_empty() {
+        println!("no likely duplicate definitions");
+        return Ok(());
+    }
+    for (i, j, score) in dups {
+        println!("{score:.2}  {} ~ {}", labels[i], labels[j]);
+    }
+    Ok(())
+}
+
+/// `omo similar <query> <file.rs>...` — rank definitions by similarity (§5.7).
+fn cmd_similar(query: String, files: Vec<PathBuf>, top: usize) -> anyhow::Result<()> {
+    // NOTE (stand-in model): deterministic hashing embedder standing in for a
+    // real transformer model behind the `Embedder` trait (ADR-0006).
+    let embedder = HashingEmbedder::default();
+    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+
+    for (idx, score) in search(&embedder, &query, &corpus, top) {
+        println!("{score:.4} {}", labels[idx]);
     }
     Ok(())
 }

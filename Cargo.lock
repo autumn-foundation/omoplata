@@ -423,6 +423,7 @@ dependencies = [
  "omoplata-drivers",
  "omoplata-git",
  "omoplata-identity",
+ "omoplata-sem",
  "omoplata-store",
  "omoplata-work",
  "predicates",
@@ -460,6 +461,14 @@ dependencies = [
  "thiserror",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "omoplata-sem"
+version = "0.1.0"
+dependencies = [
+ "omoplata-identity",
+ "thiserror",
 ]
 
 [[package]]
