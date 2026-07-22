@@ -9,6 +9,13 @@ repository.workspace = true
 name = "omo"
 path = "src/main.rs"
 
+[features]
+# Default: deterministic offline embeddings only (no model, no network).
+default = []
+# Opt-in real transformer embeddings for `omo dup`/`omo similar --real-embeddings`.
+# Fetches the model + ONNX Runtime on first use. See ADR-0006.
+fastembed = ["omoplata-sem/fastembed"]
+
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }

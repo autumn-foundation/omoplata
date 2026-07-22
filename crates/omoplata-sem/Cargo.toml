@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Deterministic offline default: the FNV hashing stand-in, no model, no network.
+default = []
+# Opt-in real transformer embeddings via fastembed (ONNX Runtime + a HuggingFace
+# model, both fetched on first use). See docs/adr/0006-semantic-embeddings.md.
+fastembed = ["dep:fastembed"]
+
 [dependencies]
 thiserror = { workspace = true }
 omoplata-identity = { path = "../omoplata-identity" }
+fastembed = { version = "5", optional = true }

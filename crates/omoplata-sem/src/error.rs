@@ -12,4 +12,11 @@ pub enum SemError {
     /// could not be parsed or the grammar could not be loaded.
     #[error("definition extraction failed: {0}")]
     Extraction(#[from] IdentityError),
+
+    /// Real-embedding model initialization failed (feature `fastembed`) — the
+    /// model weights or the ONNX Runtime could not be fetched or loaded. The
+    /// caller can fall back to the deterministic [`crate::HashingEmbedder`].
+    #[cfg(feature = "fastembed")]
+    #[error("embedding model initialization failed: {0}")]
+    Model(String),
 }

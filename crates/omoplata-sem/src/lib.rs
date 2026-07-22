@@ -20,7 +20,11 @@
 //! This crate implements that architecture with a **pluggable model**:
 //!
 //! * [`Embedder`] — the trait every embedding model implements; the swap point.
-//! * [`HashingEmbedder`] — a **deterministic local stand-in** (see below).
+//! * [`HashingEmbedder`] — a **deterministic local stand-in** (see below); the
+//!   offline default.
+//! * `FastEmbedder` — a **real** learned transformer model (`all-MiniLM-L6-v2`),
+//!   gated behind the opt-in `fastembed` Cargo feature (default off; fetches the
+//!   model from HuggingFace and ONNX Runtime from the ort CDN on first use).
 //! * [`Embedded<T>`] — "typed embeddings per node": an item paired with its
 //!   vector.
 //! * [`embed_definitions`] — extract Rust definitions (via `omoplata-identity`,
@@ -32,11 +36,13 @@
 //!
 //! # Model honesty (stand-in)
 //!
-//! Real transformer embedding models are not available offline in this
-//! environment. Per the standing instruction, the shipped [`HashingEmbedder`] is
-//! a **deterministic feature-hashing stand-in**, not a learned model — it
-//! captures lexical similarity only. This is documented in
-//! `docs/adr/0006-semantic-embeddings.md`. The *point* of this crate is the
+//! The **default** build ships only the [`HashingEmbedder`], a **deterministic
+//! feature-hashing stand-in** (not a learned model — it captures lexical
+//! similarity only), so the crate builds and tests fully offline with no model
+//! and no network. A **real** transformer model (`FastEmbedder`) is available as
+//! the opt-in `fastembed` feature, which fetches the weights and ONNX Runtime on
+//! first use; it is off by default so the offline path stays the default. This
+//! is documented in `docs/adr/0006-semantic-embeddings.md`. The *point* of this crate is the
 //! architecture (typed embeddings per node + duplicate detection over vector
 //! similarity) with the model behind [`Embedder`] as the swap point; every
 //! consumer here ([`search`], [`find_duplicates`], [`cosine`]) is model-agnostic
@@ -51,10 +57,14 @@
 
 mod embed;
 mod error;
+#[cfg(feature = "fastembed")]
+mod real;
 mod vector;
 
 pub use embed::{Embedder, HashingEmbedder, DEFAULT_DIM};
 pub use error::SemError;
+#[cfg(feature = "fastembed")]
+pub use real::FastEmbedder;
 pub use vector::cosine;
 
 use omoplata_identity::{extract_definitions, Definition};
@@ -94,7 +104,7 @@ fn definition_text(source: &str, def: &Definition) -> String {
 ///
 /// Returns [`SemError::Extraction`] if the source cannot be parsed or the
 /// tree-sitter grammar cannot be loaded (propagated from `omoplata-identity`).
-pub fn embed_definitions<E: Embedder>(
+pub fn embed_definitions<E: Embedder + ?Sized>(
     embedder: &E,
     source: &str,
 ) -> Result<Vec<Embedded<Definition>>, SemError> {
@@ -119,7 +129,7 @@ pub fn embed_definitions<E: Embedder>(
 /// The corpus vectors must have been produced by the *same* embedder (same
 /// dimension) as `embedder`; a dimension mismatch scores `0.0` for that entry
 /// (see [`cosine`]).
-pub fn search<E: Embedder, T>(
+pub fn search<E: Embedder + ?Sized, T>(
     embedder: &E,
     query: &str,
     corpus: &[Embedded<T>],

@@ -13,7 +13,9 @@ use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo}
 use omoplata_identity::{
     extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
 };
-use omoplata_sem::{embed_definitions, find_duplicates, search, Embedded, HashingEmbedder};
+use omoplata_sem::{
+    embed_definitions, find_duplicates, search, Embedded, Embedder, HashingEmbedder,
+};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{MapContext, OpKind, OpLog};
 
@@ -208,6 +210,14 @@ enum Command {
         /// Cosine-similarity threshold in [0, 1]; pairs at or above are flagged.
         #[arg(long, default_value_t = 0.85)]
         threshold: f32,
+        /// Use the real transformer model (all-MiniLM-L6-v2) instead of the
+        /// deterministic hashing stand-in. Requires the binary to be built with
+        /// `--features fastembed` and the model to be fetchable; otherwise a note
+        /// is printed and the hashing stand-in is used. Note: the real model's
+        /// similarities are lower than lexical overlap, so pass a lower
+        /// `--threshold` (e.g. 0.5) with `--real-embeddings`.
+        #[arg(long)]
+        real_embeddings: bool,
     },
     /// Semantic search: rank definitions by similarity to a query (§5.7).
     ///
@@ -222,6 +232,12 @@ enum Command {
         /// How many results to print.
         #[arg(long, default_value_t = 5)]
         top: usize,
+        /// Use the real transformer model (all-MiniLM-L6-v2) instead of the
+        /// deterministic hashing stand-in. Requires the binary to be built with
+        /// `--features fastembed` and the model to be fetchable; otherwise a note
+        /// is printed and the hashing stand-in is used.
+        #[arg(long)]
+        real_embeddings: bool,
     },
 }
 
@@ -355,8 +371,17 @@ fn run() -> anyhow::Result<i32> {
             GitCommand::Log { git_dir } => cmd_git_log(git_dir).map(|()| 0),
             GitCommand::Export { git_dir, out_dir } => cmd_git_export(git_dir, out_dir),
         },
-        Command::Dup { files, threshold } => cmd_dup(files, threshold).map(|()| 0),
-        Command::Similar { query, files, top } => cmd_similar(query, files, top).map(|()| 0),
+        Command::Dup {
+            files,
+            threshold,
+            real_embeddings,
+        } => cmd_dup(files, threshold, real_embeddings).map(|()| 0),
+        Command::Similar {
+            query,
+            files,
+            top,
+            real_embeddings,
+        } => cmd_similar(query, files, top, real_embeddings).map(|()| 0),
     }
 }
 
@@ -991,8 +1016,8 @@ fn cmd_track(old: PathBuf, new: PathBuf) -> anyhow::Result<()> {
 ///
 /// The embedder is a deterministic local stand-in; see
 /// `docs/adr/0006-semantic-embeddings.md`.
-fn embed_corpus(
-    embedder: &HashingEmbedder,
+fn embed_corpus<E: Embedder + ?Sized>(
+    embedder: &E,
     files: &[PathBuf],
 ) -> anyhow::Result<(Vec<Embedded<Definition>>, Vec<String>)> {
     let mut corpus: Vec<Embedded<Definition>> = Vec::new();
@@ -1009,33 +1034,77 @@ fn embed_corpus(
     Ok((corpus, labels))
 }
 
-/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
-fn cmd_dup(files: Vec<PathBuf>, threshold: f32) -> anyhow::Result<()> {
+/// Resolve which embedder to use for `omo dup`/`omo similar` given the
+/// `--real-embeddings` flag, and run `f` with it.
+///
+/// When `real` is set and the binary was built with `--features fastembed` and
+/// the model loads, this uses the real `FastEmbedder`; if the model cannot be
+/// loaded (or the binary was built without the feature), it prints a clear note
+/// to stderr and falls back to the deterministic [`HashingEmbedder`]. When
+/// `real` is unset the behavior is identical to before: the hashing stand-in.
+///
+/// `f` is generic over the embedder so both branches share the same downstream
+/// logic — the design's model-agnostic consumers (§5.7).
+fn with_embedder<F>(real: bool, f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&dyn Embedder) -> anyhow::Result<()>,
+{
+    if real {
+        #[cfg(feature = "fastembed")]
+        {
+            match omoplata_sem::FastEmbedder::try_new() {
+                Ok(embedder) => {
+                    eprintln!("using real embeddings (all-MiniLM-L6-v2, 384-dim)");
+                    return f(&embedder);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "note: real embedding model unavailable ({e}); \
+                         using the deterministic hashing stand-in"
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "fastembed"))]
+        {
+            eprintln!(
+                "note: this binary was built without `--features fastembed`; \
+                 using the deterministic hashing stand-in. Rebuild with \
+                 `cargo build --features fastembed` for real embeddings."
+            );
+        }
+    }
     // NOTE (stand-in model): deterministic hashing embedder standing in for a
     // real transformer model behind the `Embedder` trait (ADR-0006).
     let embedder = HashingEmbedder::default();
-    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+    f(&embedder)
+}
 
-    let dups = find_duplicates(&corpus, threshold);
-    if dups.is_empty() {
-        println!("no likely duplicate definitions");
-        return Ok(());
-    }
-    for (i, j, score) in dups {
-        println!("{score:.2}  {} ~ {}", labels[i], labels[j]);
-    }
-    Ok(())
+/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
+fn cmd_dup(files: Vec<PathBuf>, threshold: f32, real: bool) -> anyhow::Result<()> {
+    with_embedder(real, |embedder| {
+        let (corpus, labels) = embed_corpus(embedder, &files)?;
+
+        let dups = find_duplicates(&corpus, threshold);
+        if dups.is_empty() {
+            println!("no likely duplicate definitions");
+            return Ok(());
+        }
+        for (i, j, score) in dups {
+            println!("{score:.2}  {} ~ {}", labels[i], labels[j]);
+        }
+        Ok(())
+    })
 }
 
 /// `omo similar <query> <file.rs>...` — rank definitions by similarity (§5.7).
-fn cmd_similar(query: String, files: Vec<PathBuf>, top: usize) -> anyhow::Result<()> {
-    // NOTE (stand-in model): deterministic hashing embedder standing in for a
-    // real transformer model behind the `Embedder` trait (ADR-0006).
-    let embedder = HashingEmbedder::default();
-    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+fn cmd_similar(query: String, files: Vec<PathBuf>, top: usize, real: bool) -> anyhow::Result<()> {
+    with_embedder(real, |embedder| {
+        let (corpus, labels) = embed_corpus(embedder, &files)?;
 
-    for (idx, score) in search(&embedder, &query, &corpus, top) {
-        println!("{score:.4} {}", labels[idx]);
-    }
-    Ok(())
+        for (idx, score) in search(embedder, &query, &corpus, top) {
+            println!("{score:.4} {}", labels[idx]);
+        }
+        Ok(())
+    })
 }
