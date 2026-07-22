@@ -38,6 +38,13 @@
 //!   importing every reachable object through the I9 gate and recording the DAG.
 //! - Exact-mode export ([`export_repo`]) and the repo-level round-trip gate
 //!   ([`export_matches_source`]) — the outbound half of I9.
+//! - The **git wire protocol** over the local transport ([`fetch_local`]): a real
+//!   pkt-line codec ([`write_pkt_line`], [`read_pkt_line`]) and an `upload-pack`
+//!   fetch client that clones a `file://`/local repo over `git upload-pack`,
+//!   decodes the received packfile in memory ([`parse_pack_bytes`]), and imports
+//!   it through the I9 gate ([`import_objects`]). This is the design doc's §3 P8
+//!   *"reads and writes the git object format **and wire protocol**"* — see the
+//!   crate ADR for the local-vs-networked-transport scope.
 //!
 //! No `unwrap`/`expect`/`panic` appears outside tests.
 
@@ -49,19 +56,25 @@ mod loose;
 mod object;
 mod pack;
 mod refs;
+mod wire;
 
 pub use error::GitError;
 pub use export::{export_matches_source, export_repo, GitExport};
 pub use gate::{roundtrip_ok, verify_repo, GitReport};
-pub use import::{import_repo, mode_to_kind, GitImport};
+pub use import::{import_objects, import_repo, mode_to_kind, GitImport};
 pub use loose::{
     loose_path, oid_from_loose_path, pack_file_count, read_loose, walk_loose, write_loose,
 };
 pub use object::{decode, encode, oid, GitCommit, GitObject, GitOid, GitTag, GitTreeEntry};
 pub use pack::{
-    apply_delta, pack_paths, parse_idx, read_all_packs, read_pack, read_pack_detailed, PackDecode,
+    apply_delta, pack_paths, parse_idx, parse_pack_bytes, read_all_packs, read_pack,
+    read_pack_detailed, PackDecode,
 };
 pub use refs::read_refs;
+pub use wire::{
+    decode_wire_pack, fetch_local, read_pkt, read_pkt_line, write_flush, write_pkt_line, PktLine,
+    WireFetch, FLUSH_PKT, MAX_PAYLOAD,
+};
 
 #[cfg(test)]
 mod proptests {

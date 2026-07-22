@@ -3,10 +3,12 @@
 //!
 //! # Stand-in model (read this)
 //!
-//! Real transformer embedding models are not available offline in this
-//! environment, so the concrete embedder shipped here is a **deterministic
-//! local feature-hashing stand-in**, not a learned model. It is documented in
-//! `docs/adr/0006-semantic-embeddings.md`. The architectural point of §5.7 is
+//! The embedder shipped by default is a **deterministic local feature-hashing
+//! stand-in**, not a learned model, so the crate builds and runs fully offline
+//! with no weights and no network. A real transformer model
+//! (`crate::FastEmbedder`, `all-MiniLM-L6-v2`) is available behind the opt-in
+//! `fastembed` Cargo feature, which fetches the model and ONNX Runtime on first
+//! use. Both are documented in `docs/adr/0006-semantic-embeddings.md`. The architectural point of §5.7 is
 //! *typed embeddings per node* plus *duplicate-work detection over vector
 //! similarity* with a **pluggable model** — the [`Embedder`] trait is that swap
 //! point. A real transformer model drops in behind the trait without touching

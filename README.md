@@ -16,8 +16,9 @@ else degrades to an honest, first-class conflict.
 > **invariant I1b is machine-checked in Verus** (with I10 disjoint commutation
 > proven for the length-preserving core; I5-proper still property-tested — see
 > ADR-0003 and [`verus/`](verus/)) and the
-> semantic layer uses a **deterministic hashing embedder** standing in for a real
-> embedding model (ADR-0006). The per-language structural-merge fallback is the
+> semantic layer uses a **deterministic hashing embedder** as its offline default,
+> with **real transformer embeddings available behind an opt-in `fastembed`
+> feature** (ADR-0006). The per-language structural-merge fallback is the
 > real **Mergiraf** tool, integrated as a PATH-detected shell-out driver with the
 > built-in line/diff3 driver as the no-tool fallback (ADR-0004). See
 > [Reductions](#reductions-from-the-design-doc-in-this-build) for the full list of
@@ -90,8 +91,15 @@ directory); `init`/`status` take a positional path.
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `omo dup <file.rs>... [--threshold T]` | Flag likely duplicate definitions across files (convergent work before it collides). | `omo dup a.rs b.rs` |
-| `omo similar <query> <file.rs>... [--top K]` | Rank definitions by similarity to a free-text query. | `omo similar "area of rectangle" a.rs` |
+| `omo dup <file.rs>... [--threshold T] [--real-embeddings]` | Flag likely duplicate definitions across files (convergent work before it collides). | `omo dup a.rs b.rs` |
+| `omo similar <query> <file.rs>... [--top K] [--real-embeddings]` | Rank definitions by similarity to a free-text query. | `omo similar "area of rectangle" a.rs` |
+
+`--real-embeddings` uses a real transformer model (`all-MiniLM-L6-v2`, 384-dim)
+instead of the deterministic hashing stand-in. It requires the binary built with
+`--features fastembed`; on first use the model (`model.onnx` ≈ 87 MB) is fetched
+from HuggingFace and the ONNX Runtime from the `ort.pyke.io` CDN (both reachable
+through the proxy in this environment). Without the feature, or if the hosts are
+unreachable, the flag prints a note and falls back to the hashing stand-in.
 
 ## Architecture
 
@@ -150,13 +158,27 @@ the definitive statement of what is *not* yet the real thing:
   shipping `diff`/`apply`/`commute` stay trusted-by-testing, with the proptests
   as their differential oracle. The design doc's "proven kernel" claim is thus
   *delivered for I1b*, *partial for I5*, and approximated elsewhere.
-- **Real embedding model → deterministic hashing stand-in (ADR-0006).** The
+- **Real embedding model: opt-in, hashing stand-in by default (ADR-0006).** The
   semantic layer (`dup`, `similar`) uses a deterministic hashing embedder behind a
-  pluggable `Embedder` trait. It is good enough to demonstrate duplicate-work
-  detection deterministically, but it is not a real transformer embedding model.
-- **AletheiaDB substrate → loose-object store (ADR-0002).** The object store is a
-  git-style loose-object directory, not the bi-temporal AletheiaDB graph the doc
-  assumes as the substrate (P7).
+  pluggable `Embedder` trait as its **offline default**. A **real** transformer
+  model (`all-MiniLM-L6-v2`) is now available behind the opt-in `fastembed`
+  feature / `--real-embeddings` flag, since HuggingFace and the ONNX Runtime CDN
+  proved reachable here; it is off by default so the default build stays offline
+  and deterministic. On a semantic duplicate with different vocabulary the real
+  model scores 0.72 where the stand-in scores 0.35 (and mis-ranks it below an
+  unrelated pair) — the lexical-only limitation the stand-in still has by default.
+- **AletheiaDB substrate → loose-object store, external-by-design (ADR-0002).**
+  The object store is a git-style loose-object directory rather than an
+  AletheiaDB engine — and this is not a shortfall. §3 P7 is explicit that
+  *"omoplata does not build a storage engine; it defines a schema"*: AletheiaDB
+  is an external substrate omoplata *targets*, not something the design doc
+  specifies enough to build. So the loose store is the concrete v1 substrate,
+  `Repository::{read,write}_object` is the swap-in point for a real AletheiaDB
+  backend, and the bi-temporal / typed-embedding capabilities the doc ascribes
+  to AletheiaDB are realized at the *schema* level here — by `omoplata-work`'s
+  bi-temporal op log (§5.6) and `omoplata-sem`'s typed embeddings (§5.7) over
+  the object store. The schema exists even though the named engine does not;
+  building that engine is out-of-scope-by-design (ADR-0002, R5).
 
 **Genuinely not yet implemented from the design doc:**
 

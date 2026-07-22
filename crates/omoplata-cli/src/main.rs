@@ -9,13 +9,15 @@ use omoplata_algebra::{
     diff, dynamic_validate, kernel, merge3, rebase, Admission, Conflict, Doc, Validated,
 };
 use omoplata_drivers::{select_driver, MergeInput};
-use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
+use omoplata_git::{export_matches_source, export_repo, fetch_local, import_repo, verify_repo};
 use omoplata_identity::{
-    extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
+    extract_definitions, match_definitions, ChangeId, CommitId, Definition, MatchStatus,
 };
-use omoplata_sem::{embed_definitions, find_duplicates, search, Embedded, HashingEmbedder};
+use omoplata_sem::{
+    embed_definitions, find_duplicates, search, Embedded, Embedder, HashingEmbedder,
+};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
-use omoplata_work::{MapContext, OpKind, OpLog};
+use omoplata_work::{MapContext, OpKind, OpLog, RebaseEngine};
 
 /// omoplata: a version control system with a verified merge kernel.
 #[derive(Debug, Parser)]
@@ -149,6 +151,36 @@ enum Command {
         /// The version to rebase onto (the new base).
         onto: PathBuf,
     },
+    /// Auto-rebase a change through the change graph and op log (R4; §5.3,
+    /// §5.4, §5.6).
+    ///
+    /// Stores `base`, `mine` and `onto` as blobs in the repository's object
+    /// store (a commit id is the blob's object id), replays the change with the
+    /// verified rebase algebra, and records the move on **both** of the design
+    /// doc's time axes: a `Rebase` entry in the bi-temporal op log (transaction
+    /// time) and a supersession edge in the change graph (valid time). Conflicts
+    /// are carried forward as **values**, never blocking (§3 P3).
+    ///
+    /// Prints the rebased content to stdout — conflicted spans as
+    /// `<<<<<<< mine / ======= / >>>>>>> onto` marker blocks — and to stderr the
+    /// new tip commit id, `autorebase: clean` or `autorebase: <k> conflict(s)
+    /// carried`, and the appended op-log entry. The op log is persisted, so
+    /// `omo op log` shows the `Rebase` entry afterward. Exits 0 if clean, else
+    /// non-zero. Requires an initialized repository.
+    Autorebase {
+        /// The common base file.
+        base: PathBuf,
+        /// My version (the change to replay).
+        mine: PathBuf,
+        /// The version to rebase onto (the advanced base).
+        onto: PathBuf,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// The change id to record the rebase under (default: `change`).
+        #[arg(long)]
+        change: Option<String>,
+    },
     /// List the Rust definitions in a source file, in source order.
     ///
     /// Prints each definition as `<kind> <path> (lines A-B)`.
@@ -208,6 +240,14 @@ enum Command {
         /// Cosine-similarity threshold in [0, 1]; pairs at or above are flagged.
         #[arg(long, default_value_t = 0.85)]
         threshold: f32,
+        /// Use the real transformer model (all-MiniLM-L6-v2) instead of the
+        /// deterministic hashing stand-in. Requires the binary to be built with
+        /// `--features fastembed` and the model to be fetchable; otherwise a note
+        /// is printed and the hashing stand-in is used. Note: the real model's
+        /// similarities are lower than lexical overlap, so pass a lower
+        /// `--threshold` (e.g. 0.5) with `--real-embeddings`.
+        #[arg(long)]
+        real_embeddings: bool,
     },
     /// Semantic search: rank definitions by similarity to a query (§5.7).
     ///
@@ -222,6 +262,12 @@ enum Command {
         /// How many results to print.
         #[arg(long, default_value_t = 5)]
         top: usize,
+        /// Use the real transformer model (all-MiniLM-L6-v2) instead of the
+        /// deterministic hashing stand-in. Requires the binary to be built with
+        /// `--features fastembed` and the model to be fetchable; otherwise a note
+        /// is printed and the hashing stand-in is used.
+        #[arg(long)]
+        real_embeddings: bool,
     },
 }
 
@@ -266,6 +312,22 @@ enum GitCommand {
         git_dir: PathBuf,
         /// The output directory to write the reconstructed objects and refs to.
         out_dir: PathBuf,
+    },
+    /// Clone objects over the git **wire protocol** (local transport, §3 P8).
+    ///
+    /// Speaks the real pkt-line + `upload-pack` conversation against a local
+    /// `git upload-pack` process: reads the source repo's ref advertisement,
+    /// negotiates a full clone (`want …`/`done`), receives the raw packfile, and
+    /// imports every object into the omoplata repository through the I9 gate.
+    /// Prints the advertised refs, the packfile byte count, and the imported
+    /// per-type counts.
+    Fetch {
+        /// The source repository: a `file://` URL or a local path (a working
+        /// tree or a git directory).
+        repo_url: String,
+        /// Destination omoplata repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
 }
 
@@ -338,6 +400,13 @@ fn run() -> anyhow::Result<i32> {
         } => cmd_merge_file(base, left, right, validate),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
+        Command::Autorebase {
+            base,
+            mine,
+            onto,
+            repo,
+            change,
+        } => cmd_autorebase(repo, base, mine, onto, change),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
         Command::Ref { action } => match action {
@@ -354,9 +423,19 @@ fn run() -> anyhow::Result<i32> {
             GitCommand::Import { git_dir, repo } => cmd_git_import(git_dir, repo).map(|()| 0),
             GitCommand::Log { git_dir } => cmd_git_log(git_dir).map(|()| 0),
             GitCommand::Export { git_dir, out_dir } => cmd_git_export(git_dir, out_dir),
+            GitCommand::Fetch { repo_url, repo } => cmd_git_fetch(repo_url, repo).map(|()| 0),
         },
-        Command::Dup { files, threshold } => cmd_dup(files, threshold).map(|()| 0),
-        Command::Similar { query, files, top } => cmd_similar(query, files, top).map(|()| 0),
+        Command::Dup {
+            files,
+            threshold,
+            real_embeddings,
+        } => cmd_dup(files, threshold, real_embeddings).map(|()| 0),
+        Command::Similar {
+            query,
+            files,
+            top,
+            real_embeddings,
+        } => cmd_similar(query, files, top, real_embeddings).map(|()| 0),
     }
 }
 
@@ -620,6 +699,30 @@ fn cmd_git_export(git_dir: PathBuf, out_dir: PathBuf) -> anyhow::Result<i32> {
         export.objects
     );
     Ok(i32::from(!matches))
+}
+
+/// `omo git fetch <repo-url-or-path> [--repo <dir>]` — clone over the wire.
+///
+/// Speaks the git wire protocol (pkt-line + `upload-pack`) over the local
+/// transport against the source repository, importing the received packfile into
+/// the destination omoplata repo. Prints the advertised refs, the number of
+/// packfile bytes received, and the imported per-type counts.
+fn cmd_git_fetch(repo_url: String, repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let dest = Repository::open(resolve(repo)?)?;
+    let fetch =
+        fetch_local(&repo_url, &dest).with_context(|| format!("wire fetch from {repo_url}"))?;
+
+    println!("advertised refs ({}):", fetch.refs.len());
+    for (name, oid) in &fetch.refs {
+        println!("  {} {}", short(&oid.hex()), name);
+    }
+    println!("packfile bytes received: {}", fetch.pack_bytes);
+    println!("imported commits: {}", fetch.import.commits);
+    println!("imported tags:    {}", fetch.import.tags);
+    println!("imported trees:   {}", fetch.import.trees);
+    println!("imported blobs:   {}", fetch.import.blobs);
+    println!("git -> omoplata mappings: {}", fetch.import.mapping_count());
+    Ok(())
 }
 
 /// The conventional 7-character short form of a 40-hex oid.
@@ -918,6 +1021,90 @@ fn cmd_rebase(base: PathBuf, mine: PathBuf, onto: PathBuf) -> anyhow::Result<i32
     }
 }
 
+/// Store a file's bytes as a blob and return the commit id (== object id).
+fn store_file_blob(repo: &Repository, path: &Path) -> anyhow::Result<CommitId> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let id = repo.write_blob(bytes)?;
+    Ok(CommitId::new(id.to_string()))
+}
+
+/// Read a stored blob back as UTF-8 text (the content-addressed round trip).
+fn read_blob_text(repo: &Repository, commit: &CommitId) -> anyhow::Result<String> {
+    let id: ObjectId = commit
+        .as_str()
+        .parse()
+        .with_context(|| format!("malformed commit id {commit}"))?;
+    match repo.read_object(&id)? {
+        Object::Blob(b) => {
+            Ok(String::from_utf8(b.bytes().to_vec()).context("rebased content is not UTF-8")?)
+        }
+        other => anyhow::bail!("expected a blob for {commit}, got {other:?}"),
+    }
+}
+
+/// `omo autorebase <base> <mine> <onto>` — the R4 loop end to end (§5.3/§5.4/§5.6).
+fn cmd_autorebase(
+    repo: Option<PathBuf>,
+    base: PathBuf,
+    mine: PathBuf,
+    onto: PathBuf,
+    change: Option<String>,
+) -> anyhow::Result<i32> {
+    // Require an initialized repository (this is content-on-a-base in the store).
+    let repo = Repository::open(resolve(repo)?)?;
+
+    // Store the three inputs as blobs; a commit id is the blob's object id.
+    let base_commit = store_file_blob(&repo, &base)?;
+    let old_tip = store_file_blob(&repo, &mine)?;
+    let onto_commit = store_file_blob(&repo, &onto)?;
+
+    let change_id = ChangeId::new(change.unwrap_or_else(|| "change".to_owned()));
+
+    // Continue the persisted, bi-temporal op log.
+    let path = oplog_path(&repo);
+    let log = OpLog::load(&path)?;
+    let mut engine = RebaseEngine::with_log(repo.clone(), log);
+
+    // Anchor the change's ref at its pre-rebase tip on first sight, so undo can
+    // later restore it and `refs_at` reports the pre-rebase tip (bi-temporal).
+    if !engine.log().refs_now().contains_key(change_id.as_str()) {
+        engine
+            .log_mut()
+            .set_ref(change_id.to_string(), Some(old_tip.clone()), None);
+    }
+
+    let outcome = engine.auto_rebase(&change_id, &base_commit, &old_tip, &onto_commit)?;
+
+    // The op-log entry summary (the Rebase we just appended).
+    let entry = engine
+        .log()
+        .operations()
+        .last()
+        .map(|op| format!("#{} {}", op.seq, op.kind.summary()));
+
+    // Persist the op log so `omo op log` shows the Rebase entry afterward.
+    engine.log().save(&path)?;
+
+    // The rebased content, read back from the store (markers included).
+    let text = read_blob_text(&repo, &outcome.new_tip)?;
+    print!("{text}");
+
+    eprintln!("autorebase: new tip {}", outcome.new_tip);
+    if outcome.clean {
+        eprintln!("autorebase: clean");
+    } else {
+        eprintln!(
+            "autorebase: {} conflict(s) carried",
+            outcome.conflicts.len()
+        );
+    }
+    if let Some(entry) = entry {
+        eprintln!("op-log: {entry}");
+    }
+
+    Ok(i32::from(!outcome.clean))
+}
+
 /// The 1-based line number containing byte offset `at` in `source`.
 fn line_of(source: &str, at: usize) -> usize {
     // One plus the number of newlines strictly before `at`.
@@ -991,8 +1178,8 @@ fn cmd_track(old: PathBuf, new: PathBuf) -> anyhow::Result<()> {
 ///
 /// The embedder is a deterministic local stand-in; see
 /// `docs/adr/0006-semantic-embeddings.md`.
-fn embed_corpus(
-    embedder: &HashingEmbedder,
+fn embed_corpus<E: Embedder + ?Sized>(
+    embedder: &E,
     files: &[PathBuf],
 ) -> anyhow::Result<(Vec<Embedded<Definition>>, Vec<String>)> {
     let mut corpus: Vec<Embedded<Definition>> = Vec::new();
@@ -1009,33 +1196,77 @@ fn embed_corpus(
     Ok((corpus, labels))
 }
 
-/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
-fn cmd_dup(files: Vec<PathBuf>, threshold: f32) -> anyhow::Result<()> {
+/// Resolve which embedder to use for `omo dup`/`omo similar` given the
+/// `--real-embeddings` flag, and run `f` with it.
+///
+/// When `real` is set and the binary was built with `--features fastembed` and
+/// the model loads, this uses the real `FastEmbedder`; if the model cannot be
+/// loaded (or the binary was built without the feature), it prints a clear note
+/// to stderr and falls back to the deterministic [`HashingEmbedder`]. When
+/// `real` is unset the behavior is identical to before: the hashing stand-in.
+///
+/// `f` is generic over the embedder so both branches share the same downstream
+/// logic — the design's model-agnostic consumers (§5.7).
+fn with_embedder<F>(real: bool, f: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&dyn Embedder) -> anyhow::Result<()>,
+{
+    if real {
+        #[cfg(feature = "fastembed")]
+        {
+            match omoplata_sem::FastEmbedder::try_new() {
+                Ok(embedder) => {
+                    eprintln!("using real embeddings (all-MiniLM-L6-v2, 384-dim)");
+                    return f(&embedder);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "note: real embedding model unavailable ({e}); \
+                         using the deterministic hashing stand-in"
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "fastembed"))]
+        {
+            eprintln!(
+                "note: this binary was built without `--features fastembed`; \
+                 using the deterministic hashing stand-in. Rebuild with \
+                 `cargo build --features fastembed` for real embeddings."
+            );
+        }
+    }
     // NOTE (stand-in model): deterministic hashing embedder standing in for a
     // real transformer model behind the `Embedder` trait (ADR-0006).
     let embedder = HashingEmbedder::default();
-    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+    f(&embedder)
+}
 
-    let dups = find_duplicates(&corpus, threshold);
-    if dups.is_empty() {
-        println!("no likely duplicate definitions");
-        return Ok(());
-    }
-    for (i, j, score) in dups {
-        println!("{score:.2}  {} ~ {}", labels[i], labels[j]);
-    }
-    Ok(())
+/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
+fn cmd_dup(files: Vec<PathBuf>, threshold: f32, real: bool) -> anyhow::Result<()> {
+    with_embedder(real, |embedder| {
+        let (corpus, labels) = embed_corpus(embedder, &files)?;
+
+        let dups = find_duplicates(&corpus, threshold);
+        if dups.is_empty() {
+            println!("no likely duplicate definitions");
+            return Ok(());
+        }
+        for (i, j, score) in dups {
+            println!("{score:.2}  {} ~ {}", labels[i], labels[j]);
+        }
+        Ok(())
+    })
 }
 
 /// `omo similar <query> <file.rs>...` — rank definitions by similarity (§5.7).
-fn cmd_similar(query: String, files: Vec<PathBuf>, top: usize) -> anyhow::Result<()> {
-    // NOTE (stand-in model): deterministic hashing embedder standing in for a
-    // real transformer model behind the `Embedder` trait (ADR-0006).
-    let embedder = HashingEmbedder::default();
-    let (corpus, labels) = embed_corpus(&embedder, &files)?;
+fn cmd_similar(query: String, files: Vec<PathBuf>, top: usize, real: bool) -> anyhow::Result<()> {
+    with_embedder(real, |embedder| {
+        let (corpus, labels) = embed_corpus(embedder, &files)?;
 
-    for (idx, score) in search(&embedder, &query, &corpus, top) {
-        println!("{score:.4} {}", labels[idx]);
-    }
-    Ok(())
+        for (idx, score) in search(embedder, &query, &corpus, top) {
+            println!("{score:.4} {}", labels[idx]);
+        }
+        Ok(())
+    })
 }

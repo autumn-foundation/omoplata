@@ -855,3 +855,139 @@ fn similar_ranks_the_rectangle_function_first() {
         "expected an area function ranked first, got: {first:?}"
     );
 }
+
+#[test]
+fn autorebase_clean_records_rebase_op() {
+    // R4 end to end: mine and onto edit disjoint regions, so the autorebase is
+    // clean (exit 0), both edits are present, the op log gains a Rebase entry with
+    // a supersession (new tip), and `omo op log` shows it afterward.
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&mine, "a\nB\nc\nd\n").unwrap(); // I edit line 2
+    std::fs::write(&onto, "a\nb\nc\nD\n").unwrap(); // base advanced line 4
+
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout("a\nB\nc\nD\n") // both edits present
+        .stderr(predicate::str::contains("autorebase: clean"))
+        .stderr(predicate::str::contains("autorebase: new tip"))
+        .stderr(predicate::str::contains("op-log: "));
+
+    // The persisted op log now shows the Rebase entry (transaction time).
+    omo()
+        .args(["op", "log", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rebase change"))
+        .stdout(predicate::str::contains("(clean)"));
+}
+
+#[test]
+fn autorebase_conflict_exits_nonzero_with_markers() {
+    // mine and onto edit the same line differently: the conflict is carried as a
+    // value (markers in the output), the op log still records the Rebase, and the
+    // command exits non-zero.
+    let dir = tempdir().unwrap();
+    omo().arg("init").arg(dir.path()).assert().success();
+
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&mine, "a\nX\nc\n").unwrap();
+    std::fs::write(&onto, "a\nY\nc\n").unwrap();
+
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< mine"))
+        .stdout(predicate::str::contains(">>>>>>> onto"))
+        .stderr(predicate::str::contains("conflict(s) carried"));
+
+    // The Rebase entry is still recorded, marked with its conflict count.
+    omo()
+        .args(["op", "log", "--repo"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rebase change"))
+        .stdout(predicate::str::contains("1 conflict(s)"));
+}
+
+#[test]
+fn autorebase_requires_initialized_repo() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let mine = dir.path().join("mine.txt");
+    let onto = dir.path().join("onto.txt");
+    std::fs::write(&base, "a\n").unwrap();
+    std::fs::write(&mine, "b\n").unwrap();
+    std::fs::write(&onto, "a\n").unwrap();
+    omo()
+        .args(["autorebase"])
+        .arg(&base)
+        .arg(&mine)
+        .arg(&onto)
+        .args(["--repo"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no omoplata repository"));
+}
+
+#[test]
+fn git_fetch_clones_over_the_wire() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping git fetch CLI test");
+        return;
+    }
+    // A 2-commit, 2-file source repo.
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("a.txt"), b"first\n").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub").join("b.txt"), b"nested\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "first commit");
+    std::fs::write(root.join("a.txt"), b"first\nsecond\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "second commit");
+
+    // `omo git fetch <source> --repo <dest>` clones over the wire: advertises the
+    // ref, receives a packfile, and imports >=1 commit.
+    let omo_dir = tempdir().unwrap();
+    omo().arg("init").arg(omo_dir.path()).assert().success();
+    omo()
+        .arg("git")
+        .arg("fetch")
+        .arg(root)
+        .arg("--repo")
+        .arg(omo_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("refs/heads/main"))
+        .stdout(predicate::str::contains("HEAD"))
+        .stdout(predicate::str::is_match(r"packfile bytes received:\s+[1-9]").unwrap())
+        .stdout(predicate::str::is_match(r"imported commits:\s+2").unwrap())
+        .stdout(predicate::str::contains("git -> omoplata mappings:"));
+}

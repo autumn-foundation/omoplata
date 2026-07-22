@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-22
 - Updated: 2026-07-22 (M10 — commit-graph import and exact-mode export)
+- Updated: 2026-07-22 (R3 — git wire protocol fetch over the local transport)
 
 ## Context
 The design doc makes git interoperability non-negotiable (§3 P8): omoplata
@@ -57,6 +58,41 @@ recording the commit DAG (`commit_oid → GitCommit`), the ref list, and the
 git→omoplata blob/tree map. Every reachable object is re-checked through
 `roundtrip_ok` as it is visited.
 
+### Wire protocol — `upload-pack` fetch over the local transport (R3)
+§3 P8 requires omoplata to read and write *"the git object format **and wire
+protocol**."* Git speaks the same pkt-line + `upload-pack`/`receive-pack`
+conversation over every transport; only the process/socket plumbing differs.
+For `file://` URLs and local paths git uses the **local transport**, which
+spawns the server-side helper (`git upload-pack` for fetch, `git receive-pack`
+for push) and speaks the protocol over that child process's stdio. R3
+implements the fetch half of this as a genuine wire-protocol client, run against
+a local `upload-pack` process rather than a socket.
+
+The `wire` module provides:
+- **`pkt`** — the transport-agnostic pkt-line codec: `write_pkt_line`/
+  `read_pkt_line`, the flush/delim/response-end markers, and ref-line parsing.
+  Unit-tested on known vectors (`write_pkt_line(b"hello\n") == b"000ahello\n"`,
+  flush `== b"0000"`, empty payload `== b"0004"`).
+- **`fetch_local(url_or_path, repo)`** — spawns `git upload-pack <dir>` (protocol
+  v0; `GIT_PROTOCOL` is scrubbed so an inherited v2 setting cannot change the
+  framing), reads the **ref advertisement**, sends `want <oid> ofs-delta` lines
+  for the advertised refs plus a flush and a `done`, reads the `NAK`
+  acknowledgement, and collects the **raw packfile bytes** to EOF. It
+  deliberately requests `ofs-delta` but **not** `side-band`/`side-band-64k`, so
+  the pack arrives as a raw stream rather than multiplexed pkt-lines.
+
+The received pack has no sidecar `*.idx`, so `pack::parse_pack_bytes` decodes it
+**in memory**: it walks the pack sequentially (discovering each object's offset
+via the zlib stream's compressed length), resolves `OFS_DELTA` bases by
+back-offset and `REF_DELTA` bases by oid (deferral passes handle out-of-order
+ref-delta bases), and recomputes each object's SHA-1 from its reconstructed
+content. A full clone's pack is self-contained (not thin), so every base
+resolves within it. The decoded objects are imported through the **same I9
+gate** as on-disk import: `import_objects` — the shared core behind both
+`import_repo` and the wire path — runs `roundtrip_ok` on every object and reuses
+the M6/M10 blob/tree import mapping. This reuses the existing packfile
+delta/`apply_delta` machinery; the parser is not duplicated.
+
 `export_repo` writes every imported object back out as a loose object,
 reconstructed from the decoded model (so byte-identical to the source), plus
 its refs, under an `objects/<xx>/<38>` + `refs/…` layout.
@@ -93,10 +129,21 @@ zlib-ng/system feature is deliberately **not** enabled) and RustCrypto
   false whole-repo PASS over a repo whose objects are packed. Fresh
   `git init` + commits produce loose objects, which the pipeline handles
   end-to-end. Packfile (and delta) decoding is future work.
-- **Future work.** The git **wire protocol** (networked fetch/push) is out of
-  the offline-feasible scope and remains future work, as does **packfile
-  decoding**. The commit-graph import and exact-mode loose-object export
-  (the outbound half of I9's equation) are now implemented (M10).
+- **Wire-protocol scope and future work.** R3 implements the **fetch**
+  (`upload-pack`) half of the wire protocol over the **local transport**
+  (`file://` / local paths). Still future work:
+  - **Push (`receive-pack`) over the local transport.** Not implemented in R3.
+    The pkt-line codec is transport- and direction-agnostic and would be reused;
+    a push additionally needs ref-update commands (`<old> <new> <ref>`) and our
+    own packfile *writer* (serialize + delta-compress the objects to send),
+    which the current crate does not have (it decodes packs, it does not encode
+    them). Deferred to keep R3 scoped to the read path.
+  - **Networked transports (`http`/`ssh`).** The protocol code here is exactly
+    what those transports drive; only the process/socket plumbing differs. They
+    are not offline-testable in this environment, so they remain out of scope.
+  The commit-graph import and exact-mode loose-object export (the outbound half
+  of I9's equation) were implemented in M10; packfile (and delta) decoding is
+  implemented and now also feeds the in-memory wire-pack decoder.
 - **Exact-export path.** Export reconstructs objects from the decoded git-side
   model (`GitImport::git_objects`), *not* from the omoplata trees — the git↔
   omoplata tree mapping is lossy (see the fidelity caveat above), so the

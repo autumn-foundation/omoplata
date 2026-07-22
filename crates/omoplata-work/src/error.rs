@@ -35,4 +35,20 @@ pub enum WorkError {
     /// [`Operation`]: crate::Operation
     #[error("failed to decode operation log entry: {0}")]
     Decode(String),
+
+    /// The object store failed while loading or storing a change's content
+    /// during an auto-rebase.
+    #[error(transparent)]
+    Store(#[from] omoplata_store::StoreError),
+
+    /// The change graph rejected a supersession or revision update during an
+    /// auto-rebase (e.g. a public change, or an orphaned/cyclic edge — I6).
+    #[error(transparent)]
+    Identity(#[from] omoplata_identity::IdentityError),
+
+    /// A commit's stored content could not be interpreted as a text document:
+    /// its id was malformed, the object was not a blob, or its bytes were not
+    /// valid UTF-8.
+    #[error("invalid change content: {0}")]
+    Content(String),
 }

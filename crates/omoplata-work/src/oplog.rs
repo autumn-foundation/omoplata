@@ -74,6 +74,33 @@ pub enum OpKind {
         /// The phase after this operation.
         to: Phase,
     },
+    /// Record that a change auto-rebased its tip onto an advancing base
+    /// (reduction **R4**, design doc §5.3 stacking + §5.4 rebase-over-conflicts).
+    ///
+    /// This is the **transaction-time** half of an auto-rebase: it stamps, at a
+    /// monotonic `seq`, that the change moved from `old_tip` to `new_tip` by
+    /// replaying onto `onto`, carrying `conflicts` conflict values forward (never
+    /// blocking — §3 P3). The **valid-time** half is the supersession edge
+    /// recorded in the [`ChangeGraph`](omoplata_identity::ChangeGraph); the two
+    /// are jointly queryable (§5.6, Thesis claim 3).
+    ///
+    /// Like every other variant it is invertible on its own: it names both
+    /// `old_tip` and `new_tip`, and when folded it points the change's ref
+    /// (keyed by [`ChangeId`]) at `new_tip`, so [`OpLog::undo`] restores
+    /// `old_tip` simply by deactivating this operation and letting the prior
+    /// active operation win.
+    Rebase {
+        /// The change whose tip advanced.
+        change: ChangeId,
+        /// The change's tip before this rebase (restored on undo).
+        old_tip: CommitId,
+        /// The change's tip after this rebase.
+        new_tip: CommitId,
+        /// The commit this rebase replayed onto (the advanced base).
+        onto: CommitId,
+        /// How many conflict values the rebase carried forward (0 == clean).
+        conflicts: usize,
+    },
     /// Invert the operation at transaction time `target_seq`.
     ///
     /// This is how undo (and, when `target_seq` names another `Undo`, redo) is
@@ -98,6 +125,20 @@ impl OpKind {
             }
             OpKind::SetPhase { change, from, to } => {
                 format!("set-phase {change} {from:?} -> {to:?}")
+            }
+            OpKind::Rebase {
+                change,
+                old_tip,
+                new_tip,
+                onto,
+                conflicts,
+            } => {
+                let carried = if *conflicts == 0 {
+                    "clean".to_owned()
+                } else {
+                    format!("{conflicts} conflict(s)")
+                };
+                format!("rebase {change} {old_tip} -> {new_tip} onto {onto} ({carried})")
             }
             OpKind::Undo { target_seq } => format!("undo #{target_seq}"),
         }
@@ -260,15 +301,24 @@ impl OpLog {
             if !self.is_active(op.seq, limit) {
                 continue;
             }
-            if let OpKind::SetRef { name, new, .. } = &op.kind {
-                match new {
+            match &op.kind {
+                OpKind::SetRef { name, new, .. } => match new {
                     Some(commit) => {
                         refs.insert(name.clone(), commit.clone());
                     }
                     None => {
                         refs.remove(name);
                     }
+                },
+                // A `Rebase` advances the change's ref (keyed by [`ChangeId`]) to
+                // the rebased tip. Deactivating it (undo) drops this insert, so the
+                // prior active operation restores `old_tip` — invertibility (I7).
+                OpKind::Rebase {
+                    change, new_tip, ..
+                } => {
+                    refs.insert(change.to_string(), new_tip.clone());
                 }
+                OpKind::SetPhase { .. } | OpKind::Undo { .. } => {}
             }
         }
         refs
@@ -493,6 +543,64 @@ mod tests {
         let loaded = OpLog::load(&path).unwrap();
         assert_eq!(loaded.operations(), log.operations());
         assert_eq!(loaded.refs_now(), log.refs_now());
+    }
+
+    #[test]
+    fn rebase_op_folds_and_undo_restores_prior_tip() {
+        let mut log = OpLog::new();
+        // The change's ref starts at the pre-rebase tip (seq 0).
+        log.set_ref("c1", Some(commit("t0")), None);
+        // Auto-rebase advances it to t1 (seq 1).
+        log.append(
+            OpKind::Rebase {
+                change: ChangeId::new("c1"),
+                old_tip: commit("t0"),
+                new_tip: commit("t1"),
+                onto: commit("onto"),
+                conflicts: 2,
+            },
+            None,
+        );
+        // Valid "now": the folded ref is the rebased tip.
+        assert_eq!(log.refs_now().get("c1"), Some(&commit("t1")));
+        // Bi-temporal: as believed at transaction time 0 (before the rebase), the
+        // tip was still t0.
+        assert_eq!(log.refs_at(0).get("c1"), Some(&commit("t0")));
+        assert_ne!(log.refs_at(0), log.refs_now());
+
+        // PROOF OBLIGATION (I7): undoing the rebase restores old_tip.
+        log.undo().unwrap();
+        assert_eq!(log.refs_now().get("c1"), Some(&commit("t0")));
+        // The log grew (it never erases): setref, rebase, undo.
+        assert_eq!(log.operations().len(), 3);
+    }
+
+    #[test]
+    fn rebase_op_serde_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oplog.jsonl");
+        let mut log = OpLog::new();
+        log.set_ref("c1", Some(commit("t0")), None);
+        log.append(
+            OpKind::Rebase {
+                change: ChangeId::new("c1"),
+                old_tip: commit("t0"),
+                new_tip: commit("t1"),
+                onto: commit("onto"),
+                conflicts: 1,
+            },
+            Some("auto-rebase".into()),
+        );
+        log.save(&path).unwrap();
+
+        let loaded = OpLog::load(&path).unwrap();
+        assert_eq!(loaded.operations(), log.operations());
+        assert_eq!(loaded.refs_now(), log.refs_now());
+        // The persisted variant survives the round trip with all fields intact.
+        assert!(matches!(
+            loaded.operations()[1].kind,
+            OpKind::Rebase { conflicts: 1, .. }
+        ));
     }
 
     #[test]

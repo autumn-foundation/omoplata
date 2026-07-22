@@ -49,6 +49,14 @@ pub enum GitError {
     /// zlib inflate/deflate failed.
     #[error("zlib error: {0}")]
     Zlib(String),
+    /// A violation of the git wire protocol (pkt-line framing, a malformed ref
+    /// advertisement, or an unexpected `upload-pack` response).
+    #[error("git wire protocol error: {0}")]
+    WireProto(&'static str),
+    /// The `git upload-pack` / `git-upload-pack` helper could not be spawned,
+    /// exited non-zero, or the transport failed while talking to it.
+    #[error("git wire transport error: {0}")]
+    Wire(String),
     /// A filesystem operation failed.
     #[error("i/o error at {path}: {source}")]
     Io {
