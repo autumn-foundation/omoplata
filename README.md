@@ -79,7 +79,9 @@ directory); `init`/`status` take a positional path.
 | Command | Description | Example |
 |---------|-------------|---------|
 | `omo git verify <git-dir>` | Run the I9 round-trip gate over every loose object; prints per-type counts and `PASS`/`FAIL`. | `omo git verify path/.git` |
-| `omo git import <git-dir> [--repo DIR]` | Enforce the gate, then import git blobs and trees into the store. | `omo git import path/.git` |
+| `omo git import <git-dir> [--repo DIR]` | Enforce the gate, walk the commit graph from refs, and import every reachable object (commits/tags/trees/blobs). | `omo git import path/.git` |
+| `omo git log <git-dir>` | Print the imported commit graph newest-first as `<short-oid> <subject>  (parents: …)`. | `omo git log path/.git` |
+| `omo git export <git-dir> <out-dir>` | Import then exact-mode export every object back out as loose objects; prints `exported N objects; round-trip vs source: PASS/FAIL`. | `omo git export path/.git out/` |
 
 ### Semantic
 
@@ -102,7 +104,7 @@ never a silently wrong merge.
 | 3 | `omoplata-identity` | Change graph, supersession, phases, and the definition graph with structural matching. | §5.3, §5.5, §7 #3 |
 | 4 | `omoplata-work` | Working model: the bi-temporal operation log, total undo, and the revset engine. | §5.6, §5.8, §7 #4 |
 | 5 | `omoplata-drivers` | Tier-2 structural merge (Rust via tree-sitter) with a line/diff3 fallback — untrusted by design. | §4, §7 #5 |
-| 6 | `omoplata-git` | Git object codec and the round-trip fidelity gate (I9); import into the store. | §7 #6, P8 |
+| 6 | `omoplata-git` | Git object codec (blobs/trees/commits/tags), round-trip fidelity gate (I9), commit-graph import, and exact-mode export. | §7 #6, P8 |
 | 7 | `omoplata-sem` | Embedding pipeline, semantic search, and duplicate-work detection. | §5.7, §7 #7 |
 | 8 | `omoplata-cli` | The `omo` binary: command dispatch and the revset front-end. | §7 #8 |
 
@@ -149,9 +151,12 @@ the definitive statement of what is *not* yet the real thing:
 - The **I8 runtime kernel-admission check** (every merge result carries a checked
   commutation witness or is a Conflict value) is not hosted as a single enforced
   boundary the drivers pass through — future work.
-- Git **commit-graph / annotated-tag import**, the **wire protocol**, and
-  **exact-mode export** (the full `export` half of I9 beyond the round-trip codec
-  gate) are v1 future work; today's git leg is verify + blob/tree import.
+- Git **wire protocol** (networked fetch/push) and **packfile decoding** are git
+  future work. Commit-graph import and exact-mode loose-object export (closing
+  the I9 `import → export → bit-identical` loop at the repository level) are
+  implemented; the outstanding gap is the network protocol and packfile/delta
+  decoding (loose objects round-trip end-to-end; packed objects error rather
+  than being silently skipped).
 - **Conflicts-as-values propagation through rebases** and **auto-rebase** (P3/P4
   beyond the op-log undo) are modeled in the algebra but not wired as a working
   rebase loop.

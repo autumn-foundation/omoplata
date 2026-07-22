@@ -23,27 +23,37 @@
 //!
 //! ## What this crate provides
 //! - A faithful git object codec ([`encode`], [`decode`], [`oid`]) over
-//!   [`GitObject`] — trees re-encode byte-identically.
+//!   [`GitObject`] — trees, commits, and tags all re-encode byte-identically.
+//!   Commits and tags are parsed into typed graph fields ([`GitCommit`],
+//!   [`GitTag`]) while retaining their raw body for exact re-encoding.
 //! - Loose-object I/O ([`read_loose`], [`write_loose`], [`walk_loose`]).
+//! - Ref reading ([`read_refs`]): `HEAD`, loose refs, and `packed-refs`.
 //! - The round-trip gate: [`roundtrip_ok`] for one object and [`verify_repo`]
 //!   for a whole repository — the executable form of I9.
-//! - Import into the omoplata store ([`import_repo`]), which runs the gate first
-//!   (I9 enforcement) then maps git blobs/trees into
-//!   [`omoplata_store::Object`]s.
+//! - Commit-graph import ([`import_repo`]): walks the commit DAG from refs,
+//!   importing every reachable object through the I9 gate and recording the DAG.
+//! - Exact-mode export ([`export_repo`]) and the repo-level round-trip gate
+//!   ([`export_matches_source`]) — the outbound half of I9.
 //!
 //! No `unwrap`/`expect`/`panic` appears outside tests.
 
 mod error;
+mod export;
 mod gate;
 mod import;
 mod loose;
 mod object;
+mod refs;
 
 pub use error::GitError;
+pub use export::{export_matches_source, export_repo, GitExport};
 pub use gate::{roundtrip_ok, verify_repo, GitReport};
 pub use import::{import_repo, mode_to_kind, GitImport};
-pub use loose::{loose_path, oid_from_loose_path, read_loose, walk_loose, write_loose};
-pub use object::{decode, encode, oid, GitObject, GitOid, GitTreeEntry};
+pub use loose::{
+    loose_path, oid_from_loose_path, pack_file_count, read_loose, walk_loose, write_loose,
+};
+pub use object::{decode, encode, oid, GitCommit, GitObject, GitOid, GitTag, GitTreeEntry};
+pub use refs::read_refs;
 
 #[cfg(test)]
 mod proptests {

@@ -161,6 +161,23 @@ pub fn walk_loose(git_dir: &Path) -> Result<Vec<(GitOid, GitObject)>, GitError> 
     Ok(out)
 }
 
+/// Count the `*.pack` files under `<git_dir>/objects/pack`.
+///
+/// v1 decodes loose objects only; a non-zero count means some objects live in
+/// packfiles this crate does not decode. Callers use it to refuse a false PASS
+/// rather than silently skipping packed objects (§8 scope; see ADR-0005).
+#[must_use]
+pub fn pack_file_count(git_dir: &Path) -> usize {
+    let pack_dir = git_dir.join("objects").join("pack");
+    match std::fs::read_dir(&pack_dir) {
+        Ok(rd) => rd
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
 /// The conventional loose-object path for `oid` under `objects_dir`.
 #[must_use]
 pub fn loose_path(objects_dir: &Path, oid: &GitOid) -> PathBuf {

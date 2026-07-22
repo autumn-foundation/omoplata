@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use crate::error::GitError;
-use crate::loose::walk_loose;
+use crate::loose::{pack_file_count, walk_loose};
 use crate::object::{decode, encode, oid, GitObject, GitOid};
 
 /// Per-type counts produced by [`verify_repo`].
@@ -28,6 +28,11 @@ pub struct GitReport {
     pub commits: usize,
     /// Number of tag objects that passed the gate.
     pub tags: usize,
+    /// Number of packfiles present under `objects/pack`. The gate covers loose
+    /// objects only; a non-zero count means the PASS is over the loose set, not
+    /// the whole repository (§8; ADR-0005). Callers should surface this rather
+    /// than report a false whole-repo PASS.
+    pub packfiles: usize,
 }
 
 impl GitReport {
@@ -81,7 +86,10 @@ pub fn roundtrip_ok(bytes: &[u8]) -> Result<GitOid, GitError> {
 /// [`GitError::OidMismatch`] on any content/path oid disagreement (surfaced by
 /// [`walk_loose`]), or an I/O / decode error while reading objects.
 pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
-    let mut report = GitReport::default();
+    let mut report = GitReport {
+        packfiles: pack_file_count(git_dir),
+        ..GitReport::default()
+    };
     for (path_oid, object) in walk_loose(git_dir)? {
         // Re-run the gate on the canonical encoded bytes and confirm the oid the
         // path claimed matches the oid the content produces.

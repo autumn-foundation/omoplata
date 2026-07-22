@@ -478,6 +478,75 @@ fn git_verify_and_import_against_real_repo() {
         .stdout(predicate::str::contains("git -> omoplata mappings:"));
 }
 
+fn git_commit(dir: &std::path::Path, message: &str) {
+    run_git(
+        dir,
+        &[
+            "-c",
+            "user.email=test@omoplata.dev",
+            "-c",
+            "user.name=Omoplata Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+}
+
+#[test]
+fn git_log_and_export_against_two_commit_repo() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping git log/export CLI test");
+        return;
+    }
+    // A 2-commit, 2-file repo (a parent edge and a subtree).
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q"]);
+    std::fs::write(root.join("a.txt"), b"first\n").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub").join("b.txt"), b"nested\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "first commit");
+    std::fs::write(root.join("a.txt"), b"first\nsecond\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "second commit");
+    let git_dir = root.join(".git");
+
+    // `omo git log` lists 2 commits, newest-first, with the parent edge shown.
+    let out = omo().arg("git").arg("log").arg(&git_dir).output().unwrap();
+    assert!(out.status.success());
+    let log = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 commits in log, got: {log:?}");
+    assert!(lines[0].contains("second commit"), "newest first: {log:?}");
+    assert!(lines[1].contains("first commit"), "root last: {log:?}");
+    // The newest commit lists a parent; the root's parents are "-".
+    assert!(
+        lines[0].contains("(parents: "),
+        "child must show a parent: {log:?}"
+    );
+    assert!(
+        lines[1].contains("(parents: -)"),
+        "root must have no parents: {log:?}"
+    );
+
+    // `omo git export` prints PASS and exits 0.
+    let out_dir = tempdir().unwrap();
+    omo()
+        .arg("git")
+        .arg("export")
+        .arg(&git_dir)
+        .arg(out_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("round-trip vs source: PASS"))
+        .stdout(predicate::str::is_match(r"exported \d+ objects").unwrap());
+}
+
 /// Two files whose first function is essentially the same under a different
 /// name, plus an unrelated function in each — the fixtures for `dup`/`similar`.
 const FILE_A: &str = "fn area_of_rect(width: f64, height: f64) -> f64 {\n    let area = width * height;\n    area\n}\n\nfn greet(name: &str) -> String {\n    format!(\"hello, {name}!\")\n}\n";

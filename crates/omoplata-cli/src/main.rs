@@ -7,7 +7,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use omoplata_algebra::{diff, kernel, merge3, Admission, Doc};
 use omoplata_drivers::{select_driver, MergeInput};
-use omoplata_git::{import_repo, verify_repo};
+use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
 use omoplata_identity::{
     extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
 };
@@ -200,17 +200,36 @@ enum GitCommand {
         /// The git directory to verify, e.g. `path/to/.git`.
         git_dir: PathBuf,
     },
-    /// Import a git repository's blobs and trees into an omoplata repository.
+    /// Import a git repository by walking its commit graph from refs.
     ///
-    /// Enforces I9 (runs the gate first, refusing import if it fails), then maps
-    /// git blobs/trees into the store. Prints imported counts and the number of
-    /// git→omoplata oid mappings.
+    /// Enforces I9 (runs the gate first, refusing import if it fails), walks the
+    /// commit DAG from every ref, and imports every reachable object. Prints the
+    /// commit/tag/tree/blob counts and the number of git→omoplata oid mappings.
     Import {
         /// The git directory to import, e.g. `path/to/.git`.
         git_dir: PathBuf,
         /// Destination omoplata repository (defaults to the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Print the imported commit graph, newest-first.
+    ///
+    /// Each line is `<short-oid> <subject>  (parents: <short-oids>)`.
+    Log {
+        /// The git directory to read, e.g. `path/to/.git`.
+        git_dir: PathBuf,
+    },
+    /// Exact-mode export: import a git repo, then write every object back out.
+    ///
+    /// Writes loose objects and refs under `<out-dir>` (a git-directory layout:
+    /// `<out-dir>/objects/<xx>/…` and `<out-dir>/refs/…`), then runs the
+    /// repo-level round-trip gate. Prints `exported <N> objects; round-trip vs
+    /// source: PASS/FAIL` and exits non-zero on FAIL.
+    Export {
+        /// The git directory to import and export, e.g. `path/to/.git`.
+        git_dir: PathBuf,
+        /// The output directory to write the reconstructed objects and refs to.
+        out_dir: PathBuf,
     },
 }
 
@@ -291,6 +310,8 @@ fn run() -> anyhow::Result<i32> {
         Command::Git { action } => match action {
             GitCommand::Verify { git_dir } => cmd_git_verify(git_dir),
             GitCommand::Import { git_dir, repo } => cmd_git_import(git_dir, repo).map(|()| 0),
+            GitCommand::Log { git_dir } => cmd_git_log(git_dir).map(|()| 0),
+            GitCommand::Export { git_dir, out_dir } => cmd_git_export(git_dir, out_dir),
         },
         Command::Dup { files, threshold } => cmd_dup(files, threshold).map(|()| 0),
         Command::Similar { query, files, top } => cmd_similar(query, files, top).map(|()| 0),
@@ -475,6 +496,13 @@ fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
             println!("commits: {}", report.commits);
             println!("tags:    {}", report.tags);
             println!("total:   {}", report.total());
+            if report.packfiles > 0 {
+                // The gate covers loose objects only; be honest about packed ones.
+                println!(
+                    "note: {} packfile(s) present — not decoded (loose-object gate only)",
+                    report.packfiles
+                );
+            }
             println!("round-trip gate: PASS");
             Ok(0)
         }
@@ -486,19 +514,74 @@ fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
     }
 }
 
-/// `omo git import <git-dir> [--repo <dir>]` — import a git repo into the store.
+/// `omo git import <git-dir> [--repo <dir>]` — walk the commit graph and import.
 ///
-/// Enforces I9 (the gate runs first inside `import_repo`) then imports blobs and
-/// trees, printing counts and the number of git→omoplata oid mappings.
+/// Enforces I9 (the gate runs first inside `import_repo`), walks the commit DAG
+/// from refs, and imports every reachable object, printing the per-type counts
+/// and the number of git→omoplata oid mappings.
 fn cmd_git_import(git_dir: PathBuf, repo: Option<PathBuf>) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let import = import_repo(&git_dir, &repo)?;
-    println!("imported blobs:   {}", import.blobs);
+    println!("imported commits: {}", import.commits);
+    println!("imported tags:    {}", import.tags);
     println!("imported trees:   {}", import.trees);
-    println!("commits seen:     {}", import.commits);
-    println!("tags seen:        {}", import.tags);
+    println!("imported blobs:   {}", import.blobs);
+    println!("refs walked:      {}", import.refs.len());
     println!("git -> omoplata mappings: {}", import.mapping_count());
     Ok(())
+}
+
+/// `omo git log <git-dir>` — print the imported commit graph newest-first.
+///
+/// Each line is `<short-oid> <subject>  (parents: <short-oids>)`. The graph is
+/// walked from refs via `import_repo` into a throwaway store.
+fn cmd_git_log(git_dir: PathBuf) -> anyhow::Result<()> {
+    let scratch = tempfile::tempdir().context("creating a scratch omoplata store")?;
+    let repo = Repository::init(scratch.path()).context("initializing scratch store")?;
+    let import = import_repo(&git_dir, &repo)?;
+    for oid in import.commit_log() {
+        let Some(commit) = import.commit_dag.get(&oid) else {
+            continue;
+        };
+        let parents = commit
+            .parents
+            .iter()
+            .map(|p| short(&p.hex()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "{} {}  (parents: {})",
+            short(&oid.hex()),
+            commit.subject(),
+            if parents.is_empty() { "-" } else { &parents }
+        );
+    }
+    Ok(())
+}
+
+/// `omo git export <git-dir> <out-dir>` — import then exact-mode export.
+///
+/// Imports the git repo (walking the commit graph), writes every object back out
+/// as a loose object under `<out-dir>` plus its refs, then runs the repo-level
+/// round-trip gate. Prints `exported <N> objects; round-trip vs source:
+/// PASS/FAIL` and exits non-zero on FAIL.
+fn cmd_git_export(git_dir: PathBuf, out_dir: PathBuf) -> anyhow::Result<i32> {
+    let scratch = tempfile::tempdir().context("creating a scratch omoplata store")?;
+    let repo = Repository::init(scratch.path()).context("initializing scratch store")?;
+    let import = import_repo(&git_dir, &repo)?;
+    let export = export_repo(&import, &out_dir)?;
+    let matches = export_matches_source(&git_dir, &out_dir)?;
+    let verdict = if matches { "PASS" } else { "FAIL" };
+    println!(
+        "exported {} objects; round-trip vs source: {verdict}",
+        export.objects
+    );
+    Ok(i32::from(!matches))
+}
+
+/// The conventional 7-character short form of a 40-hex oid.
+fn short(hex: &str) -> String {
+    hex.chars().take(7).collect()
 }
 
 /// Read a file into a [`Doc`], preserving its contents faithfully.
