@@ -146,6 +146,42 @@ fn merge_clean_disjoint_edits() {
 }
 
 #[test]
+fn defs_lists_definitions_in_source_order() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("lib.rs");
+    std::fs::write(
+        &file,
+        "struct Point { x: i32 }\nfn free() {}\nmod inner {\n    fn nested() {}\n}\n",
+    )
+    .unwrap();
+    omo()
+        .arg("defs")
+        .arg(&file)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("struct Point (lines 1-1)"))
+        .stdout(predicate::str::contains("fn free (lines 2-2)"))
+        .stdout(predicate::str::contains("mod inner"))
+        .stdout(predicate::str::contains("fn inner::nested"));
+}
+
+#[test]
+fn track_detects_rename() {
+    let dir = tempdir().unwrap();
+    let old = dir.path().join("old.rs");
+    let new = dir.path().join("new.rs");
+    std::fs::write(&old, "fn foo() { let x = 41 + 1; }\n").unwrap();
+    std::fs::write(&new, "fn bar() { let x = 41 + 1; }\n").unwrap();
+    omo()
+        .arg("track")
+        .arg(&old)
+        .arg(&new)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("renamed foo -> bar (fn)"));
+}
+
+#[test]
 fn merge_conflict_exits_nonzero_with_markers() {
     let dir = tempdir().unwrap();
     let base = dir.path().join("base.txt");

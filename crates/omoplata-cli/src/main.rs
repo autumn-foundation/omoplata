@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use omoplata_algebra::{diff, merge3, Doc};
+use omoplata_identity::{extract_definitions, match_definitions, Definition, MatchStatus};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -64,6 +65,23 @@ enum Command {
         /// The right side.
         right: PathBuf,
     },
+    /// List the Rust definitions in a source file, in source order.
+    ///
+    /// Prints each definition as `<kind> <path> (lines A-B)`.
+    Defs {
+        /// The Rust source file to extract definitions from.
+        file: PathBuf,
+    },
+    /// Track definition identity across two versions of a Rust file.
+    ///
+    /// Prints the tiered-matcher report (§5.5): one line per matched, added,
+    /// deleted, renamed, or modified definition.
+    Track {
+        /// The old version of the file.
+        old: PathBuf,
+        /// The new version of the file.
+        new: PathBuf,
+    },
 }
 
 fn main() {
@@ -89,6 +107,8 @@ fn run() -> anyhow::Result<i32> {
         Command::CatObject { id, repo } => cmd_cat_object(repo, id).map(|()| 0),
         Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
+        Command::Defs { file } => cmd_defs(file).map(|()| 0),
+        Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
     }
 }
 
@@ -222,4 +242,80 @@ fn cmd_merge(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32
         eprintln!("{n} conflict(s)");
         Ok(1)
     }
+}
+
+/// The 1-based line number containing byte offset `at` in `source`.
+fn line_of(source: &str, at: usize) -> usize {
+    // One plus the number of newlines strictly before `at`.
+    1 + source.as_bytes()[..at.min(source.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
+/// `omo defs <file.rs>` — list definitions as `<kind> <path> (lines A-B)`.
+fn cmd_defs(file: PathBuf) -> anyhow::Result<()> {
+    let source =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+    let defs = extract_definitions(&source)?;
+    for def in &defs {
+        let start = line_of(&source, def.byte_range.start);
+        let end = line_of(
+            &source,
+            def.byte_range
+                .end
+                .saturating_sub(1)
+                .max(def.byte_range.start),
+        );
+        println!("{} {} (lines {start}-{end})", def.kind.label(), def.path);
+    }
+    Ok(())
+}
+
+/// `omo track <old.rs> <new.rs>` — print the definition match report.
+fn cmd_track(old: PathBuf, new: PathBuf) -> anyhow::Result<()> {
+    let old_src =
+        std::fs::read_to_string(&old).with_context(|| format!("reading {}", old.display()))?;
+    let new_src =
+        std::fs::read_to_string(&new).with_context(|| format!("reading {}", new.display()))?;
+    let old_defs = extract_definitions(&old_src)?;
+    let new_defs = extract_definitions(&new_src)?;
+
+    let describe = |d: &Definition| format!("{} ({})", d.path, d.kind.label());
+
+    for m in match_definitions(&old_defs, &new_defs) {
+        let line = match m.status {
+            MatchStatus::Renamed => {
+                let o = &old_defs[m.old.expect("renamed has old")];
+                let n = &new_defs[m.new.expect("renamed has new")];
+                format!("renamed {} -> {} ({})", o.path, n.path, n.kind.label())
+            }
+            MatchStatus::Modified => {
+                format!(
+                    "modified {}",
+                    describe(&new_defs[m.new.expect("modified has new")])
+                )
+            }
+            MatchStatus::Unchanged => {
+                format!(
+                    "unchanged {}",
+                    describe(&new_defs[m.new.expect("unchanged has new")])
+                )
+            }
+            MatchStatus::Added => {
+                format!(
+                    "added {}",
+                    describe(&new_defs[m.new.expect("added has new")])
+                )
+            }
+            MatchStatus::Deleted => {
+                format!(
+                    "deleted {}",
+                    describe(&old_defs[m.old.expect("deleted has old")])
+                )
+            }
+        };
+        println!("{line}");
+    }
+    Ok(())
 }
