@@ -7,6 +7,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use omoplata_algebra::{diff, merge3, Doc};
 use omoplata_drivers::{select_driver, MergeInput};
+use omoplata_git::{import_repo, verify_repo};
 use omoplata_identity::{
     extract_definitions, match_definitions, CommitId, Definition, MatchStatus,
 };
@@ -122,6 +123,36 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Git interoperability: the I9 round-trip gate and import (§3 P8, §6 I9).
+    Git {
+        #[command(subcommand)]
+        action: GitCommand,
+    },
+}
+
+/// `omo git …` — git interop subcommands (§3 P8, invariant I9).
+#[derive(Debug, Subcommand)]
+enum GitCommand {
+    /// Run the round-trip gate over every loose object in a git repository.
+    ///
+    /// Prints per-type object counts and `round-trip gate: PASS` (exit 0), or
+    /// the failing object and `round-trip gate: FAIL` (exit non-zero).
+    Verify {
+        /// The git directory to verify, e.g. `path/to/.git`.
+        git_dir: PathBuf,
+    },
+    /// Import a git repository's blobs and trees into an omoplata repository.
+    ///
+    /// Enforces I9 (runs the gate first, refusing import if it fails), then maps
+    /// git blobs/trees into the store. Prints imported counts and the number of
+    /// git→omoplata oid mappings.
+    Import {
+        /// The git directory to import, e.g. `path/to/.git`.
+        git_dir: PathBuf,
+        /// Destination omoplata repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 /// `omo ref …` — ref subcommands backed by the operation log.
@@ -197,6 +228,10 @@ fn run() -> anyhow::Result<i32> {
             OpCommand::Undo { repo } => cmd_op_undo(repo).map(|()| 0),
         },
         Command::Revset { expr, repo } => cmd_revset(repo, expr).map(|()| 0),
+        Command::Git { action } => match action {
+            GitCommand::Verify { git_dir } => cmd_git_verify(git_dir),
+            GitCommand::Import { git_dir, repo } => cmd_git_import(git_dir, repo).map(|()| 0),
+        },
     }
 }
 
@@ -362,6 +397,45 @@ fn cmd_cat_object(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `omo git verify <git-dir>` — run the I9 round-trip gate over a git repo.
+///
+/// On success prints per-type counts and `round-trip gate: PASS` (exit 0). On
+/// failure prints the failing object to stderr and `round-trip gate: FAIL`
+/// (exit 1).
+fn cmd_git_verify(git_dir: PathBuf) -> anyhow::Result<i32> {
+    match verify_repo(&git_dir) {
+        Ok(report) => {
+            println!("blobs:   {}", report.blobs);
+            println!("trees:   {}", report.trees);
+            println!("commits: {}", report.commits);
+            println!("tags:    {}", report.tags);
+            println!("total:   {}", report.total());
+            println!("round-trip gate: PASS");
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("failing object: {e}");
+            println!("round-trip gate: FAIL");
+            Ok(1)
+        }
+    }
+}
+
+/// `omo git import <git-dir> [--repo <dir>]` — import a git repo into the store.
+///
+/// Enforces I9 (the gate runs first inside `import_repo`) then imports blobs and
+/// trees, printing counts and the number of git→omoplata oid mappings.
+fn cmd_git_import(git_dir: PathBuf, repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let import = import_repo(&git_dir, &repo)?;
+    println!("imported blobs:   {}", import.blobs);
+    println!("imported trees:   {}", import.trees);
+    println!("commits seen:     {}", import.commits);
+    println!("tags seen:        {}", import.tags);
+    println!("git -> omoplata mappings: {}", import.mapping_count());
     Ok(())
 }
 

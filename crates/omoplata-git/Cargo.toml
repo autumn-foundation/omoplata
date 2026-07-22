@@ -1,0 +1,16 @@
+[package]
+name = "omoplata-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+omoplata-store = { path = "../omoplata-store" }
+flate2 = "1"
+sha1 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"

@@ -329,3 +329,73 @@ fn merge_conflict_exits_nonzero_with_markers() {
         .stdout(predicate::str::contains(">>>>>>> right"))
         .stderr(predicate::str::contains("1 conflict(s)"));
 }
+
+/// Whether `git` is available on PATH (the git-interop CLI tests need it).
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("spawn git");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[test]
+fn git_verify_and_import_against_real_repo() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping git verify/import CLI test");
+        return;
+    }
+    // Build a real git repo.
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q"]);
+    std::fs::write(root.join("f.txt"), b"content\n").unwrap();
+    run_git(root, &["add", "f.txt"]);
+    run_git(
+        root,
+        &[
+            "-c",
+            "user.email=test@omoplata.dev",
+            "-c",
+            "user.name=Omoplata Test",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ],
+    );
+    let git_dir = root.join(".git");
+
+    // `omo git verify` exits 0 and reports PASS.
+    omo()
+        .arg("git")
+        .arg("verify")
+        .arg(&git_dir)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("round-trip gate: PASS"))
+        .stdout(predicate::str::contains("blobs:"));
+
+    // `omo git import` into a fresh omoplata repo reports >=1 blob.
+    let omo_dir = tempdir().unwrap();
+    omo().arg("init").arg(omo_dir.path()).assert().success();
+    omo()
+        .arg("git")
+        .arg("import")
+        .arg(&git_dir)
+        .arg("--repo")
+        .arg(omo_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match(r"imported blobs:\s+[1-9]").unwrap())
+        .stdout(predicate::str::contains("git -> omoplata mappings:"));
+}
