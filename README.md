@@ -13,12 +13,15 @@ else degrades to an honest, first-class conflict.
 > CLI — an 8-crate workspace covering the object store, patch algebra, definition
 > identity, the bi-temporal operation log, Tier-2 merge drivers, git interop, and
 > the semantic layer. It is honest about its reductions: the merge kernel's
-> **formal Verus proofs are deferred to property tests** (ADR-0003), the
-> per-language structural-merge fallback is a **built-in line/diff3 driver**
-> standing in for Mergiraf (ADR-0004), and the semantic layer uses a
-> **deterministic hashing embedder** standing in for a real embedding model
-> (ADR-0006). See [Reductions](#reductions-from-the-design-doc-in-this-build) for
-> the full list of what is and is not yet implemented.
+> **invariant I1b is machine-checked in Verus** (with I10 disjoint commutation
+> proven for the length-preserving core; I5-proper still property-tested — see
+> ADR-0003 and [`verus/`](verus/)) and the
+> semantic layer uses a **deterministic hashing embedder** standing in for a real
+> embedding model (ADR-0006). The per-language structural-merge fallback is the
+> real **Mergiraf** tool, integrated as a PATH-detected shell-out driver with the
+> built-in line/diff3 driver as the no-tool fallback (ADR-0004). See
+> [Reductions](#reductions-from-the-design-doc-in-this-build) for the full list of
+> what is and is not yet implemented.
 
 ## Install
 
@@ -62,7 +65,7 @@ directory); `init`/`status` take a positional path.
 |---------|-------------|---------|
 | `omo diff <base> <target>` | Show the line diff turning `base` into `target`, unified-ish. | `omo diff a.txt b.txt` |
 | `omo merge <base> <left> <right>` | Three-way line merge; conflicts render as markers and exit non-zero. | `omo merge base left right` |
-| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver, everything else the line fallback. | `omo merge-file base.rs left.rs right.rs` |
+| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver; supported non-Rust files use the Mergiraf shell-out when it is on `PATH`, else the line fallback. | `omo merge-file base.json left.json right.json` |
 
 ### History and revsets
 
@@ -103,7 +106,7 @@ never a silently wrong merge.
 | 2 | `omoplata-algebra` | Canonical diff, patch algebra, commutation checker, conflicts-as-values — the verified core. | §5.2, §5.4, §7 #2 |
 | 3 | `omoplata-identity` | Change graph, supersession, phases, and the definition graph with structural matching. | §5.3, §5.5, §7 #3 |
 | 4 | `omoplata-work` | Working model: the bi-temporal operation log, total undo, and the revset engine. | §5.6, §5.8, §7 #4 |
-| 5 | `omoplata-drivers` | Tier-2 structural merge (Rust via tree-sitter) with a line/diff3 fallback — untrusted by design. | §4, §7 #5 |
+| 5 | `omoplata-drivers` | Tier-2 structural merge (Rust via tree-sitter; Mergiraf shell-out for 45+ other languages) with a line/diff3 fallback — untrusted by design. | §4, §7 #5 |
 | 6 | `omoplata-git` | Git object codec (blobs/trees/commits/tags), round-trip fidelity gate (I9), commit-graph import, and exact-mode export. | §7 #6, P8 |
 | 7 | `omoplata-sem` | Embedding pipeline, semantic search, and duplicate-work detection. | §5.7, §7 #7 |
 | 8 | `omoplata-cli` | The `omo` binary: command dispatch and the revset front-end. | §7 #8 |
@@ -111,14 +114,18 @@ never a silently wrong merge.
 ## Design-doc traceability
 
 Each soundness-relevant invariant from §6 is currently guarded as noted. Per
-ADR-0003 the Verus proofs are deferred; the guard today is an executable property
-or round-trip test against the shipping code, which is exactly the adversarial
-battery §6 describes running against "the executable code".
+ADR-0003, I1b is **machine-checked in Verus** against a faithful model
+([`verus/`](verus/)) and I10 (disjoint commutation) is Verus-checked for its
+length-preserving core; the remaining invariants are guarded by executable
+property or round-trip tests against the shipping code — the adversarial battery
+§6 describes running against "the executable code". The Verus module verifies a
+model of the algorithm shape; the shipping functions themselves stay
+trusted-by-testing, with the proptests as their differential oracle.
 
 | Invariant | Meaning | Where | Current guard |
 |-----------|---------|-------|---------------|
-| I1b | Diff faithfulness: `apply(a, diff(a,b)) == b` | `omoplata-algebra` | Property test (round-trip) |
-| I5 | Commutation soundness: commuting patches yield the same tree in either order | `omoplata-algebra` | Property test |
+| I1b | Diff faithfulness: `apply(a, diff(a,b)) == b` | `omoplata-algebra` | **Verus-checked (model)** + property test (round-trip) |
+| I5 | Commutation soundness: commuting patches yield the same tree in either order | `omoplata-algebra` | Property test; **I10 enabling lemma Verus-checked (length-preserving core)**, general I5 in progress |
 | I6 | Supersession well-formedness: the change graph is acyclic, no orphaned obsolescence | `omoplata-identity` | Unit/graph-invariant tests |
 | I7 | Op-log invertibility: `undo ∘ op ≡ identity` on repository state | `omoplata-work` | Property/unit tests |
 | I9 | Git round-trip fidelity: `export(import(x)) ≡ x` bit-identically | `omoplata-git` | Round-trip gate (tested, not proven — as designed) |
@@ -131,14 +138,18 @@ This build scaffolds the design doc's core faithfully but stands several externa
 systems and the formal-proof layer in with honest reductions. Read this section as
 the definitive statement of what is *not* yet the real thing:
 
-- **Verus formal proofs → property tests (ADR-0003).** The soundness core (I1a,
-  I1b, I5, I6, I7, I8, I11, I12) is documented as proof obligations and guarded by
-  property tests against the executable code, not machine-checked Verus theorems.
-  The design doc's central claim — a *proven* kernel — is therefore approximated,
-  not delivered.
-- **Mergiraf fallback → built-in line/diff3 driver (ADR-0004).** Tier-2 structural
-  merge is implemented for Rust; everything else falls back to a built-in
-  line/diff3 driver rather than the Mergiraf adapter the doc names.
+- **Verus formal proofs → checked (I1b) / partial (I5) (ADR-0003).** Verus
+  `0.2026.07.21.1beb0fa` builds and runs in this environment, so the "not
+  installable" premise is retired. **I1b (diff faithfulness/round-trip) is now
+  machine-checked** in Verus against a faithful `Seq<int>` model
+  ([`verus/`](verus/), `verified, 0 errors`), and **I10 (disjoint-support
+  commutation) is proven for the length-preserving core**. The general
+  length-changing **I5** (which needs coordinate rebase), plus I1a, I6, I7, I8,
+  I11, I12, remain proof obligations guarded by property tests, not yet
+  machine-checked. The Verus module checks a *model* of the algorithm shape; the
+  shipping `diff`/`apply`/`commute` stay trusted-by-testing, with the proptests
+  as their differential oracle. The design doc's "proven kernel" claim is thus
+  *delivered for I1b*, *partial for I5*, and approximated elsewhere.
 - **Real embedding model → deterministic hashing stand-in (ADR-0006).** The
   semantic layer (`dup`, `similar`) uses a deterministic hashing embedder behind a
   pluggable `Embedder` trait. It is good enough to demonstrate duplicate-work

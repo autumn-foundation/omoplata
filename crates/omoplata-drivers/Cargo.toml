@@ -7,5 +7,6 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+tempfile = "3"
 omoplata-algebra = { path = "../omoplata-algebra" }
 omoplata-identity = { path = "../omoplata-identity" }

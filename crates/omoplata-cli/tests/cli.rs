@@ -520,6 +520,51 @@ fn merge_file_txt_line_conflict_exits_nonzero() {
         .stderr(predicate::str::contains("line merge: 1 conflict(s)"));
 }
 
+/// Whether the `mergiraf` binary is available on PATH (the guarded structural
+/// CLI test below needs it; it is skipped otherwise).
+fn mergiraf_available() -> bool {
+    std::process::Command::new("mergiraf")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[test]
+fn merge_file_json_structural_via_mergiraf() {
+    // Guarded: skip when mergiraf is not installed. `omo merge-file` on a `.json`
+    // path routes through `select_driver` to the MergirafDriver. Both sides add a
+    // distinct key right after `"alpha"`, which a plain line merge conflicts on
+    // (both edit the same anchor line). Mergiraf merges it structurally, so the
+    // merged output on stdout carries BOTH new keys.
+    //
+    // We assert on the merged CONTENT, not the process exit code: the M9 kernel
+    // certify step uses the line kernel, which cannot witness a structural merge
+    // and may downgrade it to "provisional/downgraded" (exit non-zero). That is
+    // expected and documented — the driver's clean merged text is still printed.
+    if !mergiraf_available() {
+        eprintln!("skipping merge_file_json_structural_via_mergiraf: mergiraf not on PATH");
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.json");
+    let left = dir.path().join("left.json");
+    let right = dir.path().join("right.json");
+    std::fs::write(&base, "{\n  \"alpha\": 1\n}\n").unwrap();
+    std::fs::write(&left, "{\n  \"alpha\": 1,\n  \"beta\": 2\n}\n").unwrap();
+    std::fs::write(&right, "{\n  \"alpha\": 1,\n  \"gamma\": 3\n}\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        // Assert on merged content + driver name, not the exit code (see above).
+        .stdout(predicate::str::contains("beta"))
+        .stdout(predicate::str::contains("gamma"))
+        .stderr(predicate::str::contains("mergiraf merge:"));
+}
+
 #[test]
 fn merge_conflict_exits_nonzero_with_markers() {
     let dir = tempdir().unwrap();

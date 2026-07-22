@@ -51,3 +51,53 @@ jobs:
           fi
 
           echo "dynamic-validation: both P9 paths verified"
+
+  # R1b — Verus machine-checked algebra invariants (design doc §6).
+  # This job builds the Verus toolchain from source and machine-checks the
+  # verified model in `verus/` (I1b diff round-trip; I10 disjoint commutation).
+  #
+  # It is DELIBERATELY isolated: no `needs:` and nothing `needs:` it, so a Verus
+  # regression never gates build/test/dynamic-validation. It is also SLOW —
+  # building Verus with `vargo build --release` takes ~6-10 min on a GH runner —
+  # which is why it is a separate, non-blocking job. The `verus/` directory is
+  # outside the cargo workspace, so plain `cargo build --all` never touches it.
+  #
+  # Toolchain pins: Verus 0.2026.07.21.1beb0fa, Z3 4.12.5 (installed from PyPI,
+  # which ships the exact pinned z3 binary — no GitHub-release download needed),
+  # Rust 1.96.0 (from Verus's rust-toolchain.toml).
+  verus-verification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone Verus (pinned fork)
+        run: git clone --depth 1 https://github.com/madmax983/verus "$RUNNER_TEMP/verus-src"
+      - name: Install the toolchain Verus pins
+        working-directory: ${{ runner.temp }}/verus-src
+        run: |
+          set -euo pipefail
+          TC=$(grep -o '1\.[0-9]*\.[0-9]*' rust-toolchain.toml | head -1)
+          rustup toolchain install "${TC}-x86_64-unknown-linux-gnu"
+          rustup component add rustc-dev rustfmt llvm-tools \
+            --toolchain "${TC}-x86_64-unknown-linux-gnu"
+      - name: Install pinned Z3 from PyPI
+        working-directory: ${{ runner.temp }}/verus-src
+        run: |
+          set -euo pipefail
+          ZV=$(grep -oE '4\.[0-9]+\.[0-9]+' source/tools/get-z3.sh | head -1)
+          python3 -m pip install --user "z3-solver==${ZV}"
+          z3 --version
+      - name: Build Verus (vargo build --release, ~6-10 min)
+        working-directory: ${{ runner.temp }}/verus-src/source
+        run: |
+          set -euo pipefail
+          unset CARGO_TARGET_DIR
+          export VERUS_Z3_PATH="$(command -v z3)"
+          source ../tools/activate
+          export PATH="$PWD/../tools/vargo/target/release:$PATH"
+          vargo build --release
+      - name: Machine-check the algebra invariants (I1b, I10)
+        run: |
+          set -euo pipefail
+          VERUS_BIN="$RUNNER_TEMP/verus-src/source/target-verus/release/verus" \
+          VERUS_Z3_PATH="$(command -v z3)" \
+            ./verus/verify.sh

@@ -1,6 +1,9 @@
 //! Unit tests for the Tier-2 drivers, focused on the structural-vs-line win.
 
-use crate::{select_driver, LineDriver, MergeDriver, MergeInput, RustStructuralDriver};
+use crate::{
+    mergiraf_available, parse_diff3_conflicts, select_driver, supports_extension, LineDriver,
+    MergeDriver, MergeInput, MergirafDriver, RustStructuralDriver,
+};
 
 fn structural(base: &str, left: &str, right: &str) -> crate::DriverOutput {
     RustStructuralDriver::new()
@@ -182,12 +185,211 @@ fn structural_falls_back_to_line_on_invalid_rust() {
     );
 }
 
-/// `select_driver` routes by extension.
+/// `select_driver` routes `.rs` to the structural driver regardless of Mergiraf.
 #[test]
-fn select_driver_routes_by_extension() {
+fn select_driver_routes_rust_to_structural() {
     assert_eq!(select_driver("x.rs").name(), "rust-structural");
     assert_eq!(select_driver("src/lib.rs").name(), "rust-structural");
+}
+
+/// `select_driver` routes an *unsupported* extension to the line driver whether
+/// or not Mergiraf is present (`.txt` and no-extension are not Mergiraf grammars).
+#[test]
+fn select_driver_routes_unsupported_to_line() {
     assert_eq!(select_driver("x.txt").name(), "line");
     assert_eq!(select_driver("README").name(), "line");
+    // A `.rs` suffix that is not the final extension is not Rust, and `.bak` is
+    // not a Mergiraf grammar ⇒ line driver.
     assert_eq!(select_driver("archive.rs.bak").name(), "line");
+}
+
+/// `select_driver` routes a Mergiraf-supported non-Rust extension to the
+/// Mergiraf driver when the binary is present, and to the line driver when it is
+/// absent. We cannot easily fake absence in-process, so this asserts whichever
+/// branch the environment is in; the guarded integration tests below exercise
+/// the real Mergiraf merge when the binary is installed.
+#[test]
+fn select_driver_routes_supported_extension_by_availability() {
+    let name = select_driver("config.json").name();
+    if mergiraf_available() {
+        assert_eq!(
+            name, "mergiraf",
+            "json should route to mergiraf when present"
+        );
+    } else {
+        assert_eq!(name, "line", "json should fall back to line when absent");
+    }
+}
+
+/// `supports_extension` recognises Mergiraf grammars (case-insensitively) and
+/// rejects unsupported / extension-less paths.
+#[test]
+fn supports_extension_recognises_grammars() {
+    for p in ["a.json", "b.java", "c.go", "d.yaml", "e.TS", "dir/f.toml"] {
+        assert!(supports_extension(p), "{p} should be supported");
+    }
+    for p in ["a.txt", "README", "notes", "x.unknownext"] {
+        assert!(!supports_extension(p), "{p} should be unsupported");
+    }
+}
+
+/// A single diff3 block parses into one `Conflict` with the right sections.
+#[test]
+fn parse_diff3_single_block() {
+    let merged = "\
+common before
+<<<<<<< left
+left one
+left two
+||||||| base
+base one
+=======
+right one
+>>>>>>> right
+common after
+";
+    let conflicts = parse_diff3_conflicts(merged);
+    assert_eq!(conflicts.len(), 1);
+    let c = &conflicts[0];
+    assert_eq!(c.left, vec!["left one", "left two"]);
+    assert_eq!(c.base, vec!["base one"]);
+    assert_eq!(c.right, vec!["right one"]);
+}
+
+/// Multiple blocks parse in order; clean text between and around them is ignored.
+#[test]
+fn parse_diff3_multiple_blocks() {
+    let merged = "\
+<<<<<<< left
+L1
+||||||| base
+B1
+=======
+R1
+>>>>>>> right
+middle line
+<<<<<<< left
+L2
+||||||| base
+=======
+R2
+>>>>>>> right
+";
+    let conflicts = parse_diff3_conflicts(merged);
+    assert_eq!(conflicts.len(), 2);
+    assert_eq!(conflicts[0].left, vec!["L1"]);
+    assert_eq!(conflicts[0].base, vec!["B1"]);
+    assert_eq!(conflicts[0].right, vec!["R1"]);
+    // Second block has an empty base section.
+    assert_eq!(conflicts[1].left, vec!["L2"]);
+    assert!(conflicts[1].base.is_empty());
+    assert_eq!(conflicts[1].right, vec!["R2"]);
+}
+
+/// A block with no `|||||||` base marker (2-way form) still parses: base empty,
+/// left runs until `=======`, right until `>>>>>>>`.
+#[test]
+fn parse_diff3_two_way_block_has_empty_base() {
+    let merged = "\
+<<<<<<< left
+L
+=======
+R
+>>>>>>> right
+";
+    let conflicts = parse_diff3_conflicts(merged);
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].left, vec!["L"]);
+    assert!(conflicts[0].base.is_empty());
+    assert_eq!(conflicts[0].right, vec!["R"]);
+}
+
+/// An unterminated conflict block is dropped rather than panicking; clean input
+/// yields no conflicts.
+#[test]
+fn parse_diff3_degrades_gracefully() {
+    assert!(parse_diff3_conflicts("just clean text\nno markers\n").is_empty());
+    let unterminated = "<<<<<<< left\nL\n||||||| base\nB\n=======\nR\n";
+    assert!(
+        parse_diff3_conflicts(unterminated).is_empty(),
+        "unterminated block should be dropped"
+    );
+}
+
+/// Guarded integration test (skips when `mergiraf` is not on PATH): two disjoint
+/// structural edits to a JSON object that a plain line merge conflicts on are
+/// merged **cleanly** by Mergiraf, and the result carries both edits.
+#[test]
+fn mergiraf_merges_disjoint_json_cleanly() {
+    if !mergiraf_available() {
+        eprintln!("skipping: mergiraf not on PATH");
+        return;
+    }
+    // base has two keys; left edits the first, right edits the second. A line
+    // merge conflicts because both touch adjacent lines; Mergiraf resolves it
+    // structurally.
+    let base = "{\n  \"a\": 1,\n  \"b\": 2\n}\n";
+    let left = "{\n  \"a\": 10,\n  \"b\": 2\n}\n";
+    let right = "{\n  \"a\": 1,\n  \"b\": 20\n}\n";
+    let out = MergirafDriver::new()
+        .merge(&MergeInput {
+            base,
+            left,
+            right,
+            path: "config.json",
+        })
+        .expect("mergiraf merge");
+    assert!(
+        out.is_clean(),
+        "expected a clean structural merge, got conflicts:\n{}",
+        out.merged
+    );
+    assert_eq!(out.driver, "mergiraf");
+    assert!(
+        out.merged.contains("10"),
+        "left edit missing:\n{}",
+        out.merged
+    );
+    assert!(
+        out.merged.contains("20"),
+        "right edit missing:\n{}",
+        out.merged
+    );
+}
+
+/// Guarded integration test (skips when `mergiraf` absent): a genuine same-key
+/// conflict — both sides set the same JSON key to different values — yields a
+/// non-empty structured `conflicts` list.
+#[test]
+fn mergiraf_reports_same_key_conflict() {
+    if !mergiraf_available() {
+        eprintln!("skipping: mergiraf not on PATH");
+        return;
+    }
+    let base = "{\n  \"a\": 1\n}\n";
+    let left = "{\n  \"a\": 2\n}\n";
+    let right = "{\n  \"a\": 3\n}\n";
+    let out = MergirafDriver::new()
+        .merge(&MergeInput {
+            base,
+            left,
+            right,
+            path: "config.json",
+        })
+        .expect("mergiraf merge");
+    assert!(
+        !out.is_clean(),
+        "expected a same-key conflict, got clean:\n{}",
+        out.merged
+    );
+    assert_eq!(out.driver, "mergiraf");
+    let c = &out.conflicts[0];
+    assert!(
+        c.left.iter().any(|l| l.contains('2')),
+        "left side of conflict should carry `2`: {c:?}"
+    );
+    assert!(
+        c.right.iter().any(|l| l.contains('3')),
+        "right side of conflict should carry `3`: {c:?}"
+    );
 }
