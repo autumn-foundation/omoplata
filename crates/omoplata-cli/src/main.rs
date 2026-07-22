@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use omoplata_algebra::{diff, merge3, Doc};
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -43,14 +44,51 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Show the line diff turning `base` into `target`, in unified-ish form.
+    Diff {
+        /// The base file.
+        base: PathBuf,
+        /// The target file.
+        target: PathBuf,
+    },
+    /// Three-way merge `left` and `right` against their common `base`.
+    ///
+    /// Prints the merged document to stdout. A clean merge exits 0; a merge
+    /// with conflicts renders conflict markers into the output, prints a
+    /// summary to stderr, and exits with a non-zero status.
+    Merge {
+        /// The common base file.
+        base: PathBuf,
+        /// The left side.
+        left: PathBuf,
+        /// The right side.
+        right: PathBuf,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    let code = match run() {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            2
+        }
+    };
+    // Flush buffered stdout before exiting so piped output is not lost.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(code);
+}
+
+/// Dispatch a command, returning the process exit code (0 = success).
+fn run() -> anyhow::Result<i32> {
     match Cli::parse().command {
-        Command::Init { path } => cmd_init(path),
-        Command::Status { path } => cmd_status(path),
-        Command::HashObject { path, repo } => cmd_hash_object(repo, path),
-        Command::CatObject { id, repo } => cmd_cat_object(repo, id),
+        Command::Init { path } => cmd_init(path).map(|()| 0),
+        Command::Status { path } => cmd_status(path).map(|()| 0),
+        Command::HashObject { path, repo } => cmd_hash_object(repo, path).map(|()| 0),
+        Command::CatObject { id, repo } => cmd_cat_object(repo, id).map(|()| 0),
+        Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
+        Command::Merge { base, left, right } => cmd_merge(base, left, right),
     }
 }
 
@@ -124,4 +162,64 @@ fn cmd_cat_object(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read a file into a [`Doc`], preserving its contents faithfully.
+fn read_doc(path: &Path) -> anyhow::Result<Doc> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(Doc::from_str(&text))
+}
+
+fn cmd_diff(base: PathBuf, target: PathBuf) -> anyhow::Result<()> {
+    let base_doc = read_doc(&base)?;
+    let target_doc = read_doc(&target)?;
+    let patch = diff(&base_doc, &target_doc);
+
+    // Track the target-side start line so headers read like a unified diff.
+    let mut new_line = 1usize;
+    let mut base_line = 1usize;
+    for hunk in patch.hunks() {
+        // Advance past the unchanged base lines preceding this hunk.
+        let skipped = hunk.base_start + 1 - base_line;
+        new_line += skipped;
+        base_line = hunk.base_start + 1;
+
+        println!(
+            "@@ -{},{} +{},{} @@",
+            hunk.base_start + 1,
+            hunk.remove.len(),
+            new_line,
+            hunk.insert.len()
+        );
+        for line in &hunk.remove {
+            println!("-{line}");
+        }
+        for line in &hunk.insert {
+            println!("+{line}");
+        }
+
+        base_line += hunk.remove.len();
+        new_line += hunk.insert.len();
+    }
+    Ok(())
+}
+
+fn cmd_merge(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32> {
+    let base_doc = read_doc(&base)?;
+    let left_doc = read_doc(&left)?;
+    let right_doc = read_doc(&right)?;
+    let result = merge3(&base_doc, &left_doc, &right_doc);
+
+    // The merged document already renders conflicts with markers (the human
+    // view); the structured `result.conflicts` are the source of truth.
+    print!("{}", result.merged);
+
+    if result.is_clean() {
+        Ok(0)
+    } else {
+        let n = result.conflicts.len();
+        eprintln!("{n} conflict(s)");
+        Ok(1)
+    }
 }

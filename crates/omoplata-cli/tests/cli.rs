@@ -107,3 +107,62 @@ fn cat_object_unknown_fails() {
         .assert()
         .failure();
 }
+
+#[test]
+fn diff_shows_hunk() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let target = dir.path().join("target.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&target, "a\nx\nc\n").unwrap();
+    omo()
+        .arg("diff")
+        .arg(&base)
+        .arg(&target)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@@"))
+        .stdout(predicate::str::contains("-b"))
+        .stdout(predicate::str::contains("+x"));
+}
+
+#[test]
+fn merge_clean_disjoint_edits() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&left, "A\nb\nc\nd\n").unwrap(); // edits line 1
+    std::fs::write(&right, "a\nb\nc\nD\n").unwrap(); // edits line 4
+    omo()
+        .arg("merge")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .success()
+        .stdout("A\nb\nc\nD\n");
+}
+
+#[test]
+fn merge_conflict_exits_nonzero_with_markers() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&left, "a\nX\nc\n").unwrap();
+    std::fs::write(&right, "a\nY\nc\n").unwrap();
+    omo()
+        .arg("merge")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< left"))
+        .stdout(predicate::str::contains("======="))
+        .stdout(predicate::str::contains(">>>>>>> right"))
+        .stderr(predicate::str::contains("1 conflict(s)"));
+}

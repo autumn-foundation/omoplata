@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/omoplata-cli", "crates/omoplata-store"]
+members = ["crates/omoplata-algebra", "crates/omoplata-cli", "crates/omoplata-store"]
 
 [workspace.package]
 version = "0.1.0"
