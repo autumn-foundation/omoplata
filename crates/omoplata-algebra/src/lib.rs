@@ -40,11 +40,13 @@
 
 mod commute;
 mod doc;
+pub mod kernel;
 mod merge;
 mod patch;
 
 pub use commute::{combine, commute, Commutation};
 pub use doc::Doc;
+pub use kernel::{admit, certify, verify_witness, Admission, CommutationWitness};
 pub use merge::{merge3, Conflict, Merge, CONFLICT_END, CONFLICT_SEP, CONFLICT_START};
 pub use patch::{apply, diff, ApplyError, Hunk, Patch};
 

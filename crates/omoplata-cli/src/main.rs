@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use omoplata_algebra::{diff, merge3, Doc};
+use omoplata_algebra::{diff, kernel, merge3, Admission, Doc};
 use omoplata_drivers::{select_driver, MergeInput};
 use omoplata_git::{import_repo, verify_repo};
 use omoplata_identity::{
@@ -83,9 +83,29 @@ enum Command {
     ///
     /// Selects the driver from the base path's extension (§4 Tier 2): `.rs`
     /// files use the Rust structural driver, everything else the line fallback.
-    /// Prints the merged output to stdout and `<driver> merge: N conflict(s)` to
-    /// stderr; exits 0 if clean, non-zero otherwise.
+    /// A *clean* driver result is then passed through the trusted kernel
+    /// (`kernel::certify`, §3 P1 / §6 I8): the kernel independently derives its
+    /// own merge and admits the proposal only if it matches — otherwise it
+    /// downgrades to a conflict. Prints the merged output to stdout, the
+    /// `<driver> merge: N conflict(s)` summary and the kernel verdict to stderr;
+    /// exits 0 only if the merge is clean *and* kernel-admitted.
     MergeFile {
+        /// The common base file.
+        base: PathBuf,
+        /// The left side.
+        left: PathBuf,
+        /// The right side.
+        right: PathBuf,
+    },
+    /// Kernel admission of a three-way merge (§3 P1, §6 invariant I8).
+    ///
+    /// Runs the trusted kernel directly on three files: it independently diffs
+    /// both sides, runs the executable commutation check, and — only if they
+    /// commute — computes the merged document itself, emitting a checked
+    /// commutation witness. There are exactly two outcomes ("no silent wrong
+    /// answers"): an admitted merge with a witness (exit 0), or first-class
+    /// conflict values (exit non-zero). No proposer is involved.
+    Admit {
         /// The common base file.
         base: PathBuf,
         /// The left side.
@@ -256,6 +276,7 @@ fn run() -> anyhow::Result<i32> {
         Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
         Command::MergeFile { base, left, right } => cmd_merge_file(base, left, right),
+        Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
         Command::Track { old, new } => cmd_track(old, new).map(|()| 0),
         Command::Ref { action } => match action {
@@ -540,12 +561,20 @@ fn cmd_merge(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32
     }
 }
 
-/// `omo merge-file <base> <left> <right>` — Tier-2 driver merge (§4).
+/// `omo merge-file <base> <left> <right>` — Tier-2 driver merge behind the
+/// trusted kernel (§4, §3 P1, §6 I8).
 ///
 /// The driver is chosen from the base path's extension: `.rs` uses the Rust
-/// structural driver, everything else the line fallback. The merged output goes
-/// to stdout; a `<driver> merge: N conflict(s)` summary goes to stderr. Exit 0
-/// if clean, 1 if conflicted.
+/// structural driver, everything else the line fallback. The driver is an
+/// **untrusted proposer**: when it returns a *clean* result, that result is
+/// passed through `kernel::certify`, which independently re-derives the merge
+/// and admits the proposal only if it matches the kernel's own witnessed answer.
+/// A proposal the kernel cannot witness is **downgraded to a conflict** — making
+/// the untrusted-proposer / trusted-kernel split visible.
+///
+/// The merged output goes to stdout; the `<driver> merge: N conflict(s)` summary
+/// and the kernel verdict go to stderr. Exit 0 only when the merge is clean
+/// *and* kernel-admitted; a driver conflict or a kernel downgrade exits non-zero.
 fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32> {
     let base_text =
         std::fs::read_to_string(&base).with_context(|| format!("reading {}", base.display()))?;
@@ -567,10 +596,68 @@ fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Resul
 
     let n = out.conflicts.len();
     eprintln!("{} merge: {n} conflict(s)", out.driver);
-    if out.is_clean() {
-        Ok(0)
-    } else {
-        Ok(1)
+
+    // A driver conflict is already honest; report and exit non-zero.
+    if !out.is_clean() {
+        return Ok(1);
+    }
+
+    // The driver proposed a clean merge. Gate it through the trusted kernel: the
+    // kernel re-derives the merge from base/left/right and admits the proposal
+    // only if it matches its own witnessed result.
+    let base_doc = Doc::from_str(&base_text);
+    let left_doc = Doc::from_str(&left_text);
+    let right_doc = Doc::from_str(&right_text);
+    let proposed = Doc::from_str(&out.merged);
+    match kernel::certify(&base_doc, &left_doc, &right_doc, &proposed) {
+        Admission::Merged { witness, .. } => {
+            eprintln!(
+                "kernel: admitted (commutation witness: {} hunks p, {} hunks q)",
+                witness.p.hunks().len(),
+                witness.q.hunks().len()
+            );
+            Ok(0)
+        }
+        Admission::Conflict(_) => {
+            eprintln!(
+                "kernel: downgraded to conflict ({} proposal not independently witnessed)",
+                out.driver
+            );
+            Ok(1)
+        }
+    }
+}
+
+/// `omo admit <base> <left> <right>` — trusted kernel admission (§3 P1, §6 I8).
+///
+/// Runs `kernel::admit` directly on the three files — no proposer involved. On
+/// admission, prints the merged document to stdout and the commutation-witness
+/// summary to stderr (exit 0). On conflict, prints the merged-with-markers view
+/// to stdout and the conflict summary to stderr (exit non-zero). These are the
+/// only two outcomes — the "no silent wrong answers" guarantee (I8).
+fn cmd_admit(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32> {
+    let base_doc = read_doc(&base)?;
+    let left_doc = read_doc(&left)?;
+    let right_doc = read_doc(&right)?;
+
+    match kernel::admit(&base_doc, &left_doc, &right_doc) {
+        Admission::Merged { result, witness } => {
+            print!("{result}");
+            eprintln!(
+                "admitted: commutation witness (support: {} hunks p, {} hunks q)",
+                witness.p.hunks().len(),
+                witness.q.hunks().len()
+            );
+            Ok(0)
+        }
+        Admission::Conflict(conflicts) => {
+            // Render the merged-with-markers human view from merge3 (the same
+            // conflict values the kernel returned, shown with markers).
+            let view = merge3(&base_doc, &left_doc, &right_doc);
+            print!("{}", view.merged);
+            eprintln!("conflict: {} region(s)", conflicts.len());
+            Ok(1)
+        }
     }
 }
 

@@ -150,13 +150,14 @@ fn end_to_end_pipeline() {
             "renamed compute_area -> rectangle_area (fn)",
         ));
 
-    // 5. merge-file structurally merges two divergent Rust edits cleanly ------
+    // 5. merge-file structurally merges two disjoint Rust edits, and the
+    //    trusted kernel independently admits the proposal (§3 P1, §6 I8) -------
     let mbase = repo.join("m_base.rs");
     let mleft = repo.join("m_left.rs");
     let mright = repo.join("m_right.rs");
     std::fs::write(&mbase, "fn a() {}\n\nfn b() {}\n").unwrap();
-    std::fs::write(&mleft, "fn a() {}\n\nfn b() {}\n\nfn c() {}\n").unwrap();
-    std::fs::write(&mright, "fn a() {}\n\nfn b() {}\n\nfn d() {}\n").unwrap();
+    std::fs::write(&mleft, "fn a() { let x = 1; }\n\nfn b() {}\n").unwrap();
+    std::fs::write(&mright, "fn a() {}\n\nfn b() { let y = 2; }\n").unwrap();
     omo()
         .arg("merge-file")
         .arg(&mbase)
@@ -164,11 +165,30 @@ fn end_to_end_pipeline() {
         .arg(&mright)
         .assert()
         .success()
-        .stdout(predicate::str::contains("fn c()"))
-        .stdout(predicate::str::contains("fn d()"))
+        .stdout(predicate::str::contains("let x = 1;"))
+        .stdout(predicate::str::contains("let y = 2;"))
         .stderr(predicate::str::contains(
             "rust-structural merge: 0 conflict(s)",
-        ));
+        ))
+        .stderr(predicate::str::contains("kernel: admitted"));
+
+    // 5b. `omo admit` runs the trusted kernel directly: disjoint edits are
+    //     admitted with a commutation witness (no proposer involved) ----------
+    let abase = repo.join("a_base.txt");
+    let aleft = repo.join("a_left.txt");
+    let aright = repo.join("a_right.txt");
+    std::fs::write(&abase, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&aleft, "A\nb\nc\nd\n").unwrap();
+    std::fs::write(&aright, "a\nb\nc\nD\n").unwrap();
+    omo()
+        .arg("admit")
+        .arg(&abase)
+        .arg(&aleft)
+        .arg(&aright)
+        .assert()
+        .success()
+        .stdout("A\nb\nc\nD\n")
+        .stderr(predicate::str::contains("admitted: commutation witness"));
 
     // 6. ref set -> op log -> op undo -> revset -------------------------------
     let commit = "sha256:1111111111111111111111111111111111111111111111111111111111111111";

@@ -260,9 +260,14 @@ fn revset_unknown_ref_fails() {
 }
 
 #[test]
-fn merge_file_rust_structural_clean_merge() {
-    // Both sides append a new top-level fn at the same location: the line
-    // driver would conflict, but the Rust structural driver merges cleanly.
+fn merge_file_rust_structural_downgraded_by_kernel() {
+    // Both sides append a new top-level fn at the same location: the Rust
+    // structural driver (an untrusted proposer) merges cleanly, but the two
+    // appends land at the same line-level anchor, so the trusted kernel cannot
+    // produce an independent commutation witness for the driver's chosen order.
+    // The LCF gate downgrades the proposal to a conflict (I8): the driver's
+    // clean output still appears on stdout, but the kernel refuses to admit it
+    // and the exit code is non-zero.
     let dir = tempdir().unwrap();
     let base = dir.path().join("base.rs");
     let left = dir.path().join("left.rs");
@@ -276,14 +281,87 @@ fn merge_file_rust_structural_clean_merge() {
         .arg(&left)
         .arg(&right)
         .assert()
-        .success()
-        .stdout(predicate::str::contains("fn a()"))
-        .stdout(predicate::str::contains("fn b()"))
+        .failure()
         .stdout(predicate::str::contains("fn c()"))
         .stdout(predicate::str::contains("fn d()"))
         .stderr(predicate::str::contains(
             "rust-structural merge: 0 conflict(s)",
+        ))
+        .stderr(predicate::str::contains("kernel: downgraded to conflict"));
+}
+
+#[test]
+fn merge_file_rust_disjoint_kernel_admitted() {
+    // Disjoint edits (each side edits a different definition's body) are
+    // disjoint-support at the line level: the structural driver merges cleanly
+    // and the trusted kernel independently witnesses the merge, admitting it.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.rs");
+    let left = dir.path().join("left.rs");
+    let right = dir.path().join("right.rs");
+    std::fs::write(&base, "fn a() {}\n\nfn b() {}\n").unwrap();
+    std::fs::write(&left, "fn a() { let x = 1; }\n\nfn b() {}\n").unwrap();
+    std::fs::write(&right, "fn a() {}\n\nfn b() { let y = 2; }\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("let x = 1;"))
+        .stdout(predicate::str::contains("let y = 2;"))
+        .stderr(predicate::str::contains(
+            "rust-structural merge: 0 conflict(s)",
+        ))
+        .stderr(predicate::str::contains("kernel: admitted"));
+}
+
+#[test]
+fn admit_disjoint_edits_exits_zero_with_witness() {
+    // `omo admit` runs the trusted kernel directly on three files. Disjoint
+    // edits commute, so the kernel admits with a commutation witness (exit 0),
+    // printing the merged document with both edits.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&left, "A\nb\nc\nd\n").unwrap(); // edits line 1
+    std::fs::write(&right, "a\nb\nc\nD\n").unwrap(); // edits line 4
+    omo()
+        .arg("admit")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .success()
+        .stdout("A\nb\nc\nD\n")
+        .stderr(predicate::str::contains(
+            "admitted: commutation witness (support: 1 hunks p, 1 hunks q)",
         ));
+}
+
+#[test]
+fn admit_conflicting_edits_exits_nonzero() {
+    // Overlapping edits do not commute: the kernel refuses to admit and reports
+    // a conflict (exit non-zero) — never a silent merge.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&left, "a\nX\nc\n").unwrap();
+    std::fs::write(&right, "a\nY\nc\n").unwrap();
+    omo()
+        .arg("admit")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< left"))
+        .stderr(predicate::str::contains("conflict: 1 region(s)"));
 }
 
 #[test]
