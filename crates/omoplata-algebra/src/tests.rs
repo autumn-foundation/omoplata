@@ -1,7 +1,14 @@
 //! Unit tests for concrete cases and a `proptest` battery encoding the design
 //! doc's algebra invariants (I1a, I1b, I5, I8, I10, and the by-construction
-//! symmetry of I2) as executable properties. These stand in for the deferred
-//! Verus proofs (see `docs/adr/0003-verification-strategy.md`).
+//! symmetry of I2) as executable properties.
+//!
+//! These property tests guard the *shipping* `diff`/`apply`/`commute` code (they
+//! remain trusted-by-testing) and act as the differential oracle for the
+//! machine-checked companion in the top-level `verus/` directory. That Verus
+//! model proves **I1b** (diff round-trip) outright and **I10** (disjoint-support
+//! commutation) for the length-preserving core; the general length-changing
+//! **I5** is still only property-tested here (`disjoint_commutes_both_orders`).
+//! See `verus/README.md` and `docs/adr/0003-verification-strategy.md`.
 
 use super::*;
 use crate::commute::combine;
