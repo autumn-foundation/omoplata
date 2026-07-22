@@ -32,3 +32,7 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Used by the concurrency stress test to load and assert on the op log written
+# by the spawned `omo` child processes.
+omoplata-store = { path = "../omoplata-store" }
+omoplata-work = { path = "../omoplata-work" }
