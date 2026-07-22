@@ -51,4 +51,29 @@ pub enum WorkError {
     /// valid UTF-8.
     #[error("invalid change content: {0}")]
     Content(String),
+
+    /// [`add`](crate::WorkspaceRegistry::add) was asked to register a workspace
+    /// whose name is already taken.
+    #[error("a workspace named {0:?} already exists")]
+    WorkspaceExists(String),
+
+    /// A workspace name did not resolve to a registered workspace.
+    #[error("unknown workspace: {0:?}")]
+    UnknownWorkspace(String),
+
+    /// A [`switch`](crate::materialize) would overwrite uncommitted changes in a
+    /// workspace's working directory (a dirty working copy). Commit first, or
+    /// pass `--force`.
+    #[error(
+        "workspace {workspace:?} has uncommitted changes (working copy {current} \
+         != tip {expected}); commit first or pass --force"
+    )]
+    DirtyWorkingCopy {
+        /// The workspace whose working copy is dirty.
+        workspace: String,
+        /// The current working-copy snapshot commit id.
+        current: String,
+        /// The tip the switch was measured against.
+        expected: String,
+    },
 }
