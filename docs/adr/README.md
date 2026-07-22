@@ -18,3 +18,4 @@ eight-crate decomposition that every subsequent ADR builds on.
 | [ADR-0004](0004-merge-drivers.md) | Tier-2 merge uses a Rust structural driver with a built-in line/diff3 fallback, standing in for the Mergiraf adapter named in the design doc. |
 | [ADR-0005](0005-git-interop-roundtrip-gate.md) | Git interop is a byte-faithful object codec gated by an `export(import(x)) == x` round-trip check (invariant I9). |
 | [ADR-0006](0006-semantic-embeddings.md) | The embedding model is a deterministic local stand-in behind a pluggable `Embedder` trait, so a real model can be swapped in without touching callers. |
+| [ADR-0007](0007-dynamic-validation.md) | Kernel admission is provisional (P9): a configured dynamic validator (in production, CI) runs against the merged tree, and a failure demotes the merge to a Tier-3 semantic conflict rather than accepting a merge that doesn't build/test. Realizes the per-instance I12 guard; the repo's own CI job is the concrete validator. |

@@ -16,3 +16,38 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
+
+  # P9 — Dynamic validation over static omniscience (design doc §3 / §4).
+  # This job makes the repository's own CI a *dynamic validator*: it proves both
+  # sides of `omo merge-file --validate` on a clean, kernel-admitted merge —
+  # a passing validator accepts (exit 0), a failing validator demotes the merge
+  # to a Tier-3 semantic conflict (exit non-zero). This is the concrete
+  # realization of "acceptance is provisional pending dynamic validation".
+  dynamic-validation:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build -p omoplata-cli
+      - name: P9 — passing and failing (demotion) validation paths
+        run: |
+          set -euo pipefail
+          bin=target/debug/omo
+          work="$(mktemp -d)"
+          # A clean, disjoint (line-level) three-way merge the kernel admits.
+          printf 'a\nb\nc\nd\n' > "$work/base.txt"
+          printf 'A\nb\nc\nd\n' > "$work/left.txt"
+          printf 'a\nb\nc\nD\n' > "$work/right.txt"
+
+          echo "== passing validator (true) must accept: exit 0 =="
+          "$bin" merge-file "$work/base.txt" "$work/left.txt" "$work/right.txt" --validate 'true'
+
+          echo "== failing validator (false) must demote to a semantic conflict: non-zero =="
+          # `if` swallows the expected non-zero exit so it does not fail the job.
+          if "$bin" merge-file "$work/base.txt" "$work/left.txt" "$work/right.txt" --validate 'false'; then
+            echo "expected demotion to a non-zero exit, but the command succeeded"
+            exit 1
+          fi
+
+          echo "dynamic-validation: both P9 paths verified"

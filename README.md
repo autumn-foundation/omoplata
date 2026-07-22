@@ -123,6 +123,7 @@ battery §6 describes running against "the executable code".
 | I7 | Op-log invertibility: `undo ∘ op ≡ identity` on repository state | `omoplata-work` | Property/unit tests |
 | I9 | Git round-trip fidelity: `export(import(x)) ≡ x` bit-identically | `omoplata-git` | Round-trip gate (tested, not proven — as designed) |
 | I11 | Trivia conservation: merged comment tokens equal the union of both sides modulo base | `omoplata-drivers` | Structural-merge tests |
+| I12/P9 | Dynamic validation: kernel admission is provisional; a failing validator demotes the merge to a Tier-3 semantic conflict rather than accepting it | `omoplata-algebra::validation`, CI `dynamic-validation` job | Unit + CLI tests; repo CI job as the concrete validator |
 
 ## Reductions from the design doc in this build
 
@@ -160,8 +161,6 @@ the definitive statement of what is *not* yet the real thing:
 - **Conflicts-as-values propagation through rebases** and **auto-rebase** (P3/P4
   beyond the op-log undo) are modeled in the algebra but not wired as a working
   rebase loop.
-- **Dynamic validation (P9)** — demoting a kernel-accepted merge to a semantic
-  conflict on CI build/test failure — is not implemented.
 - **Change identity across rebase/amend** (stable Change-IDs, phases wired through
   the CLI) is present in `omoplata-identity` but not surfaced as end-to-end CLI
   workflows.

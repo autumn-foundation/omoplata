@@ -44,6 +44,7 @@ pub mod kernel;
 mod merge;
 mod patch;
 pub mod rebase;
+pub mod validation;
 
 pub use commute::{combine, commute, Commutation};
 pub use doc::Doc;
@@ -54,6 +55,7 @@ pub use rebase::{
     rebase, rebase_merge, rebase_stack, resolve, resolve_all, Rebased, REBASE_MINE, REBASE_ONTO,
     REBASE_SEP,
 };
+pub use validation::{dynamic_validate, Validated};
 
 #[cfg(test)]
 mod tests;

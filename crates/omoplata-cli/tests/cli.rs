@@ -318,6 +318,91 @@ fn merge_file_rust_disjoint_kernel_admitted() {
 }
 
 #[test]
+fn merge_file_validate_pass_accepts_and_exits_zero() {
+    // P9: a clean, kernel-admitted merge is provisional. With a *passing*
+    // validator (`true`), dynamic validation confirms it: the merge stands, the
+    // merged doc prints to stdout, `dynamic validation PASSED` to stderr, exit 0.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&left, "A\nb\nc\nd\n").unwrap(); // edits line 1
+    std::fs::write(&right, "a\nb\nc\nD\n").unwrap(); // edits line 4
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .arg("--validate")
+        .arg("true")
+        .assert()
+        .success()
+        .stdout("A\nb\nc\nD\n")
+        .stderr(predicate::str::contains("kernel: admitted"))
+        .stderr(predicate::str::contains("dynamic validation PASSED"));
+}
+
+#[test]
+fn merge_file_validate_fail_demotes_to_semantic_conflict() {
+    // P9/I12: the same clean, kernel-admitted merge, but the validator (`false`)
+    // fails. The provisional acceptance is demoted to a Tier-3 semantic conflict
+    // rather than accepted — the demoted conflict view prints to stdout, `dynamic
+    // validation FAILED: demoted to semantic conflict (...)` to stderr, exit 1.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\nd\n").unwrap();
+    std::fs::write(&left, "A\nb\nc\nd\n").unwrap();
+    std::fs::write(&right, "a\nb\nc\nD\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .arg("--validate")
+        .arg("false")
+        .assert()
+        .failure()
+        // The demoted Tier-3 view carries both sides' intent.
+        .stdout(predicate::str::contains("<<<<<<< left"))
+        .stdout(predicate::str::contains("||||||| base"))
+        .stdout(predicate::str::contains(">>>>>>> right"))
+        .stderr(predicate::str::contains("kernel: admitted"))
+        .stderr(predicate::str::contains(
+            "dynamic validation FAILED: demoted to semantic conflict",
+        ));
+}
+
+#[test]
+fn merge_file_validate_not_run_when_merge_conflicts() {
+    // P9: there is nothing provisional to validate on a merge that already
+    // conflicts, so the validator is never run — even a `false` validator does
+    // not add a `dynamic validation` line. The driver conflict is reported and
+    // the exit is non-zero.
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.txt");
+    let left = dir.path().join("left.txt");
+    let right = dir.path().join("right.txt");
+    std::fs::write(&base, "a\nb\nc\n").unwrap();
+    std::fs::write(&left, "a\nX\nc\n").unwrap(); // both edit line 2 differently
+    std::fs::write(&right, "a\nY\nc\n").unwrap();
+    omo()
+        .arg("merge-file")
+        .arg(&base)
+        .arg(&left)
+        .arg(&right)
+        .arg("--validate")
+        .arg("false")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("<<<<<<< left"))
+        .stderr(predicate::str::contains("line merge: 1 conflict(s)"))
+        .stderr(predicate::str::contains("dynamic validation").not());
+}
+
+#[test]
 fn admit_disjoint_edits_exits_zero_with_witness() {
     // `omo admit` runs the trusted kernel directly on three files. Disjoint
     // edits commute, so the kernel admits with a commutation witness (exit 0),

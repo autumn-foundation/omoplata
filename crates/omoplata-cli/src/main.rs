@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use omoplata_algebra::{diff, kernel, merge3, rebase, Admission, Doc};
+use omoplata_algebra::{
+    diff, dynamic_validate, kernel, merge3, rebase, Admission, Conflict, Doc, Validated,
+};
 use omoplata_drivers::{select_driver, MergeInput};
 use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
 use omoplata_identity::{
@@ -89,6 +91,15 @@ enum Command {
     /// downgrades to a conflict. Prints the merged output to stdout, the
     /// `<driver> merge: N conflict(s)` summary and the kernel verdict to stderr;
     /// exits 0 only if the merge is clean *and* kernel-admitted.
+    ///
+    /// With `--validate <cmd>`, kernel admission is treated as *provisional
+    /// pending dynamic validation* (§3 P9): a clean, kernel-admitted merge is
+    /// materialized to a temp file and `<cmd>` is run against it (a `{}`
+    /// placeholder in `<cmd>` is replaced with the temp file path; if there is
+    /// no placeholder, the path is appended as the last argument). If the
+    /// validator exits zero the merge is accepted; if it exits non-zero the
+    /// merge is **demoted to a Tier-3 semantic conflict** (P9/I12) rather than
+    /// accepted.
     MergeFile {
         /// The common base file.
         base: PathBuf,
@@ -96,6 +107,12 @@ enum Command {
         left: PathBuf,
         /// The right side.
         right: PathBuf,
+        /// Dynamic validator (P9): a shell command run against the merged
+        /// output. `{}` is substituted with the merged file path; if absent, the
+        /// path is appended. A non-zero exit demotes the merge to a semantic
+        /// conflict.
+        #[arg(long, value_name = "CMD")]
+        validate: Option<String>,
     },
     /// Kernel admission of a three-way merge (§3 P1, §6 invariant I8).
     ///
@@ -313,7 +330,12 @@ fn run() -> anyhow::Result<i32> {
         Command::CatObject { id, repo } => cmd_cat_object(repo, id).map(|()| 0),
         Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
-        Command::MergeFile { base, left, right } => cmd_merge_file(base, left, right),
+        Command::MergeFile {
+            base,
+            left,
+            right,
+            validate,
+        } => cmd_merge_file(base, left, right, validate),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
         Command::Defs { file } => cmd_defs(file).map(|()| 0),
@@ -678,7 +700,26 @@ fn cmd_merge(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32
 /// The merged output goes to stdout; the `<driver> merge: N conflict(s)` summary
 /// and the kernel verdict go to stderr. Exit 0 only when the merge is clean
 /// *and* kernel-admitted; a driver conflict or a kernel downgrade exits non-zero.
-fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Result<i32> {
+///
+/// # Dynamic validation (P9)
+///
+/// When `validate` is `Some(cmd)`, kernel admission is treated as **provisional
+/// pending dynamic validation** (§4: "Acceptance is provisional pending dynamic
+/// validation (P9)"). A clean, kernel-admitted merge is materialized to a temp
+/// file and `cmd` is run against it. The verdict (validator exit status) is fed
+/// through [`dynamic_validate`]: a **pass** accepts the merge (`dynamic
+/// validation PASSED`, exit 0); a **fail** demotes it to a Tier-3 semantic
+/// conflict (`dynamic validation FAILED: demoted to semantic conflict
+/// (<reason>)`, exit non-zero), printing the semantic-conflict view rather than
+/// the merged doc. The validator is **never** run when the merge already
+/// conflicted (driver conflict or kernel downgrade) — there is nothing
+/// provisional to validate. Without `--validate`, behavior is exactly as before.
+fn cmd_merge_file(
+    base: PathBuf,
+    left: PathBuf,
+    right: PathBuf,
+    validate: Option<String>,
+) -> anyhow::Result<i32> {
     let base_text =
         std::fs::read_to_string(&base).with_context(|| format!("reading {}", base.display()))?;
     let left_text =
@@ -695,15 +736,17 @@ fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Resul
         path: &path,
     })?;
 
-    print!("{}", out.merged);
-
     let n = out.conflicts.len();
-    eprintln!("{} merge: {n} conflict(s)", out.driver);
 
-    // A driver conflict is already honest; report and exit non-zero.
+    // A driver conflict is already honest; report and exit non-zero. Nothing
+    // provisional to validate — the validator is not run (P9).
     if !out.is_clean() {
+        print!("{}", out.merged);
+        eprintln!("{} merge: {n} conflict(s)", out.driver);
         return Ok(1);
     }
+
+    eprintln!("{} merge: {n} conflict(s)", out.driver);
 
     // The driver proposed a clean merge. Gate it through the trusted kernel: the
     // kernel re-derives the merge from base/left/right and admits the proposal
@@ -712,23 +755,104 @@ fn cmd_merge_file(base: PathBuf, left: PathBuf, right: PathBuf) -> anyhow::Resul
     let left_doc = Doc::from_str(&left_text);
     let right_doc = Doc::from_str(&right_text);
     let proposed = Doc::from_str(&out.merged);
-    match kernel::certify(&base_doc, &left_doc, &right_doc, &proposed) {
+    let admission = kernel::certify(&base_doc, &left_doc, &right_doc, &proposed);
+
+    match &admission {
         Admission::Merged { witness, .. } => {
             eprintln!(
                 "kernel: admitted (commutation witness: {} hunks p, {} hunks q)",
                 witness.p.hunks().len(),
                 witness.q.hunks().len()
             );
-            Ok(0)
         }
         Admission::Conflict(_) => {
+            // A kernel downgrade is already a conflict — nothing provisional to
+            // validate (P9). Report and exit non-zero, validator not run.
+            print!("{}", out.merged);
             eprintln!(
                 "kernel: downgraded to conflict ({} proposal not independently witnessed)",
                 out.driver
             );
-            Ok(1)
+            return Ok(1);
         }
     }
+
+    // The merge is clean and kernel-admitted — but that admission is only
+    // *provisional* (§3 P9). If a dynamic validator is configured, run it and
+    // let a failure demote the merge to a Tier-3 semantic conflict (P9/I12).
+    match validate {
+        None => {
+            print!("{}", out.merged);
+            Ok(0)
+        }
+        Some(cmd) => {
+            let passed = run_validator(&cmd, &out.merged)?;
+            let reason = format!("validator `{cmd}` exited non-zero");
+            match dynamic_validate(&base_doc, &left_doc, &right_doc, admission, passed, &reason) {
+                Validated::Accepted(result) => {
+                    print!("{result}");
+                    eprintln!("dynamic validation PASSED");
+                    Ok(0)
+                }
+                Validated::Demoted { conflict, reason } => {
+                    print!("{}", render_semantic_conflict(&conflict));
+                    eprintln!("dynamic validation FAILED: demoted to semantic conflict ({reason})");
+                    Ok(1)
+                }
+            }
+        }
+    }
+}
+
+/// Run a configured dynamic validator against `merged`, returning whether it
+/// passed (exited zero) — the P9 verdict.
+///
+/// The merged output is written to a temporary file, then `cmd` is run as a
+/// shell command (`sh -c`). A `{}` placeholder in `cmd` is substituted with the
+/// temp file path; if there is no placeholder, the path is appended (single-
+/// quoted) as the last argument. The temp file lives until this function
+/// returns, i.e. across the validator run.
+fn run_validator(cmd: &str, merged: &str) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new()
+        .context("creating a temp file to materialize the merged output for validation")?;
+    tmp.write_all(merged.as_bytes())
+        .context("writing merged output to the validation temp file")?;
+    tmp.flush().context("flushing the validation temp file")?;
+
+    let file_path = tmp.path().to_string_lossy().into_owned();
+    let shell_cmd = if cmd.contains("{}") {
+        cmd.replace("{}", &file_path)
+    } else {
+        // No placeholder: append the path as the last argument. Single-quote it
+        // so paths with spaces survive the shell (temp paths won't contain `'`).
+        format!("{cmd} '{file_path}'")
+    };
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&shell_cmd)
+        .status()
+        .with_context(|| format!("running dynamic validator: {shell_cmd}"))?;
+    Ok(status.success())
+}
+
+/// Render a demoted Tier-3 semantic conflict for display (§4 Tier-3).
+///
+/// A diff3-style view showing both sides' intent and the common base — enough to
+/// resolve, without pretending the merge succeeded. The structured [`Conflict`]
+/// value remains the source of truth; this is only the human view.
+fn render_semantic_conflict(conflict: &Conflict) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("<<<<<<< left".to_owned());
+    lines.extend(conflict.left.iter().cloned());
+    lines.push("||||||| base".to_owned());
+    lines.extend(conflict.base.iter().cloned());
+    lines.push("=======".to_owned());
+    lines.extend(conflict.right.iter().cloned());
+    lines.push(">>>>>>> right".to_owned());
+    // Trailing newline so the block reads cleanly on a terminal.
+    format!("{}\n", lines.join("\n"))
 }
 
 /// `omo admit <base> <left> <right>` — trusted kernel admission (§3 P1, §6 I8).
