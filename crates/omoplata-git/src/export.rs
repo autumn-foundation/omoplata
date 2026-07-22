@@ -19,10 +19,11 @@
 //! defines.
 //!
 //! ## Packfile scope
-//! Export writes loose objects only. The import it consumes has already refused
-//! any repo whose reachable objects were packed ([`GitError::PackedObject`]), so
-//! `export_repo` never silently drops packed objects. Packfile encoding is
-//! future work (§8; ADR-0005).
+//! Export always writes *loose* objects, but its input is complete: the import
+//! it consumes decodes both loose and packed objects (unpacking any
+//! `OFS_DELTA`/`REF_DELTA` deltas), so a `git gc`'d source exports its full
+//! object set. Re-packing on export is not performed — omoplata writes the
+//! canonical loose form, which shares each object's oid with git's packed form.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -104,33 +105,39 @@ fn write_ref(out_dir: &Path, name: &str, oid: GitOid) -> Result<(), GitError> {
     std::fs::write(&path, contents).map_err(|source| GitError::Io { path, source })
 }
 
-/// The repo-level round-trip gate: are the exported loose objects byte-identical
-/// to the source's loose objects?
+/// The repo-level round-trip gate: are the exported objects byte-identical to
+/// the source's objects?
 ///
-/// Both `git_dir` and `out_dir` are walked for loose objects; the two are equal
+/// Both `git_dir` and `out_dir` are walked for their full object set — loose
+/// objects *and* objects reconstructed from packfiles — and the two are equal
 /// iff they have exactly the same set of oids and each oid's canonical object
 /// bytes ([`crate::object::encode`]) match. Returns `true` on a perfect match.
 ///
+/// Including packed objects makes the gate correct for a `git gc`'d source,
+/// whose objects live in packs rather than loose files; `out_dir` is written by
+/// [`export_repo`] as loose objects, so its pack set is empty and only its loose
+/// objects contribute.
+///
 /// This compares canonical (uncompressed) object bytes, the level the oid
-/// commits to — see the module docs on what "byte-identical" means. If `git_dir`
-/// has packfiles, only its loose objects participate; the [`export_repo`]
-/// pipeline guarantees the exported set is complete because import already
-/// refuses packed reachable objects.
+/// commits to — see the module docs on what "byte-identical" means.
 ///
 /// # Errors
-/// Propagates any [`GitError`] from walking or decoding either side's loose
-/// objects.
+/// Propagates any [`GitError`] from walking or decoding either side's objects.
 pub fn export_matches_source(git_dir: &Path, out_dir: &Path) -> Result<bool, GitError> {
-    let source = loose_object_bytes(git_dir)?;
-    let exported = loose_object_bytes(out_dir)?;
+    let source = all_object_bytes(git_dir)?;
+    let exported = all_object_bytes(out_dir)?;
     Ok(source == exported)
 }
 
-/// Build an oid → canonical-bytes map of every loose object under `git_dir`.
-fn loose_object_bytes(git_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, GitError> {
+/// Build an oid → canonical-bytes map of every object under `git_dir`, both
+/// loose and packed.
+fn all_object_bytes(git_dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, GitError> {
     let mut map = BTreeMap::new();
     for (oid, object) in crate::loose::walk_loose(git_dir)? {
         map.insert(oid.hex(), encode(&object));
+    }
+    for (oid, object) in crate::pack::read_all_packs(git_dir)? {
+        map.entry(oid.hex()).or_insert_with(|| encode(&object));
     }
     Ok(map)
 }

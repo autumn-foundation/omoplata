@@ -16,6 +16,7 @@ use std::path::Path;
 use crate::error::GitError;
 use crate::loose::{pack_file_count, walk_loose};
 use crate::object::{decode, encode, oid, GitObject, GitOid};
+use crate::pack::read_all_packs;
 
 /// Per-type counts produced by [`verify_repo`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -28,10 +29,10 @@ pub struct GitReport {
     pub commits: usize,
     /// Number of tag objects that passed the gate.
     pub tags: usize,
-    /// Number of packfiles present under `objects/pack`. The gate covers loose
-    /// objects only; a non-zero count means the PASS is over the loose set, not
-    /// the whole repository (§8; ADR-0005). Callers should surface this rather
-    /// than report a false whole-repo PASS.
+    /// Number of packfiles present under `objects/pack`. Packed objects are now
+    /// decoded and gated exactly like loose ones, so the per-type counts above
+    /// include objects reconstructed from packs; this field is retained as
+    /// informational (how many packs the counts were drawn from).
     pub packfiles: usize,
 }
 
@@ -73,18 +74,22 @@ pub fn roundtrip_ok(bytes: &[u8]) -> Result<GitOid, GitError> {
     Ok(oid(&object))
 }
 
-/// Run the round-trip gate over every loose object in a git repository.
+/// Run the round-trip gate over every object in a git repository — loose and
+/// packed alike.
 ///
-/// For each loose object under `<git_dir>/objects/<xx>/`, this inflates it, runs
-/// [`roundtrip_ok`] (decode → re-encode → assert byte-identical), and confirms
-/// the recomputed SHA-1 equals the oid on-disk path. The gate **fails** — an
-/// error is returned — if any object does not round-trip byte-identically or
-/// mismatches its path's oid. On success it returns per-type counts.
+/// For each loose object under `<git_dir>/objects/<xx>/` and each object
+/// reconstructed from a packfile under `<git_dir>/objects/pack/`, this runs
+/// [`roundtrip_ok`] (decode → re-encode → assert byte-identical) and confirms
+/// the recomputed SHA-1 equals the oid the object was addressed by (its loose
+/// path, or its pack index entry). The gate **fails** — an error is returned —
+/// if any object does not round-trip byte-identically or mismatches its oid. On
+/// success it returns per-type counts across both sources.
 ///
 /// # Errors
 /// Returns [`GitError::Roundtrip`] on any non-identical re-encoding,
-/// [`GitError::OidMismatch`] on any content/path oid disagreement (surfaced by
-/// [`walk_loose`]), or an I/O / decode error while reading objects.
+/// [`GitError::OidMismatch`] on any content/oid disagreement,
+/// [`GitError::Pack`] on a malformed packfile, or an I/O / decode error while
+/// reading objects.
 pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
     let mut report = GitReport {
         packfiles: pack_file_count(git_dir),
@@ -97,6 +102,18 @@ pub fn verify_repo(git_dir: &Path) -> Result<GitReport, GitError> {
         if gate_oid != path_oid {
             return Err(GitError::OidMismatch {
                 expected: path_oid.hex(),
+                got: gate_oid.hex(),
+            });
+        }
+        report.tally(&object);
+    }
+    // Packed objects go through the identical gate; `read_all_packs` already
+    // checks each reconstructed object's SHA-1 against its pack-index oid.
+    for (pack_oid, object) in read_all_packs(git_dir)? {
+        let gate_oid = roundtrip_ok(&encode(&object))?;
+        if gate_oid != pack_oid {
+            return Err(GitError::OidMismatch {
+                expected: pack_oid.hex(),
                 got: gate_oid.hex(),
             });
         }

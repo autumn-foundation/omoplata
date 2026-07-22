@@ -30,18 +30,11 @@ pub enum GitError {
     /// A tree referenced an object that is not present among the loose objects.
     #[error("referenced git object not present: {0}")]
     MissingObject(String),
-    /// A reachable object was not found among the loose objects and the repo has
-    /// packfiles this crate does not decode (v1 scope: loose objects only).
-    #[error(
-        "reachable git object {oid} is not a loose object and the repo has {packfiles} \
-         packfile(s); packfile decoding is future work — cannot import/export losslessly"
-    )]
-    PackedObject {
-        /// The oid of the object that could not be resolved as loose.
-        oid: String,
-        /// The number of packfiles present under `objects/pack`.
-        packfiles: usize,
-    },
+    /// A packfile or its index (`*.pack` / `*.idx`) is malformed: bad magic,
+    /// unsupported version, a truncated stream, a delta that cannot be applied,
+    /// or a reconstructed object whose oid does not match the index.
+    #[error("malformed git packfile: {0}")]
+    Pack(&'static str),
     /// A ref file or `packed-refs` entry could not be read or parsed.
     #[error("malformed git ref {name}: {reason}")]
     BadRef {

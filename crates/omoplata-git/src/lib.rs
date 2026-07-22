@@ -27,6 +27,10 @@
 //!   Commits and tags are parsed into typed graph fields ([`GitCommit`],
 //!   [`GitTag`]) while retaining their raw body for exact re-encoding.
 //! - Loose-object I/O ([`read_loose`], [`write_loose`], [`walk_loose`]).
+//! - Packfile + delta decoding ([`read_pack`], [`read_all_packs`]): pack index
+//!   v2 parsing, `OFS_DELTA`/`REF_DELTA` resolution, and delta application, so a
+//!   `git gc`'d repository imports and verifies through the same I9 gate as
+//!   loose objects.
 //! - Ref reading ([`read_refs`]): `HEAD`, loose refs, and `packed-refs`.
 //! - The round-trip gate: [`roundtrip_ok`] for one object and [`verify_repo`]
 //!   for a whole repository — the executable form of I9.
@@ -43,6 +47,7 @@ mod gate;
 mod import;
 mod loose;
 mod object;
+mod pack;
 mod refs;
 
 pub use error::GitError;
@@ -53,6 +58,9 @@ pub use loose::{
     loose_path, oid_from_loose_path, pack_file_count, read_loose, walk_loose, write_loose,
 };
 pub use object::{decode, encode, oid, GitCommit, GitObject, GitOid, GitTag, GitTreeEntry};
+pub use pack::{
+    apply_delta, pack_paths, parse_idx, read_all_packs, read_pack, read_pack_detailed, PackDecode,
+};
 pub use refs::read_refs;
 
 #[cfg(test)]
