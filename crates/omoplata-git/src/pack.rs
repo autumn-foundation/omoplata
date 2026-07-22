@@ -141,6 +141,133 @@ pub fn read_pack_detailed(pack_path: &Path) -> Result<PackDecode, GitError> {
     Ok(out)
 }
 
+/// Decode a self-contained packfile held **entirely in memory** — the form a
+/// packfile arrives in over the git wire protocol (`upload-pack`), where there
+/// is no companion `*.idx` and the stream ends with a 20-byte SHA-1 trailer
+/// rather than index-supplied oids.
+///
+/// Unlike [`read_pack`] (which reads object oids and offsets from a sidecar
+/// index), this walks the pack sequentially: it discovers each object's offset
+/// by inflating in order, resolves `OFS_DELTA` bases by back-offset and
+/// `REF_DELTA` bases by oid (building the oid→offset map incrementally, with
+/// deferral passes so a ref-delta whose base appears later still resolves), and
+/// recomputes each object's SHA-1 from its reconstructed content. A full clone's
+/// pack is self-contained (not thin), so every delta base resolves within it.
+///
+/// The 20-byte trailing pack checksum is tolerated (it is simply not part of any
+/// object and the sequential walk stops after the declared object count).
+///
+/// # Errors
+/// Returns [`GitError::Pack`] on a malformed header, a truncated stream, a delta
+/// that cannot be applied, a `REF_DELTA` whose base is absent from the pack (a
+/// *thin* pack, which a full clone never produces), or a reconstructed object
+/// whose recomputed content is not a well-formed git object; [`GitError::Zlib`]
+/// on a corrupt deflate stream; or [`GitError::Decode`] on a malformed object.
+pub fn parse_pack_bytes(pack: &[u8]) -> Result<Vec<(GitOid, GitObject)>, GitError> {
+    let count = parse_pack_header(pack)? as usize;
+
+    // Pass 1: discover every object's byte offset by inflating sequentially. The
+    // pack has no index, so the only way to find object N+1 is to consume object
+    // N's zlib stream and note where it ends.
+    let mut offsets: Vec<u64> = Vec::with_capacity(count);
+    let mut pos = 12usize; // 4 magic + 4 version + 4 count
+    for _ in 0..count {
+        offsets.push(pos as u64);
+        pos = skip_entry(pack, pos)?;
+    }
+
+    // Pass 2: resolve every object, deferring ref-deltas whose base oid is not
+    // yet known. OFS-deltas resolve immediately (their base offset is explicit
+    // and always earlier). Iterating until no progress bounds the work at
+    // O(objects) passes and rejects a thin pack (an unresolvable ref-delta base).
+    let mut oid_to_offset: HashMap<GitOid, u64> = HashMap::with_capacity(count);
+    let mut memo: HashMap<u64, (u8, Vec<u8>)> = HashMap::new();
+    let mut results: HashMap<u64, (GitOid, GitObject)> = HashMap::with_capacity(count);
+    let mut remaining: Vec<u64> = offsets.clone();
+    while !remaining.is_empty() {
+        let before = remaining.len();
+        let mut deferred: Vec<u64> = Vec::new();
+        for &offset in &remaining {
+            // A ref-delta whose base has not been resolved yet is deferred to a
+            // later pass rather than resolved eagerly (its base may sit later in
+            // the pack).
+            if let Some(base_oid) = peek_ref_base(pack, offset)? {
+                if !oid_to_offset.contains_key(&base_oid) {
+                    deferred.push(offset);
+                    continue;
+                }
+            }
+            let (type_id, body) = resolve(pack, offset, &oid_to_offset, &mut memo, 0)?;
+            let canonical = canonical_bytes(type_id, &body)?;
+            let computed = GitOid::from_bytes(sha1_bytes(&canonical));
+            let object = decode(&canonical)?;
+            oid_to_offset.insert(computed, offset);
+            results.insert(offset, (computed, object));
+        }
+        if deferred.len() == before {
+            return Err(GitError::Pack(
+                "packfile: unresolvable ref-delta base (thin pack not supported)",
+            ));
+        }
+        remaining = deferred;
+    }
+
+    // Emit in pack order for determinism.
+    let mut out = Vec::with_capacity(count);
+    for offset in &offsets {
+        if let Some(entry) = results.remove(offset) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
+/// Advance past the pack entry at `offset`, returning the offset of the next
+/// entry. Consumes the entry header, any delta base reference, and the object's
+/// zlib stream (whose compressed length is reported by the inflater).
+fn skip_entry(pack: &[u8], offset: usize) -> Result<usize, GitError> {
+    let mut pos = offset;
+    let (type_id, _size) = read_entry_header(pack, &mut pos)?;
+    match type_id {
+        OBJ_COMMIT | OBJ_TREE | OBJ_BLOB | OBJ_TAG => {}
+        OBJ_OFS_DELTA => {
+            let _ = read_ofs_delta_offset(pack, &mut pos)?;
+        }
+        OBJ_REF_DELTA => {
+            pos = pos
+                .checked_add(20)
+                .ok_or(GitError::Pack("packfile: offset overflow"))?;
+            if pos > pack.len() {
+                return Err(GitError::Pack("packfile: truncated ref-delta base oid"));
+            }
+        }
+        _ => return Err(GitError::Pack("packfile: unknown object type")),
+    }
+    let consumed = inflate_consumed(pack, pos)?;
+    pos.checked_add(consumed)
+        .ok_or(GitError::Pack("packfile: offset overflow"))
+}
+
+/// If the entry at `offset` is a `REF_DELTA`, return its base oid (without
+/// inflating the delta stream); otherwise `None`.
+fn peek_ref_base(pack: &[u8], offset: u64) -> Result<Option<GitOid>, GitError> {
+    let mut pos =
+        usize::try_from(offset).map_err(|_| GitError::Pack("packfile: offset overflow"))?;
+    let (type_id, _size) = read_entry_header(pack, &mut pos)?;
+    if type_id != OBJ_REF_DELTA {
+        return Ok(None);
+    }
+    let end = pos
+        .checked_add(20)
+        .ok_or(GitError::Pack("packfile: offset overflow"))?;
+    let oid_bytes = pack
+        .get(pos..end)
+        .ok_or(GitError::Pack("packfile: truncated ref-delta base oid"))?;
+    let mut oid = [0u8; 20];
+    oid.copy_from_slice(oid_bytes);
+    Ok(Some(GitOid::from_bytes(oid)))
+}
+
 /// Enumerate and decode every `*.pack` under `<git_dir>/objects/pack`.
 ///
 /// Returns the concatenation of every pack's objects. A repository with no pack
@@ -556,6 +683,20 @@ fn take_byte(data: &[u8], pos: &mut usize) -> Result<u8, GitError> {
     Ok(b)
 }
 
+/// Inflate the zlib stream at `start` and report how many **compressed** bytes
+/// it consumed — the amount to advance to reach the next pack entry when there
+/// is no index to supply offsets (the wire-pack sequential walk).
+fn inflate_consumed(data: &[u8], start: usize) -> Result<usize, GitError> {
+    let slice = data
+        .get(start..)
+        .ok_or(GitError::Pack("packfile: object starts past end of file"))?;
+    let mut decoder = ZlibDecoder::new(slice);
+    let mut sink = std::io::sink();
+    std::io::copy(&mut decoder, &mut sink).map_err(|e| GitError::Zlib(e.to_string()))?;
+    usize::try_from(decoder.total_in())
+        .map_err(|_| GitError::Pack("packfile: compressed size overflow"))
+}
+
 /// Inflate the zlib stream that begins at `start` in `data`.
 fn inflate_at(data: &[u8], start: usize) -> Result<Vec<u8>, GitError> {
     let slice = data
@@ -694,6 +835,57 @@ mod tests {
     #[test]
     fn pack_header_rejects_bad_magic() {
         assert!(parse_pack_header(b"NOPExxxxxxxx").is_err());
+    }
+
+    /// zlib-deflate a byte slice, for building an in-memory pack in a test.
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Frame one whole (non-delta) object into a pack entry: the varint
+    /// `(type, size)` header followed by the deflated body.
+    fn whole_entry(type_id: u8, body: &[u8]) -> Vec<u8> {
+        let size = body.len();
+        // Single-byte header path (bodies here are < 16 bytes): (type<<4)|size.
+        assert!(
+            size < 16,
+            "test bodies stay in the single-header-byte range"
+        );
+        let mut out = vec![((type_id & 0x07) << 4) | (size as u8 & 0x0f)];
+        out.extend_from_slice(&deflate(body));
+        out
+    }
+
+    #[test]
+    fn parse_pack_bytes_walks_a_self_contained_pack() {
+        // Build a two-object pack (a blob and a blob) with no index and a trailing
+        // SHA-1 — the exact shape upload-pack streams over the wire.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes()); // count = 2
+        pack.extend_from_slice(&whole_entry(OBJ_BLOB, b"hi"));
+        pack.extend_from_slice(&whole_entry(OBJ_BLOB, b"bye"));
+        // Trailing pack checksum (ignored by the sequential walk).
+        pack.extend_from_slice(&sha1_bytes(&pack));
+
+        let objects = parse_pack_bytes(&pack).unwrap();
+        assert_eq!(objects.len(), 2);
+        // Objects come back in pack order, oids recomputed from content.
+        assert_eq!(objects[0].1, GitObject::Blob(b"hi".to_vec()));
+        assert_eq!(objects[1].1, GitObject::Blob(b"bye".to_vec()));
+        assert_eq!(objects[0].0, crate::object::oid(&objects[0].1));
+        assert_eq!(objects[1].0, crate::object::oid(&objects[1].1));
+    }
+
+    #[test]
+    fn parse_pack_bytes_rejects_bad_magic() {
+        assert!(parse_pack_bytes(b"NOPE\0\0\0\x02\0\0\0\0").is_err());
     }
 
     #[test]

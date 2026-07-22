@@ -170,7 +170,30 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
     }
 
     let refs = read_refs(git_dir)?;
+    import_objects(&objects, refs, repo)
+}
 
+/// Import an **in-memory** object set into `repo` by walking the reachable graph
+/// from `refs` — the shared core behind both [`import_repo`] (which reads objects
+/// off disk) and the wire fetch path ([`crate::fetch_local`], which receives a
+/// packfile over `upload-pack` and decodes it in memory).
+///
+/// `objects` must be an oid-keyed map that already contains every object
+/// reachable from `refs`; each is run through the I9 round-trip gate
+/// ([`crate::gate::roundtrip_ok`]) as it is visited, and blobs/trees are written
+/// into the omoplata store via the M6/M10 import mapping. `refs` are the roots of
+/// the walk and are recorded verbatim on the returned [`GitImport`].
+///
+/// # Errors
+/// Returns [`GitError::MissingObject`] if a reachable object is absent from
+/// `objects`, [`GitError::Roundtrip`] on any object that does not re-encode
+/// byte-identically, or any error from an unsupported tree-entry mode or writing
+/// into the store.
+pub fn import_objects(
+    objects: &HashMap<GitOid, GitObject>,
+    refs: Vec<(String, GitOid)>,
+    repo: &Repository,
+) -> Result<GitImport, GitError> {
     let mut import = GitImport {
         oid_map: HashMap::new(),
         git_objects: HashMap::new(),
@@ -188,7 +211,7 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
         if import.git_objects.contains_key(&oid) {
             continue;
         }
-        let object = resolve_object(oid, &objects)?;
+        let object = resolve_object(oid, objects)?;
         // I9: every reachable object must round-trip byte-identically.
         crate::gate::roundtrip_ok(&encode(&object))?;
         match &object {
@@ -207,7 +230,7 @@ pub fn import_repo(git_dir: &Path, repo: &Repository) -> Result<GitImport, GitEr
             }
             GitObject::Tree(entries) => {
                 import.trees += 1;
-                import_tree_object(oid, &object, &objects, repo, &mut import.oid_map)?;
+                import_tree_object(oid, &object, objects, repo, &mut import.oid_map)?;
                 for entry in entries {
                     stack.push(GitOid::from_bytes(entry.oid));
                 }

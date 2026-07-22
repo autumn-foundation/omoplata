@@ -9,7 +9,7 @@ use omoplata_algebra::{
     diff, dynamic_validate, kernel, merge3, rebase, Admission, Conflict, Doc, Validated,
 };
 use omoplata_drivers::{select_driver, MergeInput};
-use omoplata_git::{export_matches_source, export_repo, import_repo, verify_repo};
+use omoplata_git::{export_matches_source, export_repo, fetch_local, import_repo, verify_repo};
 use omoplata_identity::{
     extract_definitions, match_definitions, ChangeId, CommitId, Definition, MatchStatus,
 };
@@ -313,6 +313,22 @@ enum GitCommand {
         /// The output directory to write the reconstructed objects and refs to.
         out_dir: PathBuf,
     },
+    /// Clone objects over the git **wire protocol** (local transport, §3 P8).
+    ///
+    /// Speaks the real pkt-line + `upload-pack` conversation against a local
+    /// `git upload-pack` process: reads the source repo's ref advertisement,
+    /// negotiates a full clone (`want …`/`done`), receives the raw packfile, and
+    /// imports every object into the omoplata repository through the I9 gate.
+    /// Prints the advertised refs, the packfile byte count, and the imported
+    /// per-type counts.
+    Fetch {
+        /// The source repository: a `file://` URL or a local path (a working
+        /// tree or a git directory).
+        repo_url: String,
+        /// Destination omoplata repository (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 /// `omo ref …` — ref subcommands backed by the operation log.
@@ -407,6 +423,7 @@ fn run() -> anyhow::Result<i32> {
             GitCommand::Import { git_dir, repo } => cmd_git_import(git_dir, repo).map(|()| 0),
             GitCommand::Log { git_dir } => cmd_git_log(git_dir).map(|()| 0),
             GitCommand::Export { git_dir, out_dir } => cmd_git_export(git_dir, out_dir),
+            GitCommand::Fetch { repo_url, repo } => cmd_git_fetch(repo_url, repo).map(|()| 0),
         },
         Command::Dup {
             files,
@@ -682,6 +699,30 @@ fn cmd_git_export(git_dir: PathBuf, out_dir: PathBuf) -> anyhow::Result<i32> {
         export.objects
     );
     Ok(i32::from(!matches))
+}
+
+/// `omo git fetch <repo-url-or-path> [--repo <dir>]` — clone over the wire.
+///
+/// Speaks the git wire protocol (pkt-line + `upload-pack`) over the local
+/// transport against the source repository, importing the received packfile into
+/// the destination omoplata repo. Prints the advertised refs, the number of
+/// packfile bytes received, and the imported per-type counts.
+fn cmd_git_fetch(repo_url: String, repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let dest = Repository::open(resolve(repo)?)?;
+    let fetch =
+        fetch_local(&repo_url, &dest).with_context(|| format!("wire fetch from {repo_url}"))?;
+
+    println!("advertised refs ({}):", fetch.refs.len());
+    for (name, oid) in &fetch.refs {
+        println!("  {} {}", short(&oid.hex()), name);
+    }
+    println!("packfile bytes received: {}", fetch.pack_bytes);
+    println!("imported commits: {}", fetch.import.commits);
+    println!("imported tags:    {}", fetch.import.tags);
+    println!("imported trees:   {}", fetch.import.trees);
+    println!("imported blobs:   {}", fetch.import.blobs);
+    println!("git -> omoplata mappings: {}", fetch.import.mapping_count());
+    Ok(())
 }
 
 /// The conventional 7-character short form of a 40-hex oid.

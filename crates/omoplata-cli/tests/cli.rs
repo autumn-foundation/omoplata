@@ -953,3 +953,41 @@ fn autorebase_requires_initialized_repo() {
         .failure()
         .stderr(predicate::str::contains("no omoplata repository"));
 }
+
+#[test]
+fn git_fetch_clones_over_the_wire() {
+    if !git_available() {
+        eprintln!("note: `git` not on PATH; skipping git fetch CLI test");
+        return;
+    }
+    // A 2-commit, 2-file source repo.
+    let work = tempdir().unwrap();
+    let root = work.path();
+    run_git(root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("a.txt"), b"first\n").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub").join("b.txt"), b"nested\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "first commit");
+    std::fs::write(root.join("a.txt"), b"first\nsecond\n").unwrap();
+    run_git(root, &["add", "-A"]);
+    git_commit(root, "second commit");
+
+    // `omo git fetch <source> --repo <dest>` clones over the wire: advertises the
+    // ref, receives a packfile, and imports >=1 commit.
+    let omo_dir = tempdir().unwrap();
+    omo().arg("init").arg(omo_dir.path()).assert().success();
+    omo()
+        .arg("git")
+        .arg("fetch")
+        .arg(root)
+        .arg("--repo")
+        .arg(omo_dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("refs/heads/main"))
+        .stdout(predicate::str::contains("HEAD"))
+        .stdout(predicate::str::is_match(r"packfile bytes received:\s+[1-9]").unwrap())
+        .stdout(predicate::str::is_match(r"imported commits:\s+2").unwrap())
+        .stdout(predicate::str::contains("git -> omoplata mappings:"));
+}
