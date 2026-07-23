@@ -1120,3 +1120,51 @@ fn stack_submit_land_e2e_cli_test() {
         .success()
         .stdout(predicate::str::contains("landed submission sub-1"));
 }
+
+#[test]
+fn dup_scans_live_workspaces_across_agents() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let root = repo_dir.path();
+    omo().arg("init").arg(root).assert().success();
+
+    let ws1_dir = tempfile::tempdir().unwrap();
+    let ws2_dir = tempfile::tempdir().unwrap();
+
+    let code1 = "fn calculate_total(items: &[i32]) -> i32 {\n    let mut sum = 0;\n    for x in items { sum += x; }\n    sum\n}\n";
+    let code2 = "fn calculate_total(items: &[i32]) -> i32 {\n    let mut sum = 0;\n    for x in items { sum += x; }\n    sum\n}\n";
+
+    std::fs::write(ws1_dir.path().join("calc_a.rs"), code1).unwrap();
+    std::fs::write(ws2_dir.path().join("calc_b.rs"), code2).unwrap();
+
+    omo()
+        .args([
+            "workspace",
+            "add",
+            "agent_a",
+            &ws1_dir.path().to_string_lossy(),
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+
+    omo()
+        .args([
+            "workspace",
+            "add",
+            "agent_b",
+            &ws2_dir.path().to_string_lossy(),
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+
+    omo()
+        .args(["dup", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace agent_a"))
+        .stdout(predicate::str::contains("workspace agent_b"));
+}
