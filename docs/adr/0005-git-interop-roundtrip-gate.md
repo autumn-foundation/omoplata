@@ -122,13 +122,7 @@ zlib-ng/system feature is deliberately **not** enabled) and RustCrypto
   git-side record, which `GitImport` keeps authoritative in `git_objects`
   (decoded objects keyed by original oid). The round-trip gate itself operates
   entirely on the git side and is therefore unaffected by this lossiness.
-- **Packfile scope.** v1 decodes **loose objects only**. If the commit-graph
-  walk reaches an object that is not a loose object and the repo has packfiles,
-  import fails with `PackedObject` (a count is surfaced) rather than silently
-  skipping it; `verify_repo` reports a packfile count so the CLI never claims a
-  false whole-repo PASS over a repo whose objects are packed. Fresh
-  `git init` + commits produce loose objects, which the pipeline handles
-  end-to-end. Packfile (and delta) decoding is future work.
+- **Packfile scope.** Packfile and delta decoding (`parse_idx`, `read_pack`, `parse_pack_bytes`) are fully implemented, resolving `OFS_DELTA` and `REF_DELTA` delta chains. `import_repo`, `verify_repo`, and `export_repo` decode loose objects and packed objects alike into an integrated `GitImport`, ensuring `git gc`'d repositories pass the I9 round-trip gate identically to loose repositories. `packfiles` counts in `GitReport` are retained as informational.
 - **Wire-protocol scope and future work.** R3 implements the **fetch**
   (`upload-pack`) half of the wire protocol over the **local transport**
   (`file://` / local paths). Still future work:

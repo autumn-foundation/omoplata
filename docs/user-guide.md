@@ -682,10 +682,7 @@ yet the real thing:
   `ref set`, `cat-object`, and `diff`, as documented in §3. These ergonomic verbs
   are coming with **workspaces (design-doc M2)**, and §3 will be rewritten against
   them when they land.
-- **Git transport is read-only and local.** There is no `git push` / `receive-pack`,
-  and no networked (http/ssh) transports. `omo git fetch` works over the local
-  `file://` / path transport shown in §5 — a real pkt-line / upload-pack clone —
-  but not over the network.
+- **Git transport is read-only and local.** There is no `git push` / `receive-pack` (which requires packfile encoding), and no networked (http/ssh) socket transports. `omo git fetch` works over the local `file://` / path transport — a real pkt-line / upload-pack clone — and full packfile/delta decoding (`OFS_DELTA`/`REF_DELTA`) is supported across `omo git fetch`, `import`, `verify`, and `export`.
 - **Real embeddings need the network on first use.** The offline default is a
   deterministic hashing stand-in (fully reproducible, no download). The real
   `all-MiniLM-L6-v2` model requires `--features fastembed` and a one-time ~87 MB
