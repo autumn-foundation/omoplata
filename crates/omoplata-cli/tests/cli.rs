@@ -1067,3 +1067,56 @@ fn git_fetch_clones_over_the_wire() {
         .stdout(predicate::str::is_match(r"imported commits:\s+2").unwrap())
         .stdout(predicate::str::contains("git -> omoplata mappings:"));
 }
+
+#[test]
+fn stack_submit_land_e2e_cli_test() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    omo().arg("init").arg(root).assert().success();
+
+    // Register a workspace.
+    let wc = root.join("wc");
+    std::fs::create_dir_all(&wc).unwrap();
+    std::fs::write(wc.join("file.txt"), "hello omoplata\n").unwrap();
+
+    omo()
+        .args(["workspace", "add", "w1", wc.to_str().unwrap(), "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // `omo stack` auto-snapshots working copy and prints workspace/stack info.
+    omo()
+        .args(["stack", "--workspace", "w1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workspace: w1"))
+        .stdout(predicate::str::contains("stack changes: [ws/w1]"));
+
+    // `omo submit` creates a submission.
+    omo()
+        .args([
+            "submit",
+            "sub-1",
+            "--title",
+            "Initial feature",
+            "ws/w1",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "submitted sub-1 \"Initial feature\"",
+        ));
+
+    // `omo land` lands the submission through the merge queue.
+    omo()
+        .args(["land", "sub-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed submission sub-1"));
+}

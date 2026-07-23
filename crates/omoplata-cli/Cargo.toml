@@ -27,6 +27,8 @@ omoplata-identity = { path = "../omoplata-identity" }
 omoplata-sem = { path = "../omoplata-sem" }
 omoplata-work = { path = "../omoplata-work" }
 tempfile = "3"
+serde_json = { workspace = true }
+
 
 [dev-dependencies]
 assert_cmd = "2"

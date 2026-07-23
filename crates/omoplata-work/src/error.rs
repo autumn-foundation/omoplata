@@ -61,6 +61,18 @@ pub enum WorkError {
     #[error("unknown workspace: {0:?}")]
     UnknownWorkspace(String),
 
+    /// A change ID was unknown or not found in the stack/graph.
+    #[error("unknown change: {0}")]
+    UnknownChange(String),
+
+    /// A stack index was out of bounds.
+    #[error("invalid stack index: {0}")]
+    InvalidStackIndex(usize),
+
+    /// A submission was not approved and cannot be landed.
+    #[error("submission {0} is not approved")]
+    SubmissionNotApproved(String),
+
     /// A [`switch`](crate::materialize) would overwrite uncommitted changes in a
     /// workspace's working directory (a dirty working copy). Commit first, or
     /// pass `--force`.

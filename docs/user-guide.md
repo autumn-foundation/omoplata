@@ -142,63 +142,51 @@ renamed compute_area -> area_of_rect (fn)
 
 ---
 
-## 3. The everyday loop today: commits, branches, switching (and what's missing)
+## 3. The change-stack workflow: workspaces, stacks, submissions, and landing
 
-If you come from git, the first muscle-memory you reach for is the everyday loop:
-commit your work, branch off, switch between branches. **Be warned up front:**
-omoplata today is closer to git's *plumbing* than its *porcelain*. There is **no
-`omo commit`** (no verb that snapshots a working directory into a change with a
-message and advances a ref), **no `omo branch`**, and **no `omo switch` /
-`checkout`** (omo never writes a stored tree back out into your working files).
-Those are exactly what git users want first — and they aren't here yet:
+Omoplata rejects traditional Git-style `commit`, `branch`, and `switch` pointers in favor of **auto-snapshotted workspaces**, **change stacks**, **typed submissions**, and **merge queue landing** (§5.9, §5.10).
+
+### Workspaces and auto-snapshotting
+
+Working copies are associated with per-agent workspaces (`omo workspace add`). Any modification to the working copy is **implicitly auto-snapshotted** into a tree commit when querying or mutating state (P4).
 
 ```console
-$ omo commit
-error: unrecognized subcommand 'commit'
+$ omo workspace add w1 /path/to/workdir
+added workspace "w1" (dir: /path/to/workdir, change: ws/w1)
 
-  tip: a similar subcommand exists: 'admit'
-
-$ omo switch
-error: unrecognized subcommand 'switch'
-
-Usage: omo <COMMAND>
+$ omo stack --workspace w1
+workspace: w1 (change: ws/w1)
+  tip commit: sha256:7f...
+  stack changes: [ws/w1]
 ```
 
-These ergonomic verbs are being built as part of **workspaces (design-doc M2)**;
-this section will be rewritten against them when they land (see the note at the
-end). Until then, here is the honest raw-plumbing flow you assemble by hand from
-the commands that *do* exist. Every block below is real executed output.
+### Stack surgery: `absorb` and `reorder`
 
-### "Committing" a snapshot today
+Instead of interactive rebasing, `omo` provides Sapling/jj-style stack surgery:
 
-There is no working-directory snapshot commit with a message. What you have is:
-store content as a **content-addressed object** with `omo hash-object`, then point
-a **named ref** at that object id with `omo ref set`. That ref-move is recorded in
-the op log.
+- **`omo absorb`**: auto-routes working copy edits into stack changes based on definition identity.
+- **`omo reorder`**: swaps adjacent changes in a stack cleanly (if disjoint or commuting) or carrying conflict values (P3).
 
 ```console
-$ printf 'title: notes\nbody: first draft\n' > notes.txt
+$ omo absorb c1 c2
+absorbed 2 change(s) into stack [ChangeId("ws/w1"), ChangeId("c1"), ChangeId("c2")]
 
-$ omo hash-object notes.txt
-sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo ref set main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-#0 set-ref main -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo op log
-#0 set-ref main ∅ -> sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
-
-$ omo ref list
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+$ omo reorder 0
+reordered change stack: [ChangeId("c1"), ChangeId("ws/w1"), ChangeId("c2")]
 ```
 
-**What this is and isn't.** `omo hash-object` stores a **single object** (one
-file's bytes), and `omo ref set` points a name at that one object id — it does
-**not** snapshot a whole working directory into a tree, and there is **no commit
-message, author, or parent link**. It's the moral equivalent of `git hash-object
--w` followed by `git update-ref`, with no `git commit` on top yet. That
-message-bearing, working-tree-snapshotting `omo commit` is the missing verb coming
-with workspaces.
+### Submissions and Landing
+
+Changes are reviewed via **submissions** (`omo submit`) referencing change IDs, and landed into trunk via **the merge queue** (`omo land`), which transitions changes from `Draft` to `Public` phase:
+
+```console
+$ omo submit sub-101 --title "Add definition tracking" c1 c2
+submitted sub-101 "Add definition tracking" with 2 change(s) (approved)
+
+$ omo land sub-101
+landed submission sub-101: Submission sub-101 landed successfully
+```
+
 
 ### "Branching" today
 
