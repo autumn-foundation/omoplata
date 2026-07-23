@@ -37,6 +37,7 @@
 mod change;
 mod definition;
 mod error;
+mod submission;
 
 pub use change::{Change, ChangeGraph, ChangeId, CommitId, Phase};
 pub use definition::{
@@ -44,3 +45,4 @@ pub use definition::{
     DefinitionId, DefinitionKind, MatchStatus, OccurrenceId,
 };
 pub use error::IdentityError;
+pub use submission::{Approval, ApprovalCertificate, Submission, SubmissionId};

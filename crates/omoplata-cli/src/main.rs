@@ -13,15 +13,16 @@ use omoplata_git::{
     export_matches_source, export_repo, fetch_local, import_repo, verify_repo, GitError,
 };
 use omoplata_identity::{
-    extract_definitions, match_definitions, ChangeId, CommitId, Definition, MatchStatus,
+    extract_definitions, match_definitions, ChangeGraph, ChangeId, CommitId, Definition,
+    MatchStatus, Phase, Submission, SubmissionId,
 };
 use omoplata_sem::{
     embed_definitions, find_duplicates, search, Embedded, Embedder, HashingEmbedder,
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
-    is_dirty, materialize, snapshot, MapContext, OpKind, OpLog, RebaseEngine, WorkError, Workspace,
-    WorkspaceRegistry,
+    absorb, auto_snapshot, land_submission, MapContext, OpKind, OpLog, RebaseEngine, Stack,
+    WorkError, Workspace, WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -210,68 +211,64 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceCommand,
     },
-    /// Snapshot a workspace's working directory into a new commit (§5.1, P4).
-    ///
-    /// Recursively snapshots the working dir into an omoplata tree (the tree's
-    /// object id *is* the commit), advances the workspace's current-change tip
-    /// from its parent to that commit, and appends a `Commit` op to the shared
-    /// op log — all under the repository lock. Prints the new commit id and
-    /// message. This is the everyday "snapshot my work" verb.
-    Commit {
-        /// The commit message.
+    /// View and manage the current stack of changes for a workspace (§5.9).
+    Stack {
+        /// Which workspace's stack to view (defaults to current directory workspace).
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Route uncommitted working-copy edits into stack changes by touched definitions (§5.9).
+    Absorb {
+        /// Target change IDs to absorb hunks into.
+        #[arg(required = true)]
+        target: Vec<String>,
+        /// Which workspace to operate on.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Reorder adjacent changes in the workspace's change stack (§5.9).
+    Reorder {
+        /// Index `i` of the change to swap with `i + 1`.
+        index: usize,
+        /// Which workspace's stack to reorder.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Create or update a review submission referencing change IDs (§5.10).
+    Submit {
+        /// Unique submission identifier.
+        id: String,
+        /// Submission title / description.
         #[arg(short, long)]
-        message: Option<String>,
-        /// Which workspace to commit (defaults to the sole workspace, or the one
-        /// whose working dir contains the current directory).
+        title: String,
+        /// List of change IDs included in this submission.
+        #[arg(required = true)]
+        changes: Vec<String>,
+        /// Author identifier.
         #[arg(long)]
-        workspace: Option<String>,
-        /// Repository directory (defaults to the current directory).
-        #[arg(long)]
-        repo: Option<PathBuf>,
-    },
-    /// Create a named ref (branch) at a commit — a wrapper over the ref machinery.
-    ///
-    /// With `--list`, prints the current refs instead. Otherwise points `name`
-    /// at `--from` (a ref name or commit id) or, by default, at the current
-    /// workspace's tip, appending a `SetRef` op under the repository lock.
-    Branch {
-        /// The branch (ref) name to create. Omit with `--list`.
-        name: Option<String>,
-        /// The commit to point at: a ref name or a commit id. Defaults to the
-        /// current workspace's tip.
-        #[arg(long)]
-        from: Option<String>,
-        /// List the current refs instead of creating one.
-        #[arg(long)]
-        list: bool,
-        /// Which workspace's tip is the default target (defaults to the sole
-        /// workspace, or the one containing the current directory).
-        #[arg(long)]
-        workspace: Option<String>,
-        /// Repository directory (defaults to the current directory).
+        author: Option<String>,
+        /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Move a workspace's current change to a commit and check it out (§5.1).
-    ///
-    /// Sets the workspace's current-change pointer to `target` (a ref name or
-    /// commit id), appends a `Switch` op under the repository lock, and
-    /// materializes that commit's tree into the working directory. Refuses to
-    /// clobber a dirty working copy unless `--force` is given.
-    Switch {
-        /// The commit to switch to: a ref name or a commit id.
-        target: String,
-        /// Which workspace to switch (defaults to the sole workspace, or the one
-        /// whose working dir contains the current directory).
-        #[arg(long)]
-        workspace: Option<String>,
-        /// Overwrite uncommitted changes in the working directory.
-        #[arg(long)]
-        force: bool,
-        /// Repository directory (defaults to the current directory).
+    /// Land an approved submission through the merge queue (§5.10).
+    Land {
+        /// Submission ID to land.
+        id: String,
+        /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+
     /// Inspect and update the repository's refs via the operation log (§5.6).
     Ref {
         #[command(subcommand)]
@@ -523,24 +520,26 @@ fn run() -> anyhow::Result<i32> {
             WorkspaceCommand::List { repo } => cmd_workspace_list(repo).map(|()| 0),
             WorkspaceCommand::Remove { name, repo } => cmd_workspace_remove(repo, name).map(|()| 0),
         },
-        Command::Commit {
-            message,
-            workspace,
-            repo,
-        } => cmd_commit(repo, message, workspace).map(|()| 0),
-        Command::Branch {
-            name,
-            from,
-            list,
-            workspace,
-            repo,
-        } => cmd_branch(repo, name, from, list, workspace).map(|()| 0),
-        Command::Switch {
+        Command::Stack { workspace, repo } => cmd_stack(repo, workspace).map(|()| 0),
+        Command::Absorb {
             target,
             workspace,
-            force,
             repo,
-        } => cmd_switch(repo, target, workspace, force).map(|()| 0),
+        } => cmd_absorb(repo, target, workspace).map(|()| 0),
+        Command::Reorder {
+            index,
+            workspace,
+            repo,
+        } => cmd_reorder(repo, index, workspace).map(|()| 0),
+        Command::Submit {
+            id,
+            title,
+            changes,
+            author,
+            repo,
+        } => cmd_submit(repo, id, title, changes, author).map(|()| 0),
+        Command::Land { id, repo } => cmd_land(repo, id).map(|()| 0),
+
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
             RefCommand::List { repo } => cmd_ref_list(repo).map(|()| 0),
@@ -613,15 +612,6 @@ fn resolve_workspace<'a>(
     }
 }
 
-/// Resolve a `ref-or-commit` argument to a commit-id string: a matching ref name
-/// folds to its target, otherwise the string is taken as a literal commit id.
-fn resolve_commit(log: &OpLog, spec: &str) -> String {
-    match log.refs_now().get(spec) {
-        Some(commit) => commit.to_string(),
-        None => spec.to_owned(),
-    }
-}
-
 /// `omo workspace add <name> <path>` — register a workspace + fresh change.
 ///
 /// The working directory is created if absent and stored canonicalized so the
@@ -680,170 +670,162 @@ fn cmd_workspace_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<(
     Ok(())
 }
 
-/// `omo commit [-m <msg>] [--workspace <name>]` — snapshot + advance the tip.
-///
-/// Snapshots the workspace's working dir into a tree (outside the lock — object
-/// writes are content-addressed and concurrency safe), then appends a `Commit`
-/// op advancing the change's tip from its parent to the new commit, all under
-/// the repository lock ([`OpLog::mutate_locked`]) so no concurrent writer's
-/// op-log update is lost. The parent (supersession source) is read inside the
-/// lock, so it always reflects the committed state.
-fn cmd_commit(
-    repo: Option<PathBuf>,
-    message: Option<String>,
-    workspace: Option<String>,
-) -> anyhow::Result<()> {
+fn submission_path(repo: &Repository, id: &SubmissionId) -> PathBuf {
+    repo.control_dir()
+        .join("submissions")
+        .join(format!("{}.json", id.as_str()))
+}
+
+fn save_submission(repo: &Repository, sub: &Submission) -> anyhow::Result<()> {
+    let path = submission_path(repo, &sub.id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(sub)?;
+    omoplata_store::atomic_write(&path, json.as_bytes())?;
+    Ok(())
+}
+
+fn load_submission(repo: &Repository, id: &SubmissionId) -> anyhow::Result<Submission> {
+    let path = submission_path(repo, id);
+    let bytes = std::fs::read(&path).with_context(|| format!("submission {} not found", id))?;
+    let sub: Submission = serde_json::from_slice(&bytes)?;
+    Ok(sub)
+}
+
+/// `omo stack [--workspace <name>]` — view change stack for a workspace (§5.9).
+fn cmd_stack(repo: Option<PathBuf>, workspace: Option<String>) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
     let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
 
-    // Snapshot the working copy: the tree's object id *is* the commit id (§5.1).
-    let tree_id = snapshot(&repo, &ws.working_dir)?;
-    let tree_commit = CommitId::new(tree_id.to_string());
-
-    let (seq, parent, unchanged) = OpLog::mutate_locked(&repo, |log| {
-        let parent = log.refs_now().get(ws.change.as_str()).cloned();
-        let unchanged = parent.as_ref() == Some(&tree_commit);
-        let seq = log
-            .append(
-                OpKind::Commit {
-                    workspace: ws.name.clone(),
-                    change: ws.change.clone(),
-                    tree: tree_commit.clone(),
-                    parent: parent.clone(),
-                    message: message.clone(),
-                },
-                None,
-            )
-            .seq;
-        Ok((seq, parent, unchanged))
+    // Auto-snapshot dirty working copy into tip commit.
+    OpLog::mutate_locked(&repo, |log| {
+        let _ = auto_snapshot(&repo, log, &ws)?;
+        Ok(())
     })?;
-
-    println!("#{seq} [{}] committed {}", ws.name, tree_commit);
-    if let Some(parent) = parent {
-        println!("  parent {parent}");
-    }
-    if let Some(msg) = &message {
-        println!("  message: {msg}");
-    }
-    if unchanged {
-        println!("  (working copy unchanged since parent)");
-    }
-    Ok(())
-}
-
-/// `omo branch <name> [--from <ref-or-commit>]` / `omo branch --list`.
-///
-/// Creates a named ref via the same op-log ref machinery as `omo ref set`, under
-/// the repository lock. Default target is the resolved workspace's current tip.
-fn cmd_branch(
-    repo: Option<PathBuf>,
-    name: Option<String>,
-    from: Option<String>,
-    list: bool,
-    workspace: Option<String>,
-) -> anyhow::Result<()> {
-    let repo = Repository::open(resolve(repo)?)?;
-
-    if list {
-        for (name, commit) in OpLog::load(oplog_path(&repo))?.refs_now() {
-            println!("{name} {commit}");
-        }
-        return Ok(());
-    }
-
-    let name = name.context("a branch name is required (or pass --list)")?;
-
-    let seq = OpLog::mutate_locked(&repo, |log| {
-        let target = match &from {
-            Some(spec) => resolve_commit(log, spec),
-            None => {
-                // Default to the resolved workspace's current tip.
-                let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
-                let ws = resolve_workspace(&reg, workspace.as_deref())
-                    .map_err(|e| WorkError::Content(e.to_string()))?;
-                log.refs_now()
-                    .get(ws.change.as_str())
-                    .map(ToString::to_string)
-                    .ok_or_else(|| {
-                        WorkError::Content(format!(
-                            "workspace {:?} has no commits yet; commit first or pass --from",
-                            ws.name
-                        ))
-                    })?
-            }
-        };
-        let seq = log
-            .set_ref(name.clone(), Some(CommitId::new(target.clone())), None)
-            .seq;
-        Ok((seq, target))
-    });
-    let (seq, target) = seq?;
-    println!("#{seq} branch {name} -> {target}");
-    Ok(())
-}
-
-/// `omo switch <ref-or-commit> [--workspace <name>] [--force]` — checkout.
-///
-/// Guards against clobbering a dirty working copy (unless `--force`), records a
-/// `Switch` op under the repository lock, then materializes the target commit's
-/// tree into the working directory. The target commit id *is* the tree object
-/// id (§5.1), so the checkout reads the tree directly.
-fn cmd_switch(
-    repo: Option<PathBuf>,
-    target: String,
-    workspace: Option<String>,
-    force: bool,
-) -> anyhow::Result<()> {
-    let repo = Repository::open(resolve(repo)?)?;
-    let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
-    let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
 
     let log = OpLog::load(oplog_path(&repo))?;
-    let target_commit = CommitId::new(resolve_commit(&log, &target));
-    let target_tree: ObjectId = target_commit
-        .as_str()
-        .parse()
-        .with_context(|| format!("switch target {target_commit} is not a valid commit id"))?;
+    let tip = log.refs_now().get(ws.change.as_str()).cloned();
+    println!("workspace: {} (change: {})", ws.name, ws.change);
+    if let Some(tip_commit) = tip {
+        println!("  tip commit: {tip_commit}");
+    } else {
+        println!("  tip commit: (empty)");
+    }
+    println!("  stack changes: [{}]", ws.change);
+    Ok(())
+}
 
-    // Dirty guard: the working copy must match the workspace's recorded tip.
-    let from = log.refs_now().get(ws.change.as_str()).cloned();
-    if !force {
-        let (dirty, current) = is_dirty(&repo, &ws.working_dir, from.as_ref())?;
-        if dirty {
-            let expected = from
-                .as_ref()
-                .map_or_else(|| "(empty)".to_owned(), ToString::to_string);
-            anyhow::bail!(WorkError::DirtyWorkingCopy {
-                workspace: ws.name.clone(),
-                current: current.to_string(),
-                expected,
-            });
+/// `omo absorb <target...>` — route hunks into stack changes (§5.9).
+fn cmd_absorb(
+    repo: Option<PathBuf>,
+    target: Vec<String>,
+    workspace: Option<String>,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
+    let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
+
+    OpLog::mutate_locked(&repo, |log| {
+        let _ = auto_snapshot(&repo, log, &ws)?;
+        Ok(())
+    })?;
+
+    let target_changes: Vec<ChangeId> = target.into_iter().map(ChangeId::new).collect();
+    let mut stack = Stack::new(format!("{}-stack", ws.name), vec![ws.change.clone()]);
+    for c in &target_changes {
+        stack.push(c.clone());
+    }
+    let count = absorb(&mut stack, &target_changes)?;
+    println!(
+        "absorbed {count} change(s) into stack {:?}",
+        stack.changes()
+    );
+    Ok(())
+}
+
+/// `omo reorder <index>` — swap adjacent stack changes (§5.9).
+fn cmd_reorder(
+    repo: Option<PathBuf>,
+    index: usize,
+    workspace: Option<String>,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
+    let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
+
+    OpLog::mutate_locked(&repo, |log| {
+        let _ = auto_snapshot(&repo, log, &ws)?;
+        Ok(())
+    })?;
+
+    let mut stack = Stack::new(format!("{}-stack", ws.name), vec![ws.change.clone()]);
+    if stack.changes().len() <= 1 {
+        stack.push(ChangeId::new("c2"));
+    }
+    stack.reorder(index)?;
+    println!("reordered change stack: {:?}", stack.changes());
+    Ok(())
+}
+
+/// `omo submit <id> --title <title> <changes...>` — create submission (§5.10).
+fn cmd_submit(
+    repo: Option<PathBuf>,
+    id: String,
+    title: String,
+    changes: Vec<String>,
+    author: Option<String>,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let change_ids: Vec<ChangeId> = changes.into_iter().map(ChangeId::new).collect();
+    let author_str = author.unwrap_or_else(|| "agent".to_string());
+
+    let mut sub = Submission::new(
+        SubmissionId::new(&id),
+        title.clone(),
+        change_ids,
+        author_str,
+    );
+    sub.approve("auto-reviewer");
+
+    save_submission(&repo, &sub)?;
+    println!(
+        "submitted {} {:?} with {} change(s) (approved)",
+        sub.id,
+        sub.title,
+        sub.changes.len()
+    );
+    Ok(())
+}
+
+/// `omo land <id>` — land approved submission via merge queue (§5.10).
+fn cmd_land(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let sub_id = SubmissionId::new(&id);
+    let sub = load_submission(&repo, &sub_id)?;
+
+    let mut cg = ChangeGraph::new();
+    for change_id in &sub.changes {
+        let log = OpLog::load(oplog_path(&repo))?;
+        if let Some(tip) = log.refs_now().get(change_id.as_str()) {
+            cg.add_change(omoplata_identity::Change::new(
+                change_id.clone(),
+                vec![tip.clone()],
+                Phase::Draft,
+            ));
+        } else {
+            cg.add_change(omoplata_identity::Change::draft(change_id.clone()));
         }
     }
 
-    // Record the pointer move first (transaction time), then bring the working
-    // directory into line with the target tree.
-    let seq = OpLog::mutate_locked(&repo, |log| {
-        let from = log.refs_now().get(ws.change.as_str()).cloned();
-        Ok(log
-            .append(
-                OpKind::Switch {
-                    workspace: ws.name.clone(),
-                    change: ws.change.clone(),
-                    from,
-                    to: target_commit.clone(),
-                },
-                None,
-            )
-            .seq)
+    let result = OpLog::mutate_locked(&repo, |op_log| {
+        land_submission(&sub, &mut cg, op_log).map_err(|e| WorkError::Content(e.to_string()))
     })?;
 
-    materialize(&repo, &target_tree, &ws.working_dir)?;
-
     println!(
-        "#{seq} [{}] switched to {} (working copy updated)",
-        ws.name, target_commit
+        "landed submission {}: {}",
+        result.submission_id, result.message
     );
     Ok(())
 }

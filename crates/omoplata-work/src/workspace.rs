@@ -61,6 +61,7 @@ use omoplata_store::{atomic_write, EntryKind, Object, ObjectId, Repository, Tree
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkError;
+use crate::oplog::{OpKind, OpLog};
 
 /// Control-directory names that a snapshot never descends into and a checkout
 /// never removes: the omoplata store and any colocated git directory.
@@ -423,6 +424,39 @@ pub fn is_dirty(
         }
     };
     Ok((current != expected, current))
+}
+
+/// Auto-snapshot a workspace's working copy into a new commit if dirty (§5.1, P4).
+///
+/// If the working directory has uncommitted changes compared to `ws.change`'s tip,
+/// snapshots the working directory into an omoplata tree commit, advances
+/// `ws.change`'s tip in the op log, and appends a `Commit` op. Returns `(CommitId, bool)`
+/// where `bool` is `true` if a new snapshot commit was created.
+pub fn auto_snapshot(
+    repo: &Repository,
+    oplog: &mut OpLog,
+    ws: &Workspace,
+) -> Result<(CommitId, bool), WorkError> {
+    let current_tip = oplog.refs_now().get(ws.change.as_str()).cloned();
+    let (dirty, current_commit) = is_dirty(repo, &ws.working_dir, current_tip.as_ref())?;
+    if dirty {
+        let tree_id = snapshot(repo, &ws.working_dir)?;
+        let new_commit = CommitId::new(tree_id.to_string());
+        let msg = format!("auto-snapshot workspace {}", ws.name);
+        oplog.append(
+            OpKind::Commit {
+                workspace: ws.name.clone(),
+                change: ws.change.clone(),
+                parent: current_tip,
+                tree: new_commit.clone(),
+                message: Some(msg.clone()),
+            },
+            Some(msg),
+        );
+        Ok((new_commit, true))
+    } else {
+        Ok((current_commit, false))
+    }
 }
 
 #[cfg(test)]

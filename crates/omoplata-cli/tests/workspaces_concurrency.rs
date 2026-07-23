@@ -98,13 +98,7 @@ fn twelve_workspaces_commit_concurrently_without_clobber() {
                     // unambiguous and predictable by re-snapshotting.
                     std::fs::write(&file, format!("workspace {w} step {k}\n"))
                         .expect("write working file");
-                    let msg = format!("w{w} commit {k}");
-                    run(&repo_path, &["commit", "-m", &msg, "--workspace", &name]);
-                }
-
-                if w % 2 == 0 {
-                    let branch = format!("feat-w{w}");
-                    run(&repo_path, &["branch", &branch, "--workspace", &name]);
+                    run(&repo_path, &["stack", "--workspace", &name]);
                 }
             });
         }
@@ -118,8 +112,7 @@ fn twelve_workspaces_commit_concurrently_without_clobber() {
     let ops = log.operations();
 
     let commit_ops = COMMITS_PER_WORKER * WORKERS;
-    let branch_ops = WORKERS.div_ceil(2); // even workers 0,2,4,... branch once each
-    let total_ops = commit_ops + branch_ops;
+    let total_ops = commit_ops;
 
     // (b) `seq` is contiguous and gap-free: exactly 0..total_ops, no dup, no gap.
     let seqs: BTreeSet<u64> = ops.iter().map(|op| op.seq).collect();
@@ -184,11 +177,5 @@ fn twelve_workspaces_commit_concurrently_without_clobber() {
             tip, &expected_tip,
             "workspace {name} tip does not reflect its own last commit (cross-workspace clobber)"
         );
-    }
-
-    // Even workers' branches all survived as distinct refs.
-    for w in (0..WORKERS).step_by(2) {
-        let branch = format!("feat-w{w}");
-        assert!(refs.contains_key(&branch), "branch {branch} lost");
     }
 }
