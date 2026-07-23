@@ -788,6 +788,19 @@ fn cmd_submit(
     let change_ids: Vec<ChangeId> = changes.into_iter().map(ChangeId::new).collect();
     let author_str = author.unwrap_or_else(|| "agent".to_string());
 
+    if let Ok(reg) = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo)) {
+        let _ = OpLog::mutate_locked(&repo, |op_log| {
+            for change_id in &change_ids {
+                for ws in reg.workspaces() {
+                    if &ws.change == change_id || ws.name == change_id.as_str() {
+                        let _ = auto_snapshot(&repo, op_log, ws);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+
     let mut sub = Submission::new(
         SubmissionId::new(&id),
         title.clone(),
@@ -811,6 +824,19 @@ fn cmd_land(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let sub_id = SubmissionId::new(&id);
     let sub = load_submission(&repo, &sub_id)?;
+
+    if let Ok(reg) = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo)) {
+        let _ = OpLog::mutate_locked(&repo, |op_log| {
+            for change_id in &sub.changes {
+                for ws in reg.workspaces() {
+                    if &ws.change == change_id || ws.name == change_id.as_str() {
+                        let _ = auto_snapshot(&repo, op_log, ws);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
 
     let mut cg = ChangeGraph::new();
     for change_id in &sub.changes {

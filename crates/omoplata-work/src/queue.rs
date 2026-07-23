@@ -54,19 +54,18 @@ pub fn land_submission(
         landed_changes.push(change_id.clone());
 
         // Append a ref operation representing the public landing of this change tip.
-        if let Some(tip) = change_graph.tip(change_id) {
-            let ref_name = format!("public/{}", change_id.as_str());
-            let old_ref = op_log.refs_now().get(&ref_name).cloned();
+        let ref_name = format!("public/{}", change_id.as_str());
+        let old_ref = op_log.refs_now().get(&ref_name).cloned();
+        let tip = change_graph.tip(change_id).cloned();
 
-            op_log.append(
-                OpKind::SetRef {
-                    name: ref_name,
-                    old: old_ref,
-                    new: Some(tip.clone()),
-                },
-                Some(format!("land change {}", change_id)),
-            );
-        }
+        op_log.append(
+            OpKind::SetRef {
+                name: ref_name,
+                old: old_ref,
+                new: tip,
+            },
+            Some(format!("land change {}", change_id)),
+        );
     }
 
     Ok(LandResult {
