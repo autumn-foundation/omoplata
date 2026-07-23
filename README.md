@@ -58,6 +58,24 @@ directory); `init`/`status` take a positional path.
 | `omo hash-object [--repo DIR] <path>` | Store a file as a blob and print its `sha256:` id (`-` reads stdin). | `omo hash-object README.md` |
 | `omo cat-object [--repo DIR] <id>` | Print a stored object: blob bytes, or a tree listing. | `omo cat-object sha256:…` |
 
+### Workspaces and Change Stacks (§5.9)
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `omo workspace add <name> <dir>` | Register a working copy directory for an agent/user workspace. | `omo workspace add w1 ./wc` |
+| `omo workspace list` | List all active registered workspaces and their working directories. | `omo workspace list` |
+| `omo workspace remove <name>` | Unregister a workspace. | `omo workspace remove w1` |
+| `omo stack [--workspace WS]` | View linear change stack; auto-snapshots working copy modifications into tree commits (P4). | `omo stack --workspace w1` |
+| `omo absorb <change...>` | Auto-route working copy edits to stack changes by definition identity. | `omo absorb c1 c2` |
+| `omo reorder <index>` | Swap adjacent changes in a stack (carrying conflict values if non-disjoint). | `omo reorder 0` |
+
+### Submissions and Merge Queue (§5.10)
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `omo submit <id> --title "..." <change...>` | Create a review submission for change ID revsets with approval certificates. | `omo submit sub-101 --title "Add auth" ws/w1` |
+| `omo land <submission-id>` | Land approved submission through the merge queue, transitioning phase from `Draft` to `Public`. | `omo land sub-101` |
+
 ### Definitions
 
 | Command | Description | Example |
@@ -96,8 +114,9 @@ directory); `init`/`status` take a positional path.
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `omo dup <file.rs>... [--threshold T] [--real-embeddings]` | Flag likely duplicate definitions across files (convergent work before it collides). | `omo dup a.rs b.rs` |
-| `omo similar <query> <file.rs>... [--top K] [--real-embeddings]` | Rank definitions by similarity to a free-text query. | `omo similar "area of rectangle" a.rs` |
+| `omo dup [file.rs]... [--threshold T]` | Flag likely duplicate definitions across active workspaces or specified files (convergent work before textual collision). | `omo dup` |
+| `omo similar <query> <file.rs>... [--top K]` | Rank definitions by similarity to a free-text query. | `omo similar "area of rectangle" a.rs` |
+
 
 `--real-embeddings` uses a real transformer model (`all-MiniLM-L6-v2`, 384-dim)
 instead of the deterministic hashing stand-in. It requires the binary built with

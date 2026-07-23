@@ -17,7 +17,8 @@ use omoplata_identity::{
     MatchStatus, Phase, Submission, SubmissionId,
 };
 use omoplata_sem::{
-    embed_definitions, find_duplicates, search, Embedded, Embedder, HashingEmbedder,
+    embed_definitions, embed_workspace_dir, find_duplicates, search, Embedded, Embedder,
+    HashingEmbedder,
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
@@ -305,8 +306,7 @@ enum Command {
     /// as `<score>  <file>:<def> ~ <file>:<def>`, or `no likely duplicate
     /// definitions` if none.
     Dup {
-        /// The Rust source files to scan (two or more for cross-file duplicates).
-        #[arg(required = true)]
+        /// The Rust source files to scan. If empty, automatically scans all active registered workspaces in the repository.
         files: Vec<PathBuf>,
         /// Cosine-similarity threshold in [0, 1]; pairs at or above are flagged.
         #[arg(long, default_value_t = 0.85)]
@@ -319,6 +319,9 @@ enum Command {
         /// `--threshold` (e.g. 0.5) with `--real-embeddings`.
         #[arg(long)]
         real_embeddings: bool,
+        /// Path to the repository root (defaults to current working directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Semantic search: rank definitions by similarity to a query (§5.7).
     ///
@@ -560,7 +563,8 @@ fn run() -> anyhow::Result<i32> {
             files,
             threshold,
             real_embeddings,
-        } => cmd_dup(files, threshold, real_embeddings).map(|()| 0),
+            repo,
+        } => cmd_dup(repo, files, threshold, real_embeddings).map(|()| 0),
         Command::Similar {
             query,
             files,
@@ -1655,10 +1659,42 @@ where
     f(&embedder)
 }
 
-/// `omo dup <file.rs>...` — flag likely duplicate definitions across files (§5.7).
-fn cmd_dup(files: Vec<PathBuf>, threshold: f32, real: bool) -> anyhow::Result<()> {
+/// `omo dup [file.rs]...` — flag likely duplicate definitions across active workspaces or specified files (§5.7).
+fn cmd_dup(
+    repo: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    threshold: f32,
+    real: bool,
+) -> anyhow::Result<()> {
     with_embedder(real, |embedder| {
-        let (corpus, labels) = embed_corpus(embedder, &files)?;
+        let (corpus, labels) = if files.is_empty() {
+            let root = resolve(repo)?;
+            let repo_obj = Repository::open(&root)?;
+            let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo_obj))?;
+            let mut corpus = Vec::new();
+            let mut labels = Vec::new();
+
+            for ws in reg.workspaces() {
+                let embedded_items = embed_workspace_dir(embedder, Some(&ws.name), &ws.working_dir)
+                    .with_context(|| format!("failed to scan workspace {}", ws.name))?;
+                for item in embedded_items {
+                    let label = format!(
+                        "workspace {} ({}:{})",
+                        ws.name,
+                        item.item.file_path.display(),
+                        item.item.def.name
+                    );
+                    corpus.push(Embedded {
+                        item: item.item.def,
+                        vector: item.vector,
+                    });
+                    labels.push(label);
+                }
+            }
+            (corpus, labels)
+        } else {
+            embed_corpus(embedder, &files)?
+        };
 
         let dups = find_duplicates(&corpus, threshold);
         if dups.is_empty() {

@@ -67,7 +67,20 @@ pub use error::SemError;
 pub use real::FastEmbedder;
 pub use vector::cosine;
 
+use std::path::{Path, PathBuf};
+
 use omoplata_identity::{extract_definitions, Definition};
+
+/// Location of a definition within a workspace or file scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDefLocation {
+    /// Workspace name (e.g. `Some("w1")`), or `None` if scanning explicit files.
+    pub workspace: Option<String>,
+    /// File path relative to workspace or repository root.
+    pub file_path: PathBuf,
+    /// The extracted definition.
+    pub def: Definition,
+}
 
 /// A value paired with its embedding vector — "typed embeddings per node"
 /// (§5.7).
@@ -116,6 +129,62 @@ pub fn embed_definitions<E: Embedder + ?Sized>(
             Embedded { item: def, vector }
         })
         .collect())
+}
+
+/// Recursively scan `dir` for `.rs` files (skipping `.omoplata` and `.git`),
+/// extract definitions, and embed each one.
+///
+/// Yields `Embedded<WorkspaceDefLocation>` items tagging each definition with its
+/// workspace name and file path relative to `dir`.
+///
+/// # Errors
+///
+/// Returns [`SemError`] if directory traversal fails.
+pub fn embed_workspace_dir<E: Embedder + ?Sized>(
+    embedder: &E,
+    workspace_name: Option<&str>,
+    dir: &Path,
+) -> Result<Vec<Embedded<WorkspaceDefLocation>>, SemError> {
+    let mut results = Vec::new();
+    if !dir.exists() {
+        return Ok(results);
+    }
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == ".omoplata" || name_str == ".git" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                if let Ok(source) = std::fs::read_to_string(&path) {
+                    if let Ok(defs) = extract_definitions(&source) {
+                        let rel_path = path.strip_prefix(dir).unwrap_or(&path).to_path_buf();
+                        for def in defs {
+                            let vector = embedder.embed(&definition_text(&source, &def));
+                            results.push(Embedded {
+                                item: WorkspaceDefLocation {
+                                    workspace: workspace_name.map(String::from),
+                                    file_path: rel_path.clone(),
+                                    def,
+                                },
+                                vector,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Semantic search: the top-`k` corpus indices most similar to `query`.
