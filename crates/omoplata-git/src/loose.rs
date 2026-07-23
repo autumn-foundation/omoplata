@@ -163,9 +163,9 @@ pub fn walk_loose(git_dir: &Path) -> Result<Vec<(GitOid, GitObject)>, GitError> 
 
 /// Count the `*.pack` files under `<git_dir>/objects/pack`.
 ///
-/// v1 decodes loose objects only; a non-zero count means some objects live in
-/// packfiles this crate does not decode. Callers use it to refuse a false PASS
-/// rather than silently skipping packed objects (§8 scope; see ADR-0005).
+/// Packed objects are decoded and verified alongside loose objects by
+/// [`crate::pack::read_all_packs`]. This count is included in [`crate::GitReport`]
+/// as informational metadata.
 #[must_use]
 pub fn pack_file_count(git_dir: &Path) -> usize {
     let pack_dir = git_dir.join("objects").join("pack");

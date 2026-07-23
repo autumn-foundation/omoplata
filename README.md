@@ -209,12 +209,7 @@ the definitive statement of what is *not* yet the real thing:
 - The **I8 runtime kernel-admission check** (every merge result carries a checked
   commutation witness or is a Conflict value) is not hosted as a single enforced
   boundary the drivers pass through — future work.
-- Git **wire protocol** (networked fetch/push) and **packfile decoding** are git
-  future work. Commit-graph import and exact-mode loose-object export (closing
-  the I9 `import → export → bit-identical` loop at the repository level) are
-  implemented; the outstanding gap is the network protocol and packfile/delta
-  decoding (loose objects round-trip end-to-end; packed objects error rather
-  than being silently skipped).
+- Git **packfile/delta decoding** (index v2, packfile v2/v3, `OFS_DELTA`, `REF_DELTA`) and **wire-protocol fetch over local transport** (`omo git fetch`) are implemented, closing the I9 `import → export → bit-identical` loop across both loose and packed objects. Outstanding git future work is **push (`receive-pack`)** (which requires a packfile encoder) and **networked (`http`/`ssh`) socket transports** (not offline-testable).
 - **Conflicts-as-values propagation through rebases** and **auto-rebase** (P3/P4
   beyond the op-log undo) are modeled in the algebra but not wired as a working
   rebase loop.
