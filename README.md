@@ -55,8 +55,8 @@ directory); `init`/`status` take a positional path.
 |---------|-------------|---------|
 | `omo init [path]` | Create a new omoplata repository (a `.omoplata/` control dir). | `omo init myrepo` |
 | `omo status [path]` | Show whether a directory is an initialized repository. | `omo status myrepo` |
-| `omo hash-object [--repo DIR] <path>` | Store a file as a blob and print its `sha256:` id (`-` reads stdin). | `omo hash-object README.md` |
-| `omo cat-object [--repo DIR] <id>` | Print a stored object: blob bytes, or a tree listing. | `omo cat-object sha256:…` |
+| `omo hash [--repo DIR] <path>` | Store a file as a blob and print its `sha256:` id (`-` reads stdin). | `omo hash README.md` |
+| `omo cat [--repo DIR] <id>` | Print a stored object: blob bytes, or a tree listing. | `omo cat sha256:…` |
 
 ### Workspaces and Change Stacks (§5.9)
 

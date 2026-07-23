@@ -83,13 +83,13 @@ No working changes tracked yet (scaffold).
 `cat-file`):
 
 ```console
-$ printf 'hello omoplata\n' > greeting.txt
+$ printf 'hello world\n' > greeting.txt
 
-$ omo hash-object greeting.txt
+$ omo hash greeting.txt
 sha256:af1b245b018dc132a0441a20d6eb17920a98354989a9d4941d9e337ec17ff836
 
-$ omo cat-object sha256:af1b245b018dc132a0441a20d6eb17920a98354989a9d4941d9e337ec17ff836
-hello omoplata
+$ omo cat sha256:af1b245b018dc132a0441a20d6eb17920a98354989a9d4941d9e337ec17ff836
+hello world
 ```
 
 **Diff two versions.**
@@ -197,7 +197,7 @@ and now two names coexist:
 ```console
 $ printf 'title: notes\nbody: feature draft\n' > notes.feature.txt
 
-$ omo hash-object notes.feature.txt
+$ omo hash notes.feature.txt
 sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
 
 $ omo ref set feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
@@ -233,19 +233,21 @@ your working directory. So you never "check out" `feature` into the working dir
 the way `git switch feature` would.
 
 What you *can* do is inspect stored state without touching your working files —
-list refs, and read an object's bytes back with `omo cat-object`:
+list refs, and read an object's bytes back with `omo cat`:
 
 ```console
 $ omo ref list
-feature sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-main sha256:1ef630955351b20cb2c72e3cdcd11a00c74dae5a938c12ec65d85ac1a48e2d3f
+main sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
 
-$ omo cat-object sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
+$ omo cat sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
 title: notes
-body: feature draft
+body: first draft
+
+$ omo cat main
+error: sha256 prefix required (e.g. 'sha256:abcd...')
 ```
 
-To act on a ref's content you redirect `omo cat-object` into a file yourself and
+To act on a ref's content you redirect `omo cat` into a file yourself and
 diff it — there is no command that swaps your working tree to match a ref. This is
 the single biggest gap versus git, and the one workspaces is designed to close.
 
@@ -300,8 +302,8 @@ now, treat the flow above as the honest truth of what runs today.
 | You know (git) | omoplata | Notes |
 |----------------|----------|-------|
 | `git init` | `omo init [path]` | Creates a `.omoplata/` control dir. |
-| `git hash-object -w` | `omo hash-object <path>` | Prints a `sha256:` object id (`-` reads stdin). |
-| `git cat-file -p` | `omo cat-object <id>` | Blob bytes, or a tree listing. |
+| `git hash-object -w` | `omo hash <path>` | Prints a `sha256:` object id (`-` reads stdin). |
+| `git cat-file -p` | `omo cat <id>` | Blob bytes, or a tree listing. |
 | `git diff` | `omo diff <base> <target>` | Unified-ish line diff. |
 | `git merge` | `omo merge <base> <left> <right>` | Three-way line merge; conflicts become values, exit non-zero. |
 | `git merge-file` | `omo merge-file <base> <left> <right>` | Tier-2 structural merge by extension, then kernel-checked (§6). |

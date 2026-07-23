@@ -1,5 +1,6 @@
 //! `omo` — the omoplata command-line interface.
 
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -55,7 +56,8 @@ enum Command {
         path: Option<PathBuf>,
     },
     /// Hash a file's contents into the object store as a blob and print its id.
-    HashObject {
+    #[command(alias = "hash-object")]
+    Hash {
         /// File to read (use `-` for stdin).
         path: PathBuf,
         /// Repository directory (defaults to the current directory).
@@ -63,7 +65,8 @@ enum Command {
         repo: Option<PathBuf>,
     },
     /// Print a stored object by id (blob bytes, or a tree listing).
-    CatObject {
+    #[command(alias = "cat-object")]
+    Cat {
         /// Object id, e.g. `sha256:abcd…`.
         id: String,
         /// Repository directory (defaults to the current directory).
@@ -495,8 +498,8 @@ fn run() -> anyhow::Result<i32> {
     match Cli::parse().command {
         Command::Init { path } => cmd_init(path).map(|()| 0),
         Command::Status { path } => cmd_status(path).map(|()| 0),
-        Command::HashObject { path, repo } => cmd_hash_object(repo, path).map(|()| 0),
-        Command::CatObject { id, repo } => cmd_cat_object(repo, id).map(|()| 0),
+        Command::Hash { path, repo } => cmd_hash(repo, path).map(|()| 0),
+        Command::Cat { id, repo } => cmd_cat(repo, id).map(|()| 0),
         Command::Diff { base, target } => cmd_diff(base, target).map(|()| 0),
         Command::Merge { base, left, right } => cmd_merge(base, left, right),
         Command::MergeFile {
@@ -968,21 +971,26 @@ fn cmd_status(path: Option<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_hash_object(repo: Option<PathBuf>, path: PathBuf) -> anyhow::Result<()> {
+/// `omo hash <path>` — store a file as a blob and print its id.
+fn cmd_hash(repo: Option<PathBuf>, path: PathBuf) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
-    let bytes = if path == Path::new("-") {
+    let bytes = if path.as_os_str() == "-" {
         let mut buf = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)
-            .context("reading standard input")?;
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("failed to read stdin")?;
         buf
     } else {
-        std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?
+        std::fs::read(&path).with_context(|| format!("failed to read file {}", path.display()))?
     };
-    println!("{}", repo.write_blob(bytes)?);
+
+    let id = repo.write_blob(bytes)?;
+    println!("{id}");
     Ok(())
 }
 
-fn cmd_cat_object(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
+/// `omo cat <id>` — print a stored blob's bytes or a tree's listing.
+fn cmd_cat(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let oid: ObjectId = id
         .parse()

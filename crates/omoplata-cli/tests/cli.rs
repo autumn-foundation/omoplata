@@ -77,7 +77,7 @@ fn hash_object_then_cat_object() {
     std::fs::write(&file, b"hello omoplata\n").unwrap();
 
     let out = omo()
-        .args(["hash-object", "--repo"])
+        .args(["hash", "--repo"])
         .arg(dir.path())
         .arg(&file)
         .output()
@@ -88,7 +88,7 @@ fn hash_object_then_cat_object() {
     assert!(id.starts_with("sha256:"), "unexpected id: {id}");
 
     omo()
-        .args(["cat-object", "--repo"])
+        .args(["cat", "--repo"])
         .arg(dir.path())
         .arg(id)
         .assert()
@@ -101,7 +101,7 @@ fn cat_object_unknown_fails() {
     let dir = tempdir().unwrap();
     omo().arg("init").arg(dir.path()).assert().success();
     omo()
-        .args(["cat-object", "--repo"])
+        .args(["cat", "--repo"])
         .arg(dir.path())
         .arg("sha256:0000000000000000000000000000000000000000000000000000000000000000")
         .assert()
