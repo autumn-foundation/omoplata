@@ -1168,3 +1168,138 @@ fn dup_scans_live_workspaces_across_agents() {
         .stdout(predicate::str::contains("workspace agent_a"))
         .stdout(predicate::str::contains("workspace agent_b"));
 }
+
+// --- Backport certificates (ADR-0009, I5) ------------------------------------
+
+const FOO: &str = "fn foo() -> i32 {\n    1\n}\n";
+const BAR: &str = "fn bar() -> i32 {\n    2\n}\n";
+const BAZ: &str = "fn baz() -> i32 {\n    3\n}\n";
+
+/// Register a workspace `name` over a fresh dir holding `shared.rs = content`,
+/// snapshot it, submit it (auto-approved) as `sub`, and land it on trunk.
+fn land_change(root: &std::path::Path, name: &str, content: &str, sub: &str) {
+    let wc = root.join(format!("wc-{name}"));
+    std::fs::create_dir_all(&wc).unwrap();
+    std::fs::write(wc.join("shared.rs"), content).unwrap();
+    omo()
+        .args(["workspace", "add", name, wc.to_str().unwrap(), "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args(["stack", "--workspace", name, "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args([
+            "submit",
+            sub,
+            "--title",
+            sub,
+            &format!("ws/{name}"),
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args(["land", sub, "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+}
+
+/// Re-snapshot workspace `name`'s file to `content` without re-landing — the
+/// change's tip moves while its landed tip stays put ("moved since it landed").
+fn move_change(root: &std::path::Path, name: &str, content: &str) {
+    std::fs::write(root.join(format!("wc-{name}")).join("shared.rs"), content).unwrap();
+    omo()
+        .args(["stack", "--workspace", name, "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+}
+
+#[test]
+fn backport_identity_certificate_when_unchanged() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    land_change(root, "a", FOO, "sub-a");
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    // Unmoved: byte-identical to the reviewed tip → identity certificate.
+    omo()
+        .args(["backport", "sub-a", "--to", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backported sub-a"))
+        .stdout(predicate::str::contains("1 identity, 0 commutation"))
+        .stderr(predicate::str::contains("identity"));
+}
+
+#[test]
+fn backport_commutation_certificate_carries_moved_but_disjoint() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+
+    // A authors `foo` and lands; B lands `foo`+`bar` (a disjoint definition).
+    land_change(root, "a", FOO, "sub-a");
+    land_change(root, "b", &format!("{FOO}{BAR}"), "sub-b");
+
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // A rebases past B: its file gains `bar`, which already landed on trunk.
+    // The reviewed definition (`foo`) is untouched, so the approval commutes.
+    move_change(root, "a", &format!("{FOO}{BAR}"));
+
+    omo()
+        .args(["backport", "sub-a", "--to", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("backported sub-a"))
+        .stdout(predicate::str::contains("0 identity, 1 commutation"))
+        .stderr(predicate::str::contains(
+            "commutation (Tier-0 disjoint support",
+        ))
+        .stderr(predicate::str::contains("fn bar"));
+}
+
+#[test]
+fn backport_refuses_moved_novel_definition() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+
+    land_change(root, "a", FOO, "sub-a");
+    land_change(root, "b", &format!("{FOO}{BAR}"), "sub-b");
+
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // A's move introduces `baz` — a definition that never landed anywhere, so
+    // it was never reviewed. The carry cannot be witnessed; backport refuses.
+    move_change(root, "a", &format!("{FOO}{BAZ}"));
+
+    omo()
+        .args(["backport", "sub-a", "--to", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("disturbed definition(s)"))
+        .stderr(predicate::str::contains("fn baz"));
+}

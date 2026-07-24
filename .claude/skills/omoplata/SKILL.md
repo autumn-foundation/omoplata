@@ -1,18 +1,19 @@
 ---
 name: omoplata
 description: >-
-  Drive the `omo` CLI (omoplata) to do version control the omoplata way — the
-  right way, not by reaching for git habits. Use this whenever you are working
-  inside an omoplata repository (a `.omoplata/` control dir), running any `omo`
-  subcommand, or an agent/task involves omoplata's workflow: per-agent
-  workspaces, change stacks, submissions and approvals, landing through named
-  merge queues, release lines, batch landing, backports, the Tier-2 structural
-  merge (`omo merge-file`), conflicts-as-values (`omo conflicts`), or revsets
-  (`omo revset`). Especially reach for this in multi-agent / swarm development
-  against a shared omoplata repo, where using it correctly (workspaces +
-  submit/land, not files + branches) is the whole point. If a task says "land",
-  "submit", "merge", "backport", "release line", or "queue" against an omoplata
-  repo, this skill applies even if `omo` is not named explicitly.
+  Use whenever a task involves omoplata or its `omo` CLI — a standalone version
+  control system that is NOT git, recognized by the word "omoplata", an `omo`
+  command, or a `.omoplata/` directory in the project. Trigger for anything in
+  that world: getting edited files into review, submitting/approving/landing/
+  backporting changes, merge queues, release lines, batch landing, structural
+  file merges (`merge-file`), resolving or carrying conflicts, or writing
+  revsets. Trigger especially for multi-agent or swarm work over one shared
+  omoplata repo — one workspace per agent, submitting and landing independently
+  without clobbering. Also trigger to interpret `omo` output: exit codes,
+  "carried forward" and "not approved" messages, conflict values. Any land/
+  submit/merge/backport/queue/workspace/revset task in an omoplata context
+  belongs here, even if `omo` is never typed. Do NOT trigger for git, GitHub,
+  darcs, or generic release-planning equivalents.
 ---
 
 # Driving omoplata (`omo`)
@@ -131,10 +132,13 @@ omo land sub-42 --queue release-1.2       # gated on approval, carried-conflict 
   posture). A refused landing mutates nothing.
 - **Backport = the same change landing in a second queue**, identity preserved,
   no cherry-pick: `omo backport sub-42 --to release-1.2`. It carries the approval
-  forward under a certificate when the content is byte-identical to what was
-  reviewed; content that moved since it landed is refused pending re-review.
-  After every land, `omo` prints the available backport commands for sibling
-  queues.
+  forward under one of two **certificates**: *identity* when the content is
+  byte-identical to what was reviewed, or *commutation* when the change moved
+  since it landed (rebased past intervening landings) but every definition it
+  changed matches the source queue's landed history — so nothing the reviewer
+  approved was altered. A move that invents an unreviewed definition is refused
+  pending re-review, naming the definition. After every land, `omo` prints the
+  available backport commands for sibling queues.
 - **"What still needs backporting" is a query, not a branch diff:**
   `omo revset 'landed(trunk) & ~landed(release-1.2)'`.
 

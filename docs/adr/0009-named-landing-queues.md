@@ -132,8 +132,18 @@ base*, computed by `rust_support`; two agents editing different definitions of
 one file batch, while a shared definition refuses the batch naming it —
 containers compare by their shell so member additions stay disjoint), and
 **mechanical backport offers** (`omo backport` carries approval forward with an
-*identity* certificate — content byte-identical to the reviewed, landed tip;
-moved content demands re-review).
+*identity* certificate — content byte-identical to the reviewed, landed tip),
+and **commutation-certificate backports for moved content** (I5): when a change
+has moved since it landed because it rebased past intervening landings,
+`omo backport` still carries the approval forward under a *commutation*
+certificate, provided every definition the move changed matches the source
+queue's landed history (`support(reviewed → current) ∩ support(source queue
+minus this change → current) = ∅`) — so no definition the reviewer approved was
+altered and every changed definition came from an already-reviewed landing. A
+move that invents an unreviewed definition still refuses, naming it. Matching
+the queue's landed truth can never be forged: it requires some *other* landed
+change to actually carry that definition, so invented content cannot masquerade
+as reviewed (I8).
 
 Still open:
 
@@ -142,12 +152,12 @@ Still open:
   revocable assertions. When that model lands, `require_approval: bool`
   generalizes to a count or reviewer-set predicate without changing the gate's
   shape.
-- **Commutation-certificate backports for moved content** (I5): today's
-  backport certificate covers only the identity case; a checked-commutation
-  certificate would carry approval across content that provably rebased
-  cleanly. The same algebra would sharpen batch disjointness from "changed the
-  same definition" to "changed the same definition *incompatibly*", letting
-  line-disjoint edits to one definition batch too.
+- **Incompatible-change batch disjointness.** The commutation backport (I5,
+  above) reasons about a definition matching landed history; the *same* algebra
+  would sharpen batch disjointness from "changed the same definition" to
+  "changed the same definition *incompatibly*", letting provably line-disjoint
+  edits to one definition batch too. Batch landing today still refuses any pair
+  that touches a shared definition, disjoint lines or not.
 - **`queued()`** awaits persistent queue membership (landing is immediate in
   v1), which arrives with the single-writer landing daemon (ADR-0008 Option C)
   that owns all queues.
