@@ -1,0 +1,34 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -61,3 +61,31 @@
+         self.tasks.len()
+     }
+ }
++
++/// Return a short human-readable summary of the queue, e.g. "3 task(s) queued".
++pub fn queue_stats(q: &TaskQueue) -> String {
++    format!("{} task(s) queued", q.len())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn pop_returns_higher_priority_first() {
++        let mut q = TaskQueue::new();
++        q.push(Task {
++            id: 1,
++            name: "low".to_string(),
++            priority: Priority::Low,
++        });
++        q.push(Task {
++            id: 2,
++            name: "high".to_string(),
++            priority: Priority::High,
++        });
++        let first = q.pop().expect("queue should not be empty");
++        assert_eq!(first.priority, Priority::High);
++        assert_eq!(first.id, 2);
++    }
++}

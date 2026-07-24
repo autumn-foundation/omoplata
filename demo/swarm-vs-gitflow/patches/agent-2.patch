@@ -1,0 +1,24 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -61,3 +61,21 @@
+         self.tasks.len()
+     }
+ }
++
++/// Configuration for retrying failed tasks with exponential backoff.
++#[derive(Debug, Clone)]
++pub struct RetryPolicy {
++    pub max_attempts: u32,
++    pub base_delay_ms: u64,
++}
++
++/// Delay before the given retry attempt, in milliseconds.
++///
++/// Exponential backoff: `base_delay_ms * 2^attempt`, saturating on overflow.
++/// Attempts at or beyond `max_attempts` are capped at `max_attempts`.
++pub fn retry_delay_ms(policy: &RetryPolicy, attempt: u32) -> u64 {
++    let attempt = attempt.min(policy.max_attempts);
++    policy
++        .base_delay_ms
++        .saturating_mul(1u64.checked_shl(attempt).unwrap_or(u64::MAX))
++}
