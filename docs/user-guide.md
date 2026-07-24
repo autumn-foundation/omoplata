@@ -281,14 +281,43 @@ error: submissions sub-c and sub-d overlap on 1 path(s) (src/lib.rs (fn priority
 ```
 
 `omo backport` lands an already-landed submission into a second queue with its
-**approval carried forward under a certificate** (§5.10). The v1 certificate is
-the identity witness — the change's tip is byte-identical to the tip that was
-reviewed and landed, so nothing needs re-review; content that moved since its
-landing refuses with a re-review demand instead:
+**approval carried forward under a certificate** (§5.10). Two witnesses are
+admitted, strongest first:
+
+- **identity** — the change's tip is byte-identical to the tip that was reviewed
+  and landed, so nothing needs re-review;
+- **commutation** (I5) — the change *moved* since it landed because it rebased
+  past intervening landings, but every definition the move changed matches the
+  source queue's landed history, and no definition the reviewer approved was
+  altered. The approval commutes to what lands. (Checked as
+  `support(reviewed → current) ∩ support(source queue minus this change →
+  current) = ∅`.)
+
+A move that invents a definition present neither in the review nor in the
+source queue's landed history was never reviewed anywhere, so it refuses with a
+re-review demand naming the definition.
 
 ```console
 $ omo backport sub-alpha --to release-1.2
-backported sub-alpha: Submission sub-alpha landed in queue release-1.2 (approval by auto-reviewer carried forward: 1 certificate(s), witness: identity — content unchanged since review)
+backported sub-alpha: Submission sub-alpha landed in queue release-1.2 (approval by auto-reviewer carried forward under 1 certificate(s): 1 identity, 0 commutation)
+  ws/alpha: identity: content byte-identical to the tip reviewed and landed in trunk
+```
+
+If `sub-alpha` had since rebased past a sibling change that landed a *different*
+definition of the same file, its tip would have moved — but only over disjoint
+ground, so the approval still commutes:
+
+```console
+$ omo backport sub-alpha --to release-2.0
+backported sub-alpha: Submission sub-alpha landed in queue release-2.0 (approval by auto-reviewer carried forward under 1 certificate(s): 0 identity, 1 commutation)
+  ws/alpha: commutation (Tier-0 disjoint support, I10): the move rebased past 1 definition(s) [shared.rs (fn bar)], each matching trunk's landed history — no definition the review approved was altered
+```
+
+A move that instead introduced an unreviewed definition refuses (exit 2):
+
+```console
+$ omo backport sub-alpha --to release-3.0
+error: change ws/alpha moved since it landed in trunk, and the move disturbed definition(s) the review approved: shared.rs (fn baz). Approval cannot be carried forward — re-review and land the new content.
 ```
 
 What still needs backporting is a **revset query**, not a branch comparison —
@@ -810,9 +839,11 @@ what is not yet the real thing:
 - **Landing is immediate, not a persistent queue.** `omo land` applies queue
   policy and transitions `Draft → Public` synchronously; there is no standing
   queue membership, `queued()` revset, or single-writer landing daemon
-  (ADR-0008 Option C) yet. Approvals are single-reviewer, and batch/backport
-  soundness rests on identity/support witnesses rather than the general I5
-  commutation certificate (ADR-0009 future work).
+  (ADR-0008 Option C) yet. Approvals are single-reviewer. Backport carries
+  approval across moved content under an I5 commutation certificate (a changed
+  definition must match the source queue's landed history); batch landing still
+  refuses any pair touching a shared definition rather than checking whether
+  their edits are line-disjoint (ADR-0009 future work).
 - **Git transport is read-only and local.** There is no `git push` / `receive-pack` (which requires packfile encoding), and no networked (http/ssh) socket transports. `omo git fetch` works over the local `file://` / path transport — a real pkt-line / upload-pack clone — and full packfile/delta decoding (`OFS_DELTA`/`REF_DELTA`) is supported across `omo git fetch`, `import`, `verify`, and `export`.
 - **Real embeddings need the network on first use.** The offline default is a
   deterministic hashing stand-in (fully reproducible, no download). The real

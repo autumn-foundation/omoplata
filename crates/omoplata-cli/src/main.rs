@@ -315,11 +315,15 @@ enum Command {
         repo: Option<PathBuf>,
     },
     /// Land an already-landed submission into a second queue, carrying its
-    /// approval forward with a certificate (ADR-0009 backports).
+    /// approval forward with a certificate (ADR-0009 backports, I5).
     ///
-    /// Sound by identity: each change's tip must be byte-identical to the tip
-    /// reviewed and landed in the source queue; moved content refuses with a
-    /// re-review demand. The target queue's own gates still apply.
+    /// Two certificates are admitted. **Identity**: the change's tip is
+    /// byte-identical to the tip reviewed in the source queue. **Commutation**:
+    /// the change moved (rebased past intervening landings), but every changed
+    /// definition matches the source queue's landed history and none the review
+    /// approved was altered — so the approval commutes to what lands. A move
+    /// that invents an unreviewed definition refuses with a re-review demand
+    /// naming it. The target queue's own gates still apply.
     Backport {
         /// Submission ID to backport.
         id: String,
@@ -1117,12 +1121,23 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
 /// second queue, carrying its approval forward with a certificate (ADR-0009,
 /// §5.10 approval carry-forward).
 ///
-/// The carry-forward is sound by *identity*: each change's current tip must be
-/// byte-identical to the tip that was reviewed and landed in the source queue
-/// (the strongest commutation certificate — nothing changed, so nothing needs
-/// re-review). A change whose content moved since it landed refuses with a
-/// re-review demand instead. The target queue's own gates (carried values,
-/// P9 validation) still apply.
+/// Each change carries its source-queue approval forward under a *certificate*
+/// (§5.10, I5). Two witnesses are admitted, strongest first:
+///
+/// * **identity** — the change's current tip is byte-identical to the tip that
+///   was reviewed and landed in the source queue. Nothing changed, so nothing
+///   needs re-review.
+/// * **commutation (Tier-0 disjoint support, I10)** — the change *moved* since
+///   it landed (it was rebased past intervening landings), but every definition
+///   it changed matches the source queue's landed history, and none the reviewer
+///   approved was altered. Witnessed by intersecting the *moved* support
+///   (`reviewed → current`) with the *novel* support (`source queue minus this
+///   change → current`); an empty intersection is the certificate.
+///
+/// A move that disturbs a definition the review approved cannot be witnessed and
+/// refuses with a re-review demand naming the disturbed definitions (I8 — no
+/// silent wrong carry). The target queue's own gates (carried values, P9
+/// validation) still apply on top.
 fn cmd_backport(repo: Option<PathBuf>, id: String, to: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
@@ -1152,21 +1167,46 @@ fn cmd_backport(repo: Option<PathBuf>, id: String, to: String) -> anyhow::Result
                  backport carries an existing landing's approval forward"
             );
         };
-        if &landed_tip != tip {
-            anyhow::bail!(
-                "change {change_id} moved since it landed in {source_queue} \
-                 (reviewed {landed_tip}, now {tip}); approval cannot be carried \
-                 forward — re-review and land the new content"
-            );
-        }
+        let proof_witness = if &landed_tip == tip {
+            format!(
+                "identity: content byte-identical to the tip reviewed and landed in {source_queue}"
+            )
+        } else {
+            // The change moved since it landed. Admit the carry-forward only if
+            // the move commutes with the review — every definition the reviewer
+            // approved is byte-identical in the current content, the move having
+            // touched only disjoint definitions (I10). Otherwise refuse, naming
+            // what it disturbed (I8 — no silent wrong carry).
+            let reviewed_oid = landed_tip.as_str().parse::<ObjectId>().map_err(|_| {
+                anyhow::anyhow!("change {change_id}: landed tip {landed_tip} is not an object id")
+            })?;
+            let current_oid = tip.as_str().parse::<ObjectId>().map_err(|_| {
+                anyhow::anyhow!("change {change_id}: tip {tip} is not an object id")
+            })?;
+            match commutation_witness(
+                &repo,
+                &registry,
+                &refs,
+                &source_queue,
+                change_id,
+                &reviewed_oid,
+                &current_oid,
+            )? {
+                Ok(witness) => witness,
+                Err(disturbed) => anyhow::bail!(
+                    "change {change_id} moved since it landed in {source_queue}, and the move \
+                     disturbed definition(s) the review approved: {}. Approval cannot be carried \
+                     forward — re-review and land the new content.",
+                    disturbed.join(", ")
+                ),
+            }
+        };
         certificates.push(ApprovalCertificate {
             change_id: change_id.clone(),
             original_commit: landed_tip,
             rebased_commit: tip.clone(),
             approved_by: reviewer.clone(),
-            proof_witness: format!(
-                "identity: content byte-identical to the tip reviewed and landed in {source_queue}"
-            ),
+            proof_witness,
         });
         cg.add_change(omoplata_identity::Change::new(
             change_id.clone(),
@@ -1199,14 +1239,182 @@ fn cmd_backport(repo: Option<PathBuf>, id: String, to: String) -> anyhow::Result
     let result = OpLog::mutate_locked(&repo, |op_log| {
         land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)
     })?;
+    let commutation = certificates
+        .iter()
+        .filter(|c| !c.proof_witness.starts_with("identity"))
+        .count();
+    let identity = certificates.len() - commutation;
     println!(
-        "backported {}: {} (approval by {reviewer} carried forward: {} certificate(s), \
-         witness: identity — content unchanged since review)",
+        "backported {}: {} (approval by {reviewer} carried forward under {} certificate(s): \
+         {identity} identity, {commutation} commutation)",
         result.submission_id,
         result.message,
         certificates.len()
     );
+    for cert in &certificates {
+        eprintln!("  {}: {}", cert.change_id, cert.proof_witness);
+    }
     Ok(())
+}
+
+/// Witness whether an approval granted on `reviewed` (the tip landed in
+/// `source_queue`) still carries to `current` after the change moved.
+///
+/// The move is admitted (returns `Ok(witness)`) iff it commutes with the review
+/// at definition granularity (Tier-0, I10). Two supports are compared:
+///
+/// * `moved` — the definitions that differ between `reviewed` and `current`
+///   (what the move changed since review);
+/// * `novel` — the definitions where `current` differs from the source queue's
+///   landed truth *with this change excluded* (`Ssrc`).
+///
+/// A moved definition that is **also** novel is content the move invented — it
+/// matches neither the review nor anything that landed on the source queue, so
+/// it was never reviewed. A moved definition that is **not** novel matches an
+/// intervening landing: the change simply rebased past already-landed (already
+/// reviewed) content on that definition. So the carry is sound exactly when
+/// `moved ∩ novel = ∅` — then every definition the reviewer approved is intact
+/// and every changed definition came from a reviewed landing.
+///
+/// The intersection can never *wrongly* admit: matching `Ssrc` on a definition
+/// requires some other landed change to actually carry that value, so invented
+/// content cannot masquerade as landed. Excluding this change from `Ssrc` also
+/// removes the per-file overlay contention with `reviewed`, making the verdict
+/// deterministic. On a break it returns `Err(disturbed)` — the qualified names
+/// of the offending definitions — so the caller refuses with a re-review
+/// demand (I8, no silent wrong carry).
+fn commutation_witness(
+    repo: &Repository,
+    registry: &QueueRegistry,
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    source_queue: &str,
+    change: &ChangeId,
+    reviewed: &ObjectId,
+    current: &ObjectId,
+) -> anyhow::Result<Result<String, Vec<String>>> {
+    let scratch = repo
+        .control_dir()
+        .join("tmp")
+        .join(format!("backport-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating {}", scratch.display()))?;
+
+    let run = || -> anyhow::Result<Result<String, Vec<String>>> {
+        let reviewed_map = materialize_commit_map(repo, reviewed, &scratch.join("reviewed"))?;
+        let current_map = materialize_commit_map(repo, current, &scratch.join("current"))?;
+        // The change's own authored support is recovered against the source
+        // queue *minus this change's own landed ref* — so what remains is the
+        // definition text the review contributed on top of everything else.
+        // `Ssrc`: the source queue's landed truth with this change's own ref
+        // removed, so a definition that `current` shares with it can only have
+        // come from an intervening landing (not from this change).
+        let exclude = omoplata_work::queue_ref(source_queue, change);
+        let ssrc = materialize_queue_base(
+            repo,
+            registry,
+            refs,
+            source_queue,
+            &scratch.join("ssrc"),
+            Some(&exclude),
+        )?;
+
+        let mut files: BTreeSet<&String> = BTreeSet::new();
+        files.extend(reviewed_map.keys());
+        files.extend(current_map.keys());
+
+        let mut moved_defs: Vec<String> = Vec::new();
+        let mut disturbed: Vec<String> = Vec::new();
+        for file in files {
+            let reviewed_text = reviewed_map.get(file).map_or("", String::as_str);
+            let current_text = current_map.get(file).map_or("", String::as_str);
+            if reviewed_text == current_text {
+                continue; // the move left this file untouched
+            }
+            let ssrc_text = ssrc.get(file).map_or("", String::as_str);
+            let is_rs = file.ends_with(".rs");
+            let moved = support_of(reviewed_text, current_text, is_rs);
+            let novel = support_of(ssrc_text, current_text, is_rs);
+            // A moved definition that also differs from the source queue's
+            // landed truth is content the move invented — unreviewed, and not
+            // from any intervening landing. That breaks the carry.
+            for def in moved.intersection(&novel) {
+                disturbed.push(format!("{file} ({})", pretty_def(def)));
+            }
+            for def in &moved {
+                moved_defs.push(format!("{file} ({})", pretty_def(def)));
+            }
+        }
+
+        if !disturbed.is_empty() {
+            disturbed.sort();
+            disturbed.dedup();
+            return Ok(Err(disturbed));
+        }
+        moved_defs.sort();
+        moved_defs.dedup();
+        let detail = if moved_defs.is_empty() {
+            "no definitions moved".to_owned()
+        } else {
+            moved_defs.join(", ")
+        };
+        Ok(Ok(format!(
+            "commutation (Tier-0 disjoint support, I10): the move rebased past {} definition(s) \
+             [{detail}], each matching {source_queue}'s landed history — no definition the review \
+             approved was altered",
+            moved_defs.len()
+        )))
+    };
+
+    let out = run();
+    let _ = std::fs::remove_dir_all(&scratch);
+    out
+}
+
+/// The support of a `base → new` edit at definition granularity, matching the
+/// Tier-0 batch check: no support if unchanged, `rust_support` for `.rs` files
+/// (whole-file token if unparseable), the whole-file token otherwise.
+fn support_of(base: &str, new: &str, is_rs: bool) -> BTreeSet<String> {
+    if base == new {
+        return BTreeSet::new();
+    }
+    if is_rs {
+        omoplata_work::rust_support(base, new).unwrap_or_else(whole_file_support)
+    } else {
+        whole_file_support()
+    }
+}
+
+/// A human-readable definition label — the opaque whole-file token renders as
+/// `whole file`, every other key (`fn priority_of`, `impl Q`) passes through.
+fn pretty_def(key: &str) -> String {
+    if key == omoplata_work::WHOLE_FILE_SUPPORT {
+        "whole file".to_owned()
+    } else {
+        key.to_owned()
+    }
+}
+
+/// Materialize a commit's tree into `into` and read it back as
+/// `tree-relative path -> content`.
+fn materialize_commit_map(
+    repo: &Repository,
+    oid: &ObjectId,
+    into: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    std::fs::create_dir_all(into).with_context(|| format!("creating {}", into.display()))?;
+    omoplata_work::materialize(repo, oid, into)?;
+    let mut map = std::collections::BTreeMap::new();
+    for file in files_under(into) {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            let rel = file
+                .strip_prefix(into)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .into_owned();
+            map.insert(rel, text);
+        }
+    }
+    Ok(map)
 }
 
 /// Find the queue (and landed tip) a change is already landed in, if any:
@@ -1265,7 +1473,8 @@ fn observe_batch_gates(
     let observe = || -> anyhow::Result<BatchGates> {
         // 1. Base overlay: the target queue's currently-landed content, keyed
         //    by tree-relative path (later landed refs overlay earlier).
-        let base = materialize_queue_base(repo, registry, refs, queue, &scratch.join("base"))?;
+        let base =
+            materialize_queue_base(repo, registry, refs, queue, &scratch.join("base"), None)?;
 
         // 2. Per submission: the support of each file relative to base.
         let mut manifests = Vec::new();
@@ -1356,9 +1565,15 @@ fn materialize_queue_base(
     refs: &std::collections::BTreeMap<String, CommitId>,
     queue: &str,
     into: &Path,
+    exclude: Option<&str>,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
     let mut base: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (name, commit) in refs {
+        if exclude == Some(name.as_str()) {
+            continue; // a change's own landed ref, so callers can recover the
+                      // *rest* of the queue as a base (used by backport to find
+                      // a change's own authored support).
+        }
         let Some(rest) = name.strip_prefix("public/") else {
             continue;
         };

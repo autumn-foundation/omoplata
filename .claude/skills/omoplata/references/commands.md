@@ -52,7 +52,7 @@ many agents can drive one repo safely.
 | `omo submit <id> --title <t> <change...> [--author A] [--pending] [--repo DIR]` | Create a submission over change IDs. Auto-approves unless `--pending`. |
 | `omo approve <id> [--by NAME] [--repo DIR]` | Approve a pending submission. |
 | `omo land <id>... [--queue NAME] [--repo DIR]` | Land one or more submissions through a queue (default `trunk`), transitioning `Draft → Public`. Multiple ids = a **Tier-0 batch**. |
-| `omo backport <id> --to <queue> [--repo DIR]` | Land an already-landed submission into a second queue, carrying approval forward under a certificate. |
+| `omo backport <id> --to <queue> [--repo DIR]` | Land an already-landed submission into a second queue, carrying approval forward under an *identity* certificate (content unchanged) or a *commutation* certificate (moved, but every changed definition matches the source queue's landed history); an invented, unreviewed definition refuses pending re-review. |
 | `omo queue add <name> [--validate CMD] [--allow-carried] [--no-approval] [--description D] [--repo DIR]` | Register a landing queue with its policy. Registered queues default strict (approval required, carried conflicts refused). |
 | `omo queue list [--repo DIR]` | List queues (including implicit `trunk`) with their policies. |
 | `omo queue remove <name> [--repo DIR]` | Remove a queue (landed refs are kept). |
