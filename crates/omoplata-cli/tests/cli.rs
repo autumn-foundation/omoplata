@@ -1192,7 +1192,14 @@ fn land_change(root: &std::path::Path, name: &str, content: &str, sub: &str) {
         .assert()
         .success();
     omo()
-        .args(["submit", sub, "--title", sub, &format!("ws/{name}"), "--repo"])
+        .args([
+            "submit",
+            sub,
+            "--title",
+            sub,
+            &format!("ws/{name}"),
+            "--repo",
+        ])
         .arg(root)
         .assert()
         .success();
@@ -1263,7 +1270,9 @@ fn backport_commutation_certificate_carries_moved_but_disjoint() {
         .success()
         .stdout(predicate::str::contains("backported sub-a"))
         .stdout(predicate::str::contains("0 identity, 1 commutation"))
-        .stderr(predicate::str::contains("commutation (Tier-0 disjoint support"))
+        .stderr(predicate::str::contains(
+            "commutation (Tier-0 disjoint support",
+        ))
         .stderr(predicate::str::contains("fn bar"));
 }
 

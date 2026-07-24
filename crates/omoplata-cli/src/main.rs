@@ -1296,8 +1296,7 @@ fn commutation_witness(
         .control_dir()
         .join("tmp")
         .join(format!("backport-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch)
-        .with_context(|| format!("creating {}", scratch.display()))?;
+    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
 
     let run = || -> anyhow::Result<Result<String, Vec<String>>> {
         let reviewed_map = materialize_commit_map(repo, reviewed, &scratch.join("reviewed"))?;
