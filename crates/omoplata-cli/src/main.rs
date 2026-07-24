@@ -24,7 +24,7 @@ use omoplata_sem::{
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
     absorb, auto_snapshot, land_submission_in_queue, MapContext, OpKind, OpLog, QueueGates,
-    QueuePolicy, QueueRegistry, RebaseEngine, Stack, WorkError, Workspace, WorkspaceRegistry,
+    QueuePolicy, QueueRegistry, RebaseEngine, Stack, Workspace, WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
