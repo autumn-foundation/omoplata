@@ -25,14 +25,92 @@
 //! Landing into `trunk` writes the legacy `public/<change>` refs; every other
 //! queue lands at `public/<queue>/<change>`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use omoplata_identity::{ChangeGraph, ChangeId, Phase, Submission, SubmissionId};
+use omoplata_identity::{
+    extract_definitions, parses_cleanly, ChangeGraph, ChangeId, Definition, DefinitionKind, Phase,
+    Submission, SubmissionId,
+};
 use omoplata_store::{atomic_write, Repository};
 use serde::{Deserialize, Serialize};
 
 use crate::error::WorkError;
 use crate::oplog::{OpKind, OpLog};
+
+/// The support token for a whole non-Rust (or unparseable) file that changed
+/// relative to base — it intersects any other change to the same path, so any
+/// two edits to such a file conservatively overlap.
+pub const WHOLE_FILE_SUPPORT: &str = "\u{0}whole-file";
+
+/// The **support** of an edit at definition granularity (§5.10 Tier-0): the
+/// kind-qualified paths of definitions added, removed, or whose own body
+/// changed between `base` and `new` (e.g. `fn priority_of`, `impl Q`).
+///
+/// An `impl`/`mod`/`trait` container is compared by its **shell** — its header
+/// (through the opening `{`) plus its footer (the closing `}` onward), ignoring
+/// everything between. Its members are separate entries (`fn Q::len`), so two
+/// edits adding different methods to the same `impl` have disjoint support and
+/// batch, while a change to the container's own signature (generics, bounds,
+/// `for` type) is still caught. Every other definition — `fn`, `struct`,
+/// `enum`, `const`, … — is compared by its full text.
+///
+/// Kind-qualifying the key keeps a `struct Q` and an `impl Q` distinct.
+///
+/// Returns `None` when either side does not parse cleanly; the caller then
+/// treats the whole file as opaque ([`WHOLE_FILE_SUPPORT`]).
+#[must_use]
+pub fn rust_support(base: &str, new: &str) -> Option<BTreeSet<String>> {
+    if !parses_cleanly(base).unwrap_or(false) || !parses_cleanly(new).unwrap_or(false) {
+        return None;
+    }
+    let base_eff = effective_texts(base, &extract_definitions(base).ok()?);
+    let new_eff = effective_texts(new, &extract_definitions(new).ok()?);
+
+    let mut support = BTreeSet::new();
+    for (key, text) in &new_eff {
+        // Added (absent in base) or modified (own text changed).
+        if base_eff.get(key) != Some(text) {
+            support.insert(key.clone());
+        }
+    }
+    for key in base_eff.keys() {
+        if !new_eff.contains_key(key) {
+            support.insert(key.clone()); // removed
+        }
+    }
+    Some(support)
+}
+
+/// Each definition's comparison text, keyed by `"<kind> <path>"`. Containers
+/// (`impl`/`mod`/`trait`) reduce to their shell so member churn does not read
+/// as a container change; every other definition uses its full text.
+fn effective_texts(src: &str, defs: &[Definition]) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for d in defs {
+        let text = src.get(d.byte_range.clone()).unwrap_or("");
+        let effective = match d.kind {
+            DefinitionKind::Impl | DefinitionKind::Module | DefinitionKind::Trait => {
+                container_shell(text)
+            }
+            _ => text.to_owned(),
+        };
+        map.insert(format!("{} {}", d.kind.label(), d.path), effective);
+    }
+    map
+}
+
+/// A container's shell: its header up to and including the opening `{`, plus
+/// its footer from the closing `}` — everything between (its members) elided,
+/// so adding or removing members leaves the shell unchanged.
+fn container_shell(text: &str) -> String {
+    match (text.find('{'), text.rfind('}')) {
+        (Some(open), Some(close)) if close >= open => {
+            format!("{}{}", &text[..=open], &text[close..])
+        }
+        _ => text.to_owned(),
+    }
+}
 
 /// The policy of one named landing queue (ADR-0009).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,13 +473,15 @@ pub fn queue_ref(queue: &str, change: &ChangeId) -> String {
 }
 
 /// The observed facts for a **batch** landing (§5.10 Tier-0 batching):
-/// per-submission content manifests plus the batch-wide gate observations.
+/// per-submission support manifests plus the batch-wide gate observations.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGates {
-    /// Per submission: its materialized content as `path -> content hash`.
-    /// Pairwise-disjointness is judged from these — the Tier-0 support check
-    /// at file granularity.
-    pub manifests: Vec<(SubmissionId, std::collections::BTreeMap<String, String>)>,
+    /// Per submission: its **support** as `path -> {definition qualified paths}`
+    /// (Rust files, via [`rust_support`]) or `path -> {WHOLE_FILE_SUPPORT}`
+    /// (non-Rust or unparseable). Pairwise-disjointness is judged by
+    /// intersecting these — the Tier-0 support check at *definition*
+    /// granularity, so two edits to disjoint definitions of one file batch.
+    pub manifests: Vec<(SubmissionId, BTreeMap<String, BTreeSet<String>>)>,
     /// Conflict values carried across the whole batch's content.
     pub carried_values: usize,
     /// The P9 validator verdict for the batch validated **as one**.
@@ -410,13 +490,16 @@ pub struct BatchGates {
 
 /// Land several submissions through a queue **as one batch** (§5.10):
 /// pairwise-disjoint submissions validate as one and land together; an
-/// overlapping pair refuses the whole batch with the colliding paths named.
+/// overlapping pair refuses the whole batch with the colliding definitions
+/// named.
 ///
-/// Disjointness is the file-granularity Tier-0 check: two submissions overlap
-/// iff some path appears in both manifests **with different content**
-/// (identical bytes at the same path trivially commute). Disjointness is what
-/// licenses order-independence (I3′), which is why the landing order within
-/// the batch carries no meaning.
+/// Disjointness is the Tier-0 **definition-granularity** support check: two
+/// submissions overlap iff some file appears in both supports touching a
+/// **common definition** (or a whole non-Rust file both changed). Two agents
+/// adding different methods to the same `impl`, or editing unrelated functions
+/// of one file, have disjoint support and batch. Disjoint support is exactly
+/// what licenses order-independence (I3′), which is why the landing order
+/// within the batch carries no meaning.
 ///
 /// All gates are applied before any landing; a refused batch mutates nothing.
 ///
@@ -440,15 +523,25 @@ pub fn land_batch_in_queue(
         }
     }
 
-    // Tier-0 pairwise disjointness over the manifests.
+    // Tier-0 pairwise disjointness: two submissions overlap iff some shared
+    // path has intersecting support (they touched a common definition).
     for (i, (id_a, man_a)) in gates.manifests.iter().enumerate() {
         for (id_b, man_b) in gates.manifests.iter().skip(i + 1) {
-            let colliding: Vec<String> = man_a
-                .iter()
-                .filter(|(path, hash)| man_b.get(*path).is_some_and(|h| h != *hash))
-                .map(|(path, _)| path.clone())
-                .collect();
+            let mut colliding: Vec<String> = Vec::new();
+            for (path, support_a) in man_a {
+                if let Some(support_b) = man_b.get(path) {
+                    let shared: Vec<&String> = support_a.intersection(support_b).collect();
+                    for def in shared {
+                        colliding.push(if def == WHOLE_FILE_SUPPORT {
+                            path.clone()
+                        } else {
+                            format!("{path} ({def})")
+                        });
+                    }
+                }
+            }
             if !colliding.is_empty() {
+                colliding.sort();
                 return Err(WorkError::BatchOverlap {
                     a: id_a.to_string(),
                     b: id_b.to_string(),
@@ -661,21 +754,25 @@ mod tests {
         );
     }
 
+    fn support(entries: &[&str]) -> BTreeSet<String> {
+        entries.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     fn manifest(
         id: &str,
-        entries: &[(&str, &str)],
-    ) -> (SubmissionId, std::collections::BTreeMap<String, String>) {
+        entries: &[(&str, &[&str])],
+    ) -> (SubmissionId, BTreeMap<String, BTreeSet<String>>) {
         (
             SubmissionId::new(id),
             entries
                 .iter()
-                .map(|(p, h)| ((*p).to_owned(), (*h).to_owned()))
+                .map(|(p, defs)| ((*p).to_owned(), support(defs)))
                 .collect(),
         )
     }
 
     #[test]
-    fn disjoint_batch_lands_together_overlap_refuses_whole_batch() {
+    fn definition_disjoint_batch_lands_shared_definition_refuses_whole_batch() {
         let sub_a = approved_sub("sub-a", "ca");
         let sub_b = approved_sub("sub-b", "cb");
         let mut cg = graph_with("ca");
@@ -686,11 +783,11 @@ mod tests {
         ));
         let mut log = OpLog::new();
 
-        // Disjoint paths (and one identical shared path): batches.
+        // Same FILE, disjoint DEFINITIONS: batches (the Tier-0 refinement).
         let gates = BatchGates {
             manifests: vec![
-                manifest("sub-a", &[("src/a.rs", "h1"), ("Cargo.toml", "same")]),
-                manifest("sub-b", &[("src/b.rs", "h2"), ("Cargo.toml", "same")]),
+                manifest("sub-a", &[("src/lib.rs", &["fn TaskQueue::peek"])]),
+                manifest("sub-b", &[("src/lib.rs", &["fn retry_delay_ms"])]),
             ],
             carried_values: 0,
             validated: None,
@@ -713,13 +810,14 @@ mod tests {
             Phase::Public
         );
 
-        // Same path, different content: the whole batch refuses, nothing lands.
+        // Same file, SAME definition: the whole batch refuses, nothing lands,
+        // and the error names the definition.
         let mut cg = graph_with("ca");
         cg.add_change(Change::draft(ChangeId::new("cb")));
         let overlapping = BatchGates {
             manifests: vec![
-                manifest("sub-a", &[("src/lib.rs", "h1")]),
-                manifest("sub-b", &[("src/lib.rs", "h2")]),
+                manifest("sub-a", &[("src/lib.rs", &["fn priority_of"])]),
+                manifest("sub-b", &[("src/lib.rs", &["fn priority_of"])]),
             ],
             carried_values: 0,
             validated: None,
@@ -733,7 +831,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, WorkError::BatchOverlap { ref paths, .. } if paths == &vec!["src/lib.rs".to_owned()])
+            matches!(err, WorkError::BatchOverlap { ref paths, .. } if paths == &vec!["src/lib.rs (fn priority_of)".to_owned()])
         );
         assert_eq!(cg.change(&ChangeId::new("ca")).unwrap().phase, Phase::Draft);
     }
@@ -752,13 +850,70 @@ mod tests {
             allow_carried: false,
         };
         let gates = BatchGates {
-            manifests: vec![manifest("sub-a", &[("src/a.rs", "h1")])],
+            manifests: vec![manifest("sub-a", &[("src/a.rs", &["foo"])])],
             carried_values: 0,
             validated: Some(false),
         };
         let err = land_batch_in_queue(&[&sub_a], &queue, &gates, &mut cg, &mut log).unwrap_err();
         assert!(matches!(err, WorkError::QueueValidationFailed { .. }));
         assert_eq!(cg.change(&ChangeId::new("ca")).unwrap().phase, Phase::Draft);
+    }
+
+    const SUPPORT_BASE: &str = "\
+pub fn priority_of(u: u32) -> u32 {
+    u
+}
+
+pub struct Q {
+    n: usize,
+}
+
+impl Q {
+    pub fn len(&self) -> usize {
+        self.n
+    }
+}
+";
+
+    #[test]
+    fn support_two_agents_add_different_impl_methods_are_disjoint() {
+        let a = SUPPORT_BASE.replace(
+            "    pub fn len(&self) -> usize {\n        self.n\n    }",
+            "    pub fn len(&self) -> usize {\n        self.n\n    }\n\n    pub fn peek(&self) -> usize {\n        self.n\n    }",
+        );
+        let b = SUPPORT_BASE.replace(
+            "    pub fn len(&self) -> usize {\n        self.n\n    }",
+            "    pub fn is_empty(&self) -> bool {\n        self.n == 0\n    }\n\n    pub fn len(&self) -> usize {\n        self.n\n    }",
+        );
+        let sa = rust_support(SUPPORT_BASE, &a).unwrap();
+        let sb = rust_support(SUPPORT_BASE, &b).unwrap();
+        // Each touches only its own new member; the impl shell is unchanged.
+        assert_eq!(sa, support(&["fn Q::peek"]));
+        assert_eq!(sb, support(&["fn Q::is_empty"]));
+        assert!(sa.is_disjoint(&sb));
+    }
+
+    #[test]
+    fn support_edit_vs_untouched_is_disjoint_same_edit_intersects() {
+        let edit = SUPPORT_BASE.replace("    u\n", "    u + 1\n");
+        let add =
+            SUPPORT_BASE.replace("impl Q {", "pub fn helper() -> u32 {\n    0\n}\n\nimpl Q {");
+        // A edits priority_of; B leaves it untouched (adds a free fn).
+        let sa = rust_support(SUPPORT_BASE, &edit).unwrap();
+        let sb = rust_support(SUPPORT_BASE, &add).unwrap();
+        assert_eq!(sa, support(&["fn priority_of"]));
+        assert_eq!(sb, support(&["fn helper"]));
+        assert!(sa.is_disjoint(&sb));
+        // Two agents editing the same fn intersect on it.
+        let edit2 = SUPPORT_BASE.replace("    u\n", "    u * 2\n");
+        let sa2 = rust_support(SUPPORT_BASE, &edit).unwrap();
+        let sb2 = rust_support(SUPPORT_BASE, &edit2).unwrap();
+        assert!(!sa2.is_disjoint(&sb2));
+    }
+
+    #[test]
+    fn support_is_none_on_unparseable_input() {
+        assert!(rust_support(SUPPORT_BASE, "fn broken( {").is_none());
     }
 
     #[test]

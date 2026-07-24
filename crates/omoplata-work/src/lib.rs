@@ -55,8 +55,8 @@ pub use autorebase::{ChangeHistory, RebaseEngine, RebaseOutcome, RebaseRecord, S
 pub use error::WorkError;
 pub use oplog::{OpKind, OpLog, Operation};
 pub use queue::{
-    land_batch_in_queue, land_submission, land_submission_in_queue, queue_ref, BatchGates,
-    LandResult, QueueGates, QueuePolicy, QueueRegistry,
+    land_batch_in_queue, land_submission, land_submission_in_queue, queue_ref, rust_support,
+    BatchGates, LandResult, QueueGates, QueuePolicy, QueueRegistry, WHOLE_FILE_SUPPORT,
 };
 pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};
 pub use stack::{absorb, Stack};

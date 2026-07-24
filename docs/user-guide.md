@@ -255,26 +255,29 @@ error: queue "release-1.2" validation gate failed: validator exited non-zero
 
 ### Batching, backports, and the needs-backport query
 
-Several submissions land as one **Tier-0 batch** (§5.10): pairwise-disjoint
-content validates as one and lands in a single locked transaction, and after
-any landing `omo` offers the mechanical backports:
+Several submissions land as one **Tier-0 batch** (§5.10): submissions with
+disjoint *definition* support validate as one and land in a single locked
+transaction, and after any landing `omo` offers the mechanical backports.
+Disjointness is judged at **definition granularity** relative to the queue's
+landed state (ADR-0009), so two agents editing *different definitions of the
+same file* still batch — the case a fleet hits constantly:
 
 ```console
-$ omo land sub-alpha sub-beta
+$ omo land sub-a sub-b
 batched 2 pairwise-disjoint submission(s) into queue trunk (validated as one)
-  landed sub-alpha: Submission sub-alpha landed in queue trunk
-  landed sub-beta: Submission sub-beta landed in queue trunk
-backport available: omo backport sub-alpha --to release-1.2
-backport available: omo backport sub-beta --to release-1.2
+  landed sub-a: Submission sub-a landed in queue trunk
+  landed sub-b: Submission sub-b landed in queue trunk
+backport available: omo backport sub-a --to release-1.2
+backport available: omo backport sub-b --to release-1.2
 ```
 
-An overlapping pair — the same path with different content — refuses the whole
-batch and names the collision (overlapping changes serialize; land them
+Two submissions that touch the **same definition** overlap and refuse the whole
+batch, naming the definition (overlapping changes serialize; land them
 separately):
 
 ```console
-$ omo land sub-gamma sub-alpha2
-error: submissions sub-gamma and sub-alpha2 overlap on 1 path(s) (change-0/feature-a.txt); overlapping changes serialize — land them separately
+$ omo land sub-c sub-d
+error: submissions sub-c and sub-d overlap on 1 path(s) (src/lib.rs (fn priority_of)); overlapping changes serialize — land them separately
 ```
 
 `omo backport` lands an already-landed submission into a second queue with its

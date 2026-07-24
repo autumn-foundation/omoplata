@@ -38,11 +38,14 @@ commands (needs `omo` built at `../../target/release/omo`).
    resolution latency; the release line refuses it with an error naming the
    count. Same content, two policies, both honest.
 
-7. **Tier-0 batching.** `omo land sub-a sub-b` lands pairwise-disjoint
-   submissions as one batch — validated as one, landed in a single locked
-   transaction — while an overlapping pair (same path, different content)
-   refuses the *whole* batch naming the collision: overlapping changes
-   serialize.
+7. **Tier-0 batching at definition granularity.** `omo land sub-a sub-b` lands
+   pairwise-disjoint submissions as one batch — validated as one, landed in a
+   single locked transaction. Disjointness is judged at *definition*
+   granularity relative to the queue's landed base (ADR-0009): two agents who
+   both edit `src/lib.rs` — one adding a method to `impl Queue`, the other
+   retuning the free function `priority_of` — have disjoint support and batch.
+   Two agents editing the **same** definition refuse the *whole* batch, naming
+   it (`src/lib.rs (fn priority_of)`): overlapping changes serialize.
 
 8. **Certified backports and the needs-backport query.** `omo backport sub-a
    --to release-1.2` re-lands an already-landed submission with its approval

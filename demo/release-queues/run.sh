@@ -99,22 +99,79 @@ EOF
 "$OMO" land sub-209 --repo repo
 "$OMO" land sub-209 --queue release-1.2 --repo repo 2>&1 || true
 
-say "Tier-0 batch: disjoint submissions validate as one and land together"
-mkdir -p wa wb
-echo "feature a" > wa/a.txt
-echo "feature b" > wb/b.txt
+# Establish a shared lib.rs in trunk — the base two agents will branch from.
+say "Tier-0 batch at DEFINITION granularity: same file, disjoint definitions"
+mkdir -p w0/src
+cat > w0/src/lib.rs <<'RS'
+pub fn priority_of(u: u32) -> u32 {
+    u
+}
+
+pub struct Queue {
+    n: usize,
+}
+
+impl Queue {
+    pub fn len(&self) -> usize {
+        self.n
+    }
+}
+RS
+"$OMO" workspace add w0 w0 --repo repo >/dev/null
+"$OMO" submit sub-base --title "shared library" ws/w0 --repo repo >/dev/null
+"$OMO" land sub-base --repo repo >/dev/null
+
+# Agent A adds a method to impl Queue; agent B retunes the free function.
+mkdir -p wa/src wb/src
+cat > wa/src/lib.rs <<'RS'
+pub fn priority_of(u: u32) -> u32 {
+    u
+}
+
+pub struct Queue {
+    n: usize,
+}
+
+impl Queue {
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn peek(&self) -> usize {
+        self.n
+    }
+}
+RS
+cat > wb/src/lib.rs <<'RS'
+pub fn priority_of(u: u32) -> u32 {
+    u.saturating_mul(2)
+}
+
+pub struct Queue {
+    n: usize,
+}
+
+impl Queue {
+    pub fn len(&self) -> usize {
+        self.n
+    }
+}
+RS
 "$OMO" workspace add wa wa --repo repo >/dev/null
 "$OMO" workspace add wb wb --repo repo >/dev/null
-"$OMO" submit sub-a --title "feature a" ws/wa --repo repo >/dev/null
-"$OMO" submit sub-b --title "feature b" ws/wb --repo repo >/dev/null
+"$OMO" submit sub-a --title "add Queue::peek" ws/wa --repo repo >/dev/null
+"$OMO" submit sub-b --title "retune priority_of" ws/wb --repo repo >/dev/null
 "$OMO" land sub-a sub-b --repo repo
 
-say "overlap refuses the WHOLE batch, naming the colliding paths"
-mkdir -p wc2 && echo "feature a, differently" > wc2/a.txt
-"$OMO" workspace add wc2 wc2 --repo repo >/dev/null
-"$OMO" submit sub-c --title "collides with a" ws/wc2 --repo repo >/dev/null
-"$OMO" submit sub-a2 --title "a again" ws/wa --repo repo >/dev/null
-"$OMO" land sub-c sub-a2 --repo repo 2>&1 || true
+say "same file, SAME definition edited twice: refuses the whole batch, naming it"
+mkdir -p wc/src wd/src
+sed 's/u.saturating_mul(2)/u + 1/' wb/src/lib.rs > wc/src/lib.rs
+sed 's/u.saturating_mul(2)/u + 100/' wb/src/lib.rs > wd/src/lib.rs
+"$OMO" workspace add wc wc --repo repo >/dev/null
+"$OMO" workspace add wd wd --repo repo >/dev/null
+"$OMO" submit sub-c --title "priority_of +1" ws/wc --repo repo >/dev/null
+"$OMO" submit sub-d --title "priority_of +100" ws/wd --repo repo >/dev/null
+"$OMO" land sub-c sub-d --repo repo 2>&1 || true
 
 say "backport: approval carried forward under an identity certificate"
 "$OMO" backport sub-a --to release-1.2 --repo repo

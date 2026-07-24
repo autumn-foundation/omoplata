@@ -1,5 +1,6 @@
 //! `omo` — the omoplata command-line interface.
 
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1050,8 +1051,9 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
     }
 
     // Observe the gate facts against the materialized content (the stored
-    // trees, not whatever the working copy has drifted to since).
-    let gates = observe_batch_gates(&repo, &sub_tips, &policy)?;
+    // trees, not whatever the working copy has drifted to since). Support is
+    // computed relative to the target queue's current landed state.
+    let gates = observe_batch_gates(&repo, &registry, &refs, &policy.name, &sub_tips, &policy)?;
     if policy.validate.is_some() {
         match gates.validated {
             Some(true) => eprintln!("queue {}: validation PASSED", policy.name),
@@ -1182,7 +1184,7 @@ fn cmd_backport(repo: Option<PathBuf>, id: String, to: String) -> anyhow::Result
     save_submission(&repo, &sub)?;
 
     let sub_tips = vec![(sub.id.clone(), tips)];
-    let batch = observe_batch_gates(&repo, &sub_tips, &policy)?;
+    let batch = observe_batch_gates(&repo, &registry, &refs, &policy.name, &sub_tips, &policy)?;
     let gates = QueueGates {
         carried_values: batch.carried_values,
         validated: batch.validated,
@@ -1226,16 +1228,29 @@ fn find_landed(
     None
 }
 
-/// Materialize a batch of submissions' stored trees into a scratch directory
-/// and observe the queue-gate facts: per-submission content manifests
-/// (`path -> content address`, the Tier-0 disjointness input), how many
-/// conflict values (§5.4) the content carries, and — when the policy
-/// configures one — the P9 validator's verdict over the batch **as one**.
+/// Materialize a batch of submissions' stored trees and observe the queue-gate
+/// facts: per-submission **support manifests** (`path -> {definition qualified
+/// paths}`, the Tier-0 disjointness input, computed relative to the target
+/// queue's current landed state), how many conflict values (§5.4) the content
+/// carries, and — when the policy configures one — the P9 validator's verdict
+/// over the batch **as one**.
 ///
-/// The scratch directory lives under `.omoplata/tmp` (unique per process) and
-/// is removed on the way out (best effort).
+/// Support is definition-granular (ADR-0009): the base is the target queue's
+/// landed content per file path, and a submission's support for a file is the
+/// set of definitions it changed relative to that base — so two submissions
+/// that each add a different method to the same `impl`, or edit unrelated
+/// functions of one file, have disjoint support and batch. A file identical to
+/// base contributes no support; a non-Rust or unparseable file that differs
+/// contributes the opaque whole-file token.
+///
+/// The scratch directory lives under `.omoplata/tmp` (unique per process),
+/// split into `base/` (landed state) and `content/` (the submissions, over
+/// which carried values and the validator run), and is removed on the way out.
 fn observe_batch_gates(
     repo: &Repository,
+    registry: &QueueRegistry,
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    queue: &str,
     sub_tips: &[(SubmissionId, Vec<ObjectId>)],
     policy: &QueuePolicy,
 ) -> anyhow::Result<BatchGates> {
@@ -1243,38 +1258,61 @@ fn observe_batch_gates(
         .control_dir()
         .join("tmp")
         .join(format!("land-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
+    let content_dir = scratch.join("content");
+    std::fs::create_dir_all(&content_dir)
+        .with_context(|| format!("creating {}", content_dir.display()))?;
 
     let observe = || -> anyhow::Result<BatchGates> {
+        // 1. Base overlay: the target queue's currently-landed content, keyed
+        //    by tree-relative path (later landed refs overlay earlier).
+        let base = materialize_queue_base(repo, registry, refs, queue, &scratch.join("base"))?;
+
+        // 2. Per submission: the support of each file relative to base.
         let mut manifests = Vec::new();
         for (sid, tips) in sub_tips {
-            let sub_dir = scratch.join(format!("sub-{}", sid.as_str().replace(['/', '\\'], "_")));
-            let mut manifest = std::collections::BTreeMap::new();
+            let sub_dir =
+                content_dir.join(format!("sub-{}", sid.as_str().replace(['/', '\\'], "_")));
+            let mut files: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
             for (i, tip) in tips.iter().enumerate() {
                 let dir = sub_dir.join(format!("change-{i}"));
                 std::fs::create_dir_all(&dir)?;
                 omoplata_work::materialize(repo, tip, &dir)?;
-                // Manifest keys are change-ordinal-relative paths so the same
-                // logical path aligns across submissions; values are content
-                // addresses (the blob is already in the store, so hashing via
-                // write_blob costs nothing extra).
                 for file in files_under(&dir) {
-                    let rel = file
-                        .strip_prefix(&sub_dir)
-                        .unwrap_or(&file)
-                        .to_string_lossy()
-                        .into_owned();
-                    let bytes = std::fs::read(&file)
-                        .with_context(|| format!("reading {}", file.display()))?;
-                    let address = repo.write_blob(bytes)?;
-                    manifest.insert(rel, address.to_string());
+                    if let Ok(text) = std::fs::read_to_string(&file) {
+                        let rel = file
+                            .strip_prefix(&dir)
+                            .unwrap_or(&file)
+                            .to_string_lossy()
+                            .into_owned();
+                        files.insert(rel, text);
+                    }
+                }
+            }
+
+            let mut manifest: std::collections::BTreeMap<String, BTreeSet<String>> =
+                std::collections::BTreeMap::new();
+            for (rel, text) in &files {
+                let base_text = base.get(rel).map_or("", String::as_str);
+                if base_text == text {
+                    continue; // unchanged file touches nothing
+                }
+                let support: BTreeSet<String> = if rel.ends_with(".rs") {
+                    omoplata_work::rust_support(base_text, text).unwrap_or_else(whole_file_support)
+                } else {
+                    whole_file_support()
+                };
+                if !support.is_empty() {
+                    manifest.insert(rel.clone(), support);
                 }
             }
             manifests.push((sid.clone(), manifest));
         }
 
+        // 3. Carried values and validation over the submission content only
+        //    (not the base overlay).
         let mut carried_values = 0usize;
-        for file in files_under(&scratch) {
+        for file in files_under(&content_dir) {
             if !file.extension().is_some_and(|e| e == "rs") {
                 continue;
             }
@@ -1287,7 +1325,7 @@ fn observe_batch_gates(
 
         let validated = match &policy.validate {
             None => None,
-            Some(cmd) => Some(run_dir_validator(cmd, &scratch)?),
+            Some(cmd) => Some(run_dir_validator(cmd, &content_dir)?),
         };
         Ok(BatchGates {
             manifests,
@@ -1299,6 +1337,56 @@ fn observe_batch_gates(
     let gates = observe();
     let _ = std::fs::remove_dir_all(&scratch);
     gates
+}
+
+/// The single-element whole-file support token set (non-Rust / unparseable).
+fn whole_file_support() -> BTreeSet<String> {
+    std::iter::once(omoplata_work::WHOLE_FILE_SUPPORT.to_owned()).collect()
+}
+
+/// Materialize the target queue's currently-landed content into `into` and
+/// return it as `tree-relative path -> content` (ADR-0009 base for support).
+///
+/// A `public/…` ref belongs to a non-trunk queue iff its first segment names a
+/// registered queue (the same disambiguation `landed()` uses); refs owned by
+/// `queue` are overlaid in ref-name order.
+fn materialize_queue_base(
+    repo: &Repository,
+    registry: &QueueRegistry,
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    queue: &str,
+    into: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut base: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (name, commit) in refs {
+        let Some(rest) = name.strip_prefix("public/") else {
+            continue;
+        };
+        let owner = match rest.split_once('/') {
+            Some((first, _)) if registry.get(first).is_some() => first,
+            _ => "trunk",
+        };
+        if owner != queue {
+            continue;
+        }
+        let Ok(oid) = commit.as_str().parse::<ObjectId>() else {
+            continue;
+        };
+        let dir = into.join(name.replace(['/', '\\'], "_"));
+        std::fs::create_dir_all(&dir)?;
+        omoplata_work::materialize(repo, &oid, &dir)?;
+        for file in files_under(&dir) {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                let rel = file
+                    .strip_prefix(&dir)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .into_owned();
+                base.insert(rel, text);
+            }
+        }
+    }
+    Ok(base)
 }
 
 /// Every file under `dir`, recursively (control dirs are not present in

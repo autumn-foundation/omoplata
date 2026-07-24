@@ -122,14 +122,18 @@ by an agent fleet.
 
 ## Future work
 
-Three of the items originally listed here have since shipped in their v1
+Four of the items originally listed here have since shipped in their v1
 shapes: **`landed(<queue>)` in revsets** (registry-driven ref disambiguation;
 `landed(trunk) & ~landed(release-1.2)` is the needs-backport query),
-**Tier-0 batching** (`omo land a b c` — pairwise disjointness judged from
-content manifests at *file* granularity, batch validated as one, landed in one
-locked transaction), and **mechanical backport offers** (`omo backport`
-carries approval forward with an *identity* certificate — content
-byte-identical to the reviewed, landed tip; moved content demands re-review).
+**Tier-0 batching** (`omo land a b c` — batch validated as one, landed in one
+locked transaction), **definition-granularity Tier-0 disjointness** (support is
+the set of definitions a submission changed *relative to the queue's landed
+base*, computed by `rust_support`; two agents editing different definitions of
+one file batch, while a shared definition refuses the batch naming it —
+containers compare by their shell so member additions stay disjoint), and
+**mechanical backport offers** (`omo backport` carries approval forward with an
+*identity* certificate — content byte-identical to the reviewed, landed tip;
+moved content demands re-review).
 
 Still open:
 
@@ -138,13 +142,12 @@ Still open:
   revocable assertions. When that model lands, `require_approval: bool`
   generalizes to a count or reviewer-set predicate without changing the gate's
   shape.
-- **Definition-granularity Tier-0.** Batch disjointness compares whole files;
-  the definition-identity layer can refine it so two submissions touching
-  disjoint definitions of the same file still batch.
 - **Commutation-certificate backports for moved content** (I5): today's
   backport certificate covers only the identity case; a checked-commutation
   certificate would carry approval across content that provably rebased
-  cleanly.
+  cleanly. The same algebra would sharpen batch disjointness from "changed the
+  same definition" to "changed the same definition *incompatibly*", letting
+  line-disjoint edits to one definition batch too.
 - **`queued()`** awaits persistent queue membership (landing is immediate in
   v1), which arrives with the single-writer landing daemon (ADR-0008 Option C)
   that owns all queues.
