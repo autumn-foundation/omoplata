@@ -54,7 +54,10 @@ mod workspace;
 pub use autorebase::{ChangeHistory, RebaseEngine, RebaseOutcome, RebaseRecord, StackItem};
 pub use error::WorkError;
 pub use oplog::{OpKind, OpLog, Operation};
-pub use queue::{land_submission, LandResult};
+pub use queue::{
+    land_submission, land_submission_in_queue, queue_ref, LandResult, QueueGates, QueuePolicy,
+    QueueRegistry,
+};
 pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};
 pub use stack::{absorb, Stack};
 pub use workspace::{auto_snapshot, is_dirty, materialize, snapshot, Workspace, WorkspaceRegistry};

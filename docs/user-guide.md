@@ -184,7 +184,73 @@ $ omo submit sub-101 --title "Add definition tracking" c1 c2
 submitted sub-101 "Add definition tracking" with 2 change(s) (approved)
 
 $ omo land sub-101
-landed submission sub-101: Submission sub-101 landed successfully
+landed submission sub-101: Submission sub-101 landed in queue trunk
+```
+
+### Release lines as landing queues (ADR-0009)
+
+Git models a release line as a long-lived branch plus forge-side CI rules
+keyed on its name. Omoplata models it as a **named landing queue with a
+policy**: what may land, gated by which validator (§3 P9), with what approval
+requirement, and whether content still carrying conflict values (§5.4) is
+acceptable. Policy lives in the repository (`.omoplata/queues.json`), and
+validation runs **before** the `Draft → Public` transition — a failure means
+the landing simply never happens, not a broken branch to revert.
+
+Register a release queue with a regression-suite validator (`{}` is replaced
+by the materialized content directory):
+
+```console
+$ omo queue add release-1.2 --validate './regression.sh {}' --description "the 1.2 release line"
+registered queue release-1.2 (approval=required carried=refused validate=./regression.sh {})
+
+$ omo queue list
+trunk  approval=required carried=allowed validate=(none) [implicit]
+release-1.2  approval=required carried=refused validate=./regression.sh {}
+```
+
+Note the two postures: the implicit `trunk` queue is permissive about carried
+conflict values — the fleet keeps landing while a conflict awaits resolution —
+while registered queues default strict, which is what a release line wants.
+
+A release landing gates on approval, then P9 validation of the submission's
+**stored** content (materialized from the object store, not the working copy):
+
+```console
+$ omo submit sub-207 --title "Fix length parsing" ws/hotfix --pending
+submitted sub-207 "Fix length parsing" with 1 change(s) (pending approval)
+
+$ omo land sub-207 --queue release-1.2
+error: submission sub-207 is not approved (queue release-1.2)
+
+$ omo approve sub-207 --by kara
+approved sub-207 (by kara)
+
+$ omo land sub-207 --queue release-1.2
+queue release-1.2: validation PASSED
+landed submission sub-207: Submission sub-207 landed in queue release-1.2
+```
+
+The backport story is the same change landing in a second queue — one change
+object, two landings, no cherry-pick identity fork. Each queue records its own
+public ref (`trunk` keeps the legacy `public/<change>` shape):
+
+```console
+$ omo land sub-207
+landed submission sub-207: Submission sub-207 landed in queue trunk
+
+$ omo ref list | grep public
+public/release-1.2/ws/hotfix sha256:77b05c7c99fb814eeb77321f4e664bd350502e8a4d6e87fb7a745bd4a68d2151
+public/ws/hotfix sha256:77b05c7c99fb814eeb77321f4e664bd350502e8a4d6e87fb7a745bd4a68d2151
+```
+
+And a change that fails the queue's validator is refused in-band — nothing
+transitions, nothing needs reverting:
+
+```console
+$ omo land sub-208 --queue release-1.2
+queue release-1.2: validation FAILED
+error: queue "release-1.2" validation gate failed: validator exited non-zero
 ```
 
 

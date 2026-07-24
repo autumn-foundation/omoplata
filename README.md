@@ -73,8 +73,12 @@ directory); `init`/`status` take a positional path.
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `omo submit <id> --title "..." <change...>` | Create a review submission for change ID revsets with approval certificates. | `omo submit sub-101 --title "Add auth" ws/w1` |
-| `omo land <submission-id>` | Land approved submission through the merge queue, transitioning phase from `Draft` to `Public`. | `omo land sub-101` |
+| `omo submit <id> --title "..." <change...>` | Create a review submission for change ID revsets with approval certificates; `--pending` leaves it awaiting review instead of auto-approving. | `omo submit sub-101 --title "Add auth" ws/w1` |
+| `omo approve <id> [--by NAME]` | Approve a pending submission. | `omo approve sub-101 --by mark` |
+| `omo land <submission-id> [--queue NAME]` | Land approved submission through a named merge queue (default `trunk`), transitioning phase from `Draft` to `Public`. The queue's policy gates the landing: approval, carried conflict values, and P9 validation of the materialized content. | `omo land sub-101 --queue release-1.2` |
+| `omo queue add <name>` | Register a landing queue with its policy: `--validate CMD` (P9 validator, `{}` = content dir), `--allow-carried`, `--no-approval`, `--description`. Registered queues default strict (carried values refused); the implicit `trunk` is permissive. | `omo queue add release-1.2 --validate './regression.sh {}'` |
+| `omo queue list` | List queues (including the implicit `trunk`) with their policies. | `omo queue list` |
+| `omo queue remove <name>` | Remove a queue from the registry (landed refs are kept). | `omo queue remove release-1.2` |
 
 ### Definitions
 
@@ -89,7 +93,8 @@ directory); `init`/`status` take a positional path.
 |---------|-------------|---------|
 | `omo diff <base> <target>` | Show the line diff turning `base` into `target`, unified-ish. | `omo diff a.txt b.txt` |
 | `omo merge <base> <left> <right>` | Three-way line merge; conflicts render as markers and exit non-zero. | `omo merge base left right` |
-| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver; supported non-Rust files use the Mergiraf shell-out when it is on `PATH`, else the line fallback. | `omo merge-file base.json left.json right.json` |
+| `omo merge-file <base> <left> <right>` | Tier-2 driver merge chosen by extension: `.rs` uses the Rust structural driver (definition granularity, recursing into `impl`/`mod`/`trait` members); supported non-Rust files use the Mergiraf shell-out when it is on `PATH`, else the line fallback. Inputs may carry conflict values (§5.4): they ride through untouched definitions (exit 2, `carried forward`) instead of degrading the merge. | `omo merge-file base.json left.json right.json` |
+| `omo conflicts <file>` | List the conflict values a file carries, each pinned to the definition containing it. Exit 0 = none, 2 = values present. | `omo conflicts src/lib.rs` |
 
 ### History and revsets
 
