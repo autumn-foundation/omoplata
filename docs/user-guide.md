@@ -363,8 +363,12 @@ error: sha256 prefix required (e.g. 'sha256:abcd...')
 ```
 
 To act on a ref's content you redirect `omo cat` into a file yourself and
-diff it — there is no command that swaps your working tree to match a ref. This is
-the single biggest gap versus git, and the one workspaces is designed to close.
+diff it — there is no command that swaps your working tree to match a ref.
+Workspaces (§3, M2) landed with per-agent working directories and
+auto-snapshotting, and the object store can already materialize a stored tree
+back to disk (it is how the merge queue validates a submission's content), but a
+user-facing `omo switch` / `checkout` verb that swaps your working tree to a ref
+is still the single biggest ergonomic gap versus git.
 
 ### Undo and history
 
@@ -394,21 +398,27 @@ The undo (`#2`) removed the `feature` ref, and the log keeps *all three* entries
 history is a bi-temporal record you can query and invert, not a mutable pointer
 you rewrite. (More on the op log vs the reflog in §6.)
 
-### Coming with workspaces (M2)
+### What workspaces (M2) landed — and the git verbs still missing
 
-The section above is a stopgap. The workspaces milestone (design-doc M2) brings
-the ergonomic verbs a git user actually reaches for:
+The workspaces milestone **has landed**: `omo workspace add` registers per-agent
+working directories over one shared object store, working-copy edits
+auto-snapshot into change stacks (§3.1), and submissions land through named
+queues (§3.4). The `ref set` / `hash-object` dance above is the low-level
+substrate those verbs sit on, not the everyday path.
 
-- **`omo commit`** — snapshot a working copy into a change (a whole-tree snapshot
-  with a message), advancing a ref in one step instead of `hash-object` +
-  `ref set` on a single file.
-- **`omo branch`** — first-class create / list / delete of named branches, instead
-  of setting refs by hand.
-- **`omo switch` / `checkout`** — materialize a change back into working files, and
-  move between multiple working copies over one shared object store.
+What is **still absent** is the git-verb ergonomics a git user reaches for by
+name — and two of the three are deliberate omissions, not pending work:
 
-When those land, this section will be **rewritten against the real verbs**. For
-now, treat the flow above as the honest truth of what runs today.
+- **`omo commit`** — there is no message-bearing snapshot verb; workspaces
+  **auto-snapshot** instead (P4), so a "commit" is a query/mutation side effect,
+  not a command you run. A named `commit` verb may still be added for muscle
+  memory.
+- **`omo branch`** — intentionally absent. Branches are **not a primary object**
+  (§5.9); the primary objects are changes and stacks, and bookmarks are
+  read-only interop shadows. There is no plan for locally-mutable branch names.
+- **`omo switch` / `checkout`** — genuinely missing: nothing swaps your working
+  tree to a ref yet, though the underlying materialize capability exists (see
+  the note in "Switching today", above).
 
 ---
 
@@ -787,16 +797,22 @@ lower `--threshold` (e.g. `0.5`) when using `--real-embeddings`.
 
 ## 7. Current limitations (honest)
 
-This build scaffolds the design doc faithfully but is explicit about what is not
-yet the real thing:
+This build implements the design doc's core end to end but is explicit about
+what is not yet the real thing:
 
-- **No everyday `commit` / `branch` / `switch` verbs yet.** There is no `omo
-  commit` (a message-bearing, working-tree snapshot), no `omo branch`, and no `omo
-  switch` / `checkout` — omo never materializes a stored tree back into your
-  working files. Today you assemble the loop by hand from `hash-object`,
-  `ref set`, `cat-object`, and `diff`, as documented in §3. These ergonomic verbs
-  are coming with **workspaces (design-doc M2)**, and §3 will be rewritten against
-  them when they land.
+- **No `commit` / `branch` / `switch` verbs — mostly by design.** Workspaces (M2)
+  landed (`omo workspace`, `omo stack`, auto-snapshotting), so the everyday path
+  is workspaces + stacks + submissions, not the hand-assembled `hash-object` /
+  `ref set` loop. But there is no `omo commit` (auto-snapshot replaces it), no
+  `omo branch` (branches are deliberately not a primary object, §5.9), and no
+  `omo switch` / `checkout` — nothing yet swaps your working tree to a ref, though
+  the underlying materialize capability exists. See §3's "git verbs still missing".
+- **Landing is immediate, not a persistent queue.** `omo land` applies queue
+  policy and transitions `Draft → Public` synchronously; there is no standing
+  queue membership, `queued()` revset, or single-writer landing daemon
+  (ADR-0008 Option C) yet. Approvals are single-reviewer, and batch/backport
+  soundness rests on identity/support witnesses rather than the general I5
+  commutation certificate (ADR-0009 future work).
 - **Git transport is read-only and local.** There is no `git push` / `receive-pack` (which requires packfile encoding), and no networked (http/ssh) socket transports. `omo git fetch` works over the local `file://` / path transport — a real pkt-line / upload-pack clone — and full packfile/delta decoding (`OFS_DELTA`/`REF_DELTA`) is supported across `omo git fetch`, `import`, `verify`, and `export`.
 - **Real embeddings need the network on first use.** The offline default is a
   deterministic hashing stand-in (fully reproducible, no download). The real

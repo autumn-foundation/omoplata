@@ -8,11 +8,15 @@ believed); and reads and writes the git object format so it can be smuggled in a
 a backend behind existing tooling. Every accepted merge is checked; everything
 else degrades to an honest, first-class conflict.
 
-> **Status: implementation in progress.** This repository scaffolds the core of
+> **Status: implementation in progress.** This repository implements the core of
 > [`Omoplata_design_doc.md`](Omoplata_design_doc.md) end to end through the `omo`
 > CLI — an 8-crate workspace covering the object store, patch algebra, definition
 > identity, the bi-temporal operation log, Tier-2 merge drivers, git interop, and
-> the semantic layer. It is honest about its reductions: the merge kernel's
+> the semantic layer, plus the **working model** (§5.9: per-agent workspaces,
+> change stacks, `absorb`/`reorder`) and the **review-and-landing layer** (§5.10,
+> ADR-0009: submissions with approvals, named merge queues with per-queue policy,
+> Tier-0 batch landing at definition granularity, and certified backports). It is
+> honest about its reductions: the merge kernel's
 > **invariant I1b is machine-checked in Verus** (with I10 disjoint commutation
 > proven for the length-preserving core; I5-proper still property-tested — see
 > ADR-0003 and [`verus/`](verus/)) and the
@@ -210,18 +214,42 @@ the definitive statement of what is *not* yet the real thing:
   the object store. The schema exists even though the named engine does not;
   building that engine is out-of-scope-by-design (ADR-0002, R5).
 
-**Genuinely not yet implemented from the design doc:**
+**Since this section was first written, several items moved from "not yet" to
+shipped** — recorded here so the reductions stay honest:
 
-- The **I8 runtime kernel-admission check** (every merge result carries a checked
-  commutation witness or is a Conflict value) is not hosted as a single enforced
-  boundary the drivers pass through — future work.
+- **The working and landing layer is real, not scaffolded.** `omo workspace` /
+  `stack` / `absorb` / `reorder` (§5.9) and `omo submit` / `approve` / `land` /
+  `backport` / `queue` (§5.10, ADR-0009) drive the change-graph end to end:
+  submissions carry approvals, landing is the `Draft → Public` phase transition,
+  named queues gate on per-queue policy (P9 validator, approval, carried-conflict
+  rule), `omo land a b c` batches **pairwise-disjoint changes at definition
+  granularity** (two agents editing different definitions of one file batch),
+  and `omo backport` carries approval forward under an identity certificate.
+- **Conflicts-as-values propagate through the merge path** (§5.4, P3): the Rust
+  structural driver merges at definition granularity **recursing into
+  `impl`/`mod`/`trait` members**, carries pre-existing conflict values through
+  untouched definitions (`omo merge-file` reports them, exits 2), and
+  `omo conflicts <file>` lists them pinned to their definitions. `omo rebase` /
+  `omo autorebase` carry conflicts as values through the change graph and op log
+  rather than blocking.
+- **Kernel admission is a live boundary:** `omo merge-file` passes every clean
+  driver proposal through `kernel::certify`, downgrading to a Conflict when the
+  kernel cannot independently witness it; `omo admit` runs the kernel directly.
+
+**Genuinely still reduced or not implemented from the design doc:**
+
+- **Landing is immediate, not a persistent queue.** `land` applies policy and
+  transitions synchronously; there is no standing queue membership, `queued()`
+  revset, or single-writer landing daemon (ADR-0008 Option C) yet — the daemon
+  is the documented destination that internalizes today's per-command lock.
+- **Approvals are single-reviewer** (`require_approval: bool`); multi-approval
+  thresholds and named-reviewer policies await the bi-temporal approval model
+  (§5.6). **Batch disjointness and backport certificates use identity/support
+  witnesses**, not the general I5 commutation certificate (future work, ADR-0009).
+- The **I8 kernel-admission check** is hosted at `merge-file`/`admit`, but is not
+  yet threaded as a mandatory gate through the landing path or every driver call
+  site — future work.
 - Git **packfile/delta decoding** (index v2, packfile v2/v3, `OFS_DELTA`, `REF_DELTA`) and **wire-protocol fetch over local transport** (`omo git fetch`) are implemented, closing the I9 `import → export → bit-identical` loop across both loose and packed objects. Outstanding git future work is **push (`receive-pack`)** (which requires a packfile encoder) and **networked (`http`/`ssh`) socket transports** (not offline-testable).
-- **Conflicts-as-values propagation through rebases** and **auto-rebase** (P3/P4
-  beyond the op-log undo) are modeled in the algebra but not wired as a working
-  rebase loop.
-- **Change identity across rebase/amend** (stable Change-IDs, phases wired through
-  the CLI) is present in `omoplata-identity` but not surfaced as end-to-end CLI
-  workflows.
 - Multi-language structural drivers **beyond Rust**, any **server/forge**, and any
   **UI beyond the CLI** are explicitly out of v1 scope.
 
