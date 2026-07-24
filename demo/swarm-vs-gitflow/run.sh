@@ -174,9 +174,9 @@ open(f"{out}/r2b_left.rs", "w").write(left)
 open(f"{out}/r2b_right.rs", "w").write(right)
 EOF
 git merge-file -p "$OUT/r2b_left.rs" "$HERE/base/src/lib.rs" "$OUT/r2b_right.rs" > "$OUT/r2b_git.rs"
-echo "git:  exit=$? copies-of-is_empty=$(grep -c 'pub fn is_empty' "$OUT/r2b_git.rs")  <- exit 0, duplicate method, does not compile"
+echo "git:  exit=$? copies-of-is_empty=$(grep -c 'pub fn is_empty' "$OUT/r2b_git.rs") markers=$(grep -c '^<<<<<<<' "$OUT/r2b_git.rs")  <- exit 0, duplicate method, does not compile"
 "$OMO" merge-file "$HERE/base/src/lib.rs" "$OUT/r2b_left.rs" "$OUT/r2b_right.rs" > "$OUT/r2b_omo.rs" 2>/dev/null
-echo "omo:  exit=$? copies-of-is_empty=$(grep -c 'pub fn is_empty' "$OUT/r2b_omo.rs")  <- ALSO exit 0 and broken (line-merge inside impl block)"
+echo "omo:  exit=$? copies-of-is_empty=$(grep -c 'pub fn is_empty' "$OUT/r2b_omo.rs") markers=$(grep -c '^<<<<<<<' "$OUT/r2b_omo.rs")  <- member-granularity: honest scoped conflict, both variants inside the marker block"
 cat > "$OUT/validate.sh" <<'SH'
 #!/bin/sh
 d=$(mktemp -d) && mkdir -p "$d/src" && cp "$1" "$d/src/lib.rs"
@@ -189,7 +189,48 @@ if "$OMO" merge-file "$HERE/base/src/lib.rs" "$OUT/r2b_left.rs" "$OUT/r2b_right.
 else
   echo "omo --validate: $(tail -1 "$OUT/r2b_val.err")"
 fi
-tally+=("R2b  duplicate work: BOTH engines silently merge a broken file; omo's P9 --validate demotes it to a semantic conflict, git has no equivalent below forge CI")
+tally+=("R2b  duplicate work: git silently merges a broken file (P9 --validate is git's missing net); omo member granularity makes it an honest scoped conflict")
+
+# ---------------------------------------- Round 3: the queue that never blocks
+say "Round 3: conflicts as values — land ON TOP of an unresolved conflict"
+R3="$OUT/round3"; mkdir -p "$R3"
+cp "$HERE/base/src/lib.rs" "$R3/trunk.rs"
+for i in 3 1 2; do
+  "$OMO" merge-file "$HERE/base/src/lib.rs" "$R3/trunk.rs" "$OUT/agents/agent-$i/src/lib.rs" > "$R3/m.rs" 2>/dev/null \
+    && cp "$R3/m.rs" "$R3/trunk.rs"
+done
+"$OMO" merge-file "$HERE/base/src/lib.rs" "$R3/trunk.rs" "$OUT/agents/agent-5/src/lib.rs" > "$R3/m5.rs" 2>/dev/null
+echo "agent-5: genuine conflict (exit $?) -> adopted AS trunk, unresolved (conflict as value)"
+cp "$R3/m5.rs" "$R3/trunk.rs"
+"$OMO" merge-file "$HERE/base/src/lib.rs" "$R3/trunk.rs" "$OUT/agents/agent-4/src/lib.rs" > "$R3/m4.rs" 2> "$R3/m4.err"
+r3exit=$?
+echo "agent-4 lands on the CONFLICTED trunk: exit $r3exit — $(cat "$R3/m4.err")"
+cp "$R3/m4.rs" "$R3/trunk.rs"
+echo "queryable: $("$OMO" conflicts "$R3/trunk.rs" | head -1)"
+# Resolution is a commit that collapses the term — applied LAST, after
+# everything else landed around it.
+python3 - "$R3/trunk.rs" <<'EOF'
+import sys
+text = open(sys.argv[1]).read()
+conflicted = """<<<<<<< left
+    if urgency >= 95 {
+        Priority::Critical
+    } else if urgency >= 80 {
+=======
+    if urgency >= 75 {
+>>>>>>> right
+"""
+resolved = """    if urgency >= 95 {
+        Priority::Critical
+    } else if urgency >= 75 {
+"""
+assert conflicted in text, "unexpected conflict shape"
+open(sys.argv[1], "w").write(text.replace(conflicted, resolved))
+EOF
+mkdir -p "$R3/final/src" && cp "$HERE/base/Cargo.toml" "$R3/final/" && cp "$R3/trunk.rs" "$R3/final/src/lib.rs"
+if (cd "$R3/final" && cargo test -q >/dev/null 2>&1); then r3final=PASS; else r3final=FAIL; fi
+echo "resolved last; final tests: $r3final"
+tally+=("R3   conflict rides through a later landing (exit 2, carried), queryable via 'omo conflicts', resolved last; tests: $r3final")
 
 # --------------------------------------------------------- contention at n=10
 say "Contention: 10 concurrent writers against one shared repo"

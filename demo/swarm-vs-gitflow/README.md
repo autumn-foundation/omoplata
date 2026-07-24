@@ -51,14 +51,35 @@ produced **one copy with the edit applied** (kernel downgraded pending
 validation, and validation passes).
 
 **R2b, duplicate work** (two agents independently implement `is_empty`, different
-bodies, different positions in the impl block). **Both** engines exit 0 with two
-copies of the method — a file that does not compile. This is an honest black
-mark for the current Tier-2 driver: inside an impl block it degrades to line
-merge, and §5.7 duplicate-work detection is not wired into the merge path.
-The difference is what stands behind the mistake: `omo merge-file
---validate 'cargo check'` (P9) demotes the broken merge to a **semantic
-conflict before landing**, in-band; git has nothing below forge-side CI, which
-runs after the merge commit exists.
+bodies, different positions in the impl block). Git exits 0 with two copies of
+the method — a file that does not compile — and has nothing below forge-side CI
+to catch it. In the *first* run of this demo, omoplata failed the same way (the
+Tier-2 driver line-merged impl interiors); that finding drove the
+member-granularity extension below, and the driver now surfaces an **honest,
+member-scoped conflict** (both variants inside one marker block, exit 1).
+Identical double-adds dedupe to a single copy. P9 `--validate` remains the
+backstop for whatever granularity misses.
+
+### Round 3 — conflicts as values: the queue that never blocks
+
+With conflict-value propagation in the driver (§5.4, P3), the round-1 sequence
+replays **without resolving the genuine conflict first**:
+
+1. agents 3, 1, 2 land clean;
+2. agent-5's landing produces the genuine conflict — the conflicted output is
+   adopted as trunk, *unresolved*;
+3. agent-4 lands **on top of the conflicted trunk**: exit 2,
+   `0 new conflict(s), 1 carried forward` — his feature integrates
+   structurally around the conflict, which rides through byte-identically;
+4. `omo conflicts trunk.rs` pins the value: `priority_of line 16`;
+5. the resolution is applied **last** ("resolution is a commit that collapses
+   the term"); final tests pass.
+
+Before this change, a conflict in trunk poisoned the parse gate and degraded
+every subsequent structural merge to a line merge — the queue had to stop for
+a human. Now landing throughput is independent of resolution latency: exactly
+the property a 20–30-agent swarm needs, where one stuck conflict must not
+stall the other 29 agents' landings.
 
 ### Contention — 10 concurrent writers, one shared repo
 
@@ -91,11 +112,17 @@ advantages for swarm development are:
    which is exactly the property a swarm operator wants when no human reads
    every diff.
 
+4. **Non-blocking landing under conflict** (round 3). Conflicts ride through
+   subsequent landings as first-class, queryable values and are resolved when
+   convenient — landing throughput decouples from resolution latency, which is
+   what lets a large fleet keep landing while one conflict waits for a human.
+
 Costs observed: kernel downgrades tax legitimate merges with validation steps
-(1 of 5 landings in round 1); the impl-block-interior granularity gap (R2b) is
-the concrete next work item — extend definition-granularity matching inside
-impl blocks, or wire duplicate-definition detection into the driver, so that
-case becomes an honest conflict *without* needing the validator.
+(1 of 5 landings in round 1). The two gaps the first run of this demo exposed —
+line-merged impl interiors (R2b) and the parse gate rejecting conflict-carrying
+files — were closed by the member-granularity and conflict-value-propagation
+extensions to the Rust structural driver; R2b and round 3 above measure the
+result.
 
 ## Files
 

@@ -52,6 +52,7 @@ impl MergeDriver for LineDriver {
         Ok(DriverOutput {
             merged: merge.merged.to_string(),
             conflicts: merge.conflicts,
+            carried: Vec::new(),
             driver: self.name(),
         })
     }

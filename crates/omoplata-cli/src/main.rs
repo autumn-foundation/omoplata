@@ -126,6 +126,19 @@ enum Command {
         #[arg(long, value_name = "CMD")]
         validate: Option<String>,
     },
+    /// List the conflict values carried by a file (§5.4: conflicts are
+    /// first-class, queryable values).
+    ///
+    /// Scans the file for `<<<<<<<` / `=======` / `>>>>>>>` marker blocks and
+    /// pins each to the definition containing it (Rust files; other files are
+    /// scanned without definition pinning). Prints one line per value:
+    /// `<definition> line <n>: <l> line(s) left | <r> line(s) right`.
+    /// Exits 0 when the file carries no values, 2 when it carries some, and
+    /// non-zero with an error for a malformed marker structure.
+    Conflicts {
+        /// The file to scan.
+        path: PathBuf,
+    },
     /// Kernel admission of a three-way merge (§3 P1, §6 invariant I8).
     ///
     /// Runs the trusted kernel directly on three files: it independently diffs
@@ -508,6 +521,7 @@ fn run() -> anyhow::Result<i32> {
             right,
             validate,
         } => cmd_merge_file(base, left, right, validate),
+        Command::Conflicts { path } => cmd_conflicts(path),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
         Command::Autorebase {
@@ -1287,13 +1301,33 @@ fn cmd_merge_file(
     })?;
 
     let n = out.conflicts.len();
+    let k = out.carried.len();
 
     // A driver conflict is already honest; report and exit non-zero. Nothing
     // provisional to validate — the validator is not run (P9).
-    if !out.is_clean() {
+    if !out.is_mergeable() {
         print!("{}", out.merged);
-        eprintln!("{} merge: {n} conflict(s)", out.driver);
+        if k == 0 {
+            eprintln!("{} merge: {n} conflict(s)", out.driver);
+        } else {
+            eprintln!("{} merge: {n} conflict(s), {k} carried forward", out.driver);
+        }
         return Ok(1);
+    }
+
+    // No NEW conflicts, but conflict values from the inputs rode through
+    // (§5.4, P3: "rebase maps over conflicts"). The merge is mergeable — the
+    // rest of the file integrated structurally — but the output is not a
+    // candidate final document, so the kernel and validator are not run.
+    // Exit 2 distinguishes "landable, carrying unresolved values" from both
+    // success (0) and fresh conflict (1); `omo conflicts` lists the values.
+    if k > 0 {
+        print!("{}", out.merged);
+        eprintln!(
+            "{} merge: 0 new conflict(s), {k} carried forward (values ride through; resolve later)",
+            out.driver
+        );
+        return Ok(2);
     }
 
     eprintln!("{} merge: {n} conflict(s)", out.driver);
@@ -1407,6 +1441,33 @@ fn render_semantic_conflict(conflict: &Conflict) -> String {
 
 /// `omo admit <base> <left> <right>` — trusted kernel admission (§3 P1, §6 I8).
 ///
+/// `omo conflicts <path>` — list the conflict values a file carries (§5.4).
+///
+/// Each value is pinned to the definition containing it (via the same
+/// sanitize-then-parse pass the structural driver uses). Exit 0 = no values,
+/// 2 = values present, error on malformed marker structure.
+fn cmd_conflicts(path: PathBuf) -> anyhow::Result<i32> {
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let values = omoplata_drivers::rust::conflict_values(&text)
+        .with_context(|| format!("{}: malformed conflict markers", path.display()))?;
+    if values.is_empty() {
+        println!("no conflict values");
+        return Ok(0);
+    }
+    for v in &values {
+        let definition = v.definition.as_deref().unwrap_or("(between definitions)");
+        println!(
+            "{definition}  line {}: {} line(s) left | {} line(s) right",
+            v.line,
+            v.left.len(),
+            v.right.len()
+        );
+    }
+    eprintln!("{} conflict value(s) carried", values.len());
+    Ok(2)
+}
+
 /// Runs `kernel::admit` directly on the three files — no proposer involved. On
 /// admission, prints the merged document to stdout and the commutation-witness
 /// summary to stderr (exit 0). On conflict, prints the merged-with-markers view

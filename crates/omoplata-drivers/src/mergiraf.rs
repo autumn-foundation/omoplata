@@ -170,7 +170,8 @@ impl MergeDriver for MergirafDriver {
                 Ok(DriverOutput {
                     merged,
                     conflicts: Vec::new(),
-                    driver: self.name(),
+                    carried: Vec::new(),
+            driver: self.name(),
                 })
             }
             Some(1) => {
@@ -179,7 +180,8 @@ impl MergeDriver for MergirafDriver {
                 Ok(DriverOutput {
                     merged,
                     conflicts,
-                    driver: self.name(),
+                    carried: Vec::new(),
+            driver: self.name(),
                 })
             }
             other => {

@@ -393,3 +393,171 @@ fn mergiraf_reports_same_key_conflict() {
         "right side of conflict should carry `3`: {c:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Container recursion: definition granularity inside impl/mod/trait blocks
+// ---------------------------------------------------------------------------
+
+const IMPL_BASE: &str = "struct Q { n: usize }\n\nimpl Q {\n    fn len(&self) -> usize {\n        self.n\n    }\n\n    fn pop(&mut self) -> usize {\n        self.n -= 1;\n        self.n\n    }\n}\n";
+
+/// Two sides adding *different* methods to the same impl block — at different
+/// anchors — merge cleanly at member granularity (previously an interior line
+/// merge that could silently interleave).
+#[test]
+fn impl_disjoint_method_adds_merge_clean() {
+    let left = IMPL_BASE.replace(
+        "    fn pop(&mut self)",
+        "    fn is_empty(&self) -> bool {\n        self.n == 0\n    }\n\n    fn pop(&mut self)",
+    );
+    let right = IMPL_BASE.replace(
+        "        self.n\n    }\n}",
+        "        self.n\n    }\n\n    fn clear(&mut self) {\n        self.n = 0;\n    }\n}",
+    );
+    let out = structural(IMPL_BASE, &left, &right);
+    assert!(out.is_clean(), "expected clean merge, got: {}", out.merged);
+    assert!(out.merged.contains("fn is_empty") && out.merged.contains("fn clear"));
+    // Exactly one impl block in the output.
+    assert_eq!(out.merged.matches("impl Q").count(), 1);
+}
+
+/// Duplicate work: both sides independently add a method with the same name,
+/// different bodies, at different anchors. A line merge compiles both copies
+/// in silently; member granularity must surface an honest conflict.
+#[test]
+fn impl_same_name_add_is_honest_conflict() {
+    let left = IMPL_BASE.replace(
+        "    fn pop(&mut self)",
+        "    fn is_empty(&self) -> bool {\n        self.n == 0\n    }\n\n    fn pop(&mut self)",
+    );
+    let right = IMPL_BASE.replace(
+        "        self.n\n    }\n}",
+        "        self.n\n    }\n\n    fn is_empty(&self) -> bool {\n        self.len() == 0\n    }\n}",
+    );
+    let out = structural(IMPL_BASE, &left, &right);
+    assert!(!out.is_clean(), "duplicate add must not merge silently");
+    assert_eq!(out.conflicts.len(), 1);
+    assert!(out.merged.contains("<<<<<<<"), "conflict must be rendered");
+}
+
+/// Both sides add an *identical* method: include it once, clean.
+#[test]
+fn impl_same_name_identical_add_dedupes() {
+    let addition = "    fn is_empty(&self) -> bool {\n        self.n == 0\n    }\n\n";
+    let left = IMPL_BASE.replace("    fn pop", &format!("{addition}    fn pop"));
+    let right = IMPL_BASE.replace("    fn pop", &format!("{addition}    fn pop"));
+    let out = structural(IMPL_BASE, &left, &right);
+    assert!(out.is_clean());
+    assert_eq!(out.merged.matches("fn is_empty").count(), 1);
+}
+
+/// A container whose header changed on one side falls back to the interior
+/// line merge and still merges when the edits are line-disjoint.
+#[test]
+fn impl_header_change_falls_back_to_line_interior() {
+    let left = IMPL_BASE.replace("impl Q {", "impl Q {\n    // note\n");
+    let right = IMPL_BASE.replace("self.n -= 1;", "self.n = self.n.saturating_sub(1);");
+    let out = structural(IMPL_BASE, &left, &right);
+    assert!(out.is_clean(), "line-disjoint edits should merge: {}", out.merged);
+}
+
+// ---------------------------------------------------------------------------
+// Conflicts as values: ride-through and honest nesting (§5.4, P3)
+// ---------------------------------------------------------------------------
+
+const CV_BASE: &str = "fn alpha() -> u32 {\n    1\n}\n\nfn beta() -> u32 {\n    2\n}\n";
+
+/// A left side carrying an unresolved conflict value in `alpha`.
+fn cv_left() -> String {
+    CV_BASE.replace(
+        "fn alpha() -> u32 {\n    1\n}",
+        "fn alpha() -> u32 {\n<<<<<<< left\n    10\n=======\n    11\n>>>>>>> right\n}",
+    )
+}
+
+/// The other side edits a *different* definition: the conflict value rides
+/// through byte-identically, the other edit merges, and the carried value is
+/// reported out-of-band — the merge is mergeable, not failed.
+#[test]
+fn conflict_value_rides_through_disjoint_merge() {
+    let left = cv_left();
+    let right = CV_BASE.replace("    2\n", "    22\n");
+    let out = structural(CV_BASE, &left, &right);
+    assert_eq!(out.driver, "rust-structural", "must not degrade to line");
+    assert!(out.conflicts.is_empty(), "no NEW conflicts: {}", out.merged);
+    assert_eq!(out.carried.len(), 1, "the value must be carried");
+    assert!(out.is_mergeable() && !out.is_clean());
+    // The carried block is preserved verbatim and the disjoint edit landed.
+    assert!(out.merged.contains("<<<<<<< left\n    10\n=======\n    11\n>>>>>>> right"));
+    assert!(out.merged.contains("    22\n"));
+}
+
+/// The other side edits the SAME definition that carries the value: nest
+/// honestly as a fresh conflict — both full texts survive, nothing is picked.
+#[test]
+fn conflict_value_nests_when_both_touch() {
+    let left = cv_left();
+    let right = CV_BASE.replace("fn alpha() -> u32 {\n    1\n}", "fn alpha() -> u32 {\n    99\n}");
+    let out = structural(CV_BASE, &left, &right);
+    assert_eq!(out.conflicts.len(), 1, "must be a fresh conflict");
+    assert!(out.merged.contains("    99"), "right's text must survive");
+    assert!(out.merged.contains("    10"), "carried left variant must survive");
+}
+
+/// A side that differs from a conflict-carrying base is a resolution: it wins
+/// and the term collapses (no carried values remain).
+#[test]
+fn resolution_collapses_carried_conflict() {
+    let base = cv_left(); // base itself carries the value
+    let left = CV_BASE.replace("fn alpha() -> u32 {\n    1\n}", "fn alpha() -> u32 {\n    10\n}");
+    let right = base.clone(); // right leaves the conflict untouched
+    let out = structural(&base, &left, &right);
+    assert!(out.is_clean(), "resolution should collapse: {}", out.merged);
+    assert!(out.merged.contains("    10") && !out.merged.contains("<<<<<<<"));
+}
+
+/// Conflict values are queryable, pinned to their containing definition.
+#[test]
+fn conflict_values_are_queryable() {
+    let vals = crate::rust::conflict_values(&cv_left()).expect("well-formed");
+    assert_eq!(vals.len(), 1);
+    assert_eq!(vals[0].definition.as_deref(), Some("alpha"));
+    assert_eq!(vals[0].line, 2);
+    assert_eq!(vals[0].left, vec!["    10".to_owned()]);
+}
+
+/// Malformed marker structure (unterminated block) bails to the line driver
+/// rather than guessing.
+#[test]
+fn malformed_markers_fall_back_to_line() {
+    let left = CV_BASE.replace("    1\n", "<<<<<<< left\n    1\n");
+    let out = structural(CV_BASE, &left, CV_BASE);
+    assert_eq!(out.driver, "line");
+}
+
+/// A member-scoped conflict (as rendered by container recursion, with the
+/// start marker indented) must also ride through a later disjoint merge —
+/// end-to-end: produce the conflict via a merge, then merge again on top.
+#[test]
+fn member_conflict_value_rides_through_next_merge() {
+    // Round A: duplicate-work conflict inside the impl block.
+    let left = IMPL_BASE.replace(
+        "    fn pop(&mut self)",
+        "    fn is_empty(&self) -> bool {\n        self.n == 0\n    }\n\n    fn pop(&mut self)",
+    );
+    let right = IMPL_BASE.replace(
+        "        self.n\n    }\n}",
+        "        self.n\n    }\n\n    fn is_empty(&self) -> bool {\n        self.len() == 0\n    }\n}",
+    );
+    let a = structural(IMPL_BASE, &left, &right);
+    assert_eq!(a.conflicts.len(), 1);
+
+    // Round B: the conflicted output is the new left; the new right makes a
+    // disjoint edit to a different top-level item.
+    let right_b = IMPL_BASE.replace("struct Q { n: usize }", "struct Q { n: u64 }");
+    let b = structural(IMPL_BASE, &a.merged, &right_b);
+    assert_eq!(b.driver, "rust-structural", "must not degrade: {}", b.merged);
+    assert!(b.conflicts.is_empty(), "no new conflicts: {}", b.merged);
+    assert_eq!(b.carried.len(), 1, "member conflict must be carried");
+    assert!(b.merged.contains("n: u64"), "disjoint edit must land");
+    assert!(b.merged.contains("<<<<<<<"), "value preserved");
+}
