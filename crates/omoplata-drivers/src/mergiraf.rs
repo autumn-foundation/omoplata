@@ -171,7 +171,7 @@ impl MergeDriver for MergirafDriver {
                     merged,
                     conflicts: Vec::new(),
                     carried: Vec::new(),
-            driver: self.name(),
+                    driver: self.name(),
                 })
             }
             Some(1) => {
@@ -181,7 +181,7 @@ impl MergeDriver for MergirafDriver {
                     merged,
                     conflicts,
                     carried: Vec::new(),
-            driver: self.name(),
+                    driver: self.name(),
                 })
             }
             other => {

@@ -89,8 +89,7 @@
 
 use omoplata_algebra::{merge3, Conflict, Doc, CONFLICT_END, CONFLICT_SEP, CONFLICT_START};
 use omoplata_identity::{
-    extract_definitions, match_definitions, parses_cleanly, Definition, DefinitionKind,
-    MatchStatus,
+    extract_definitions, match_definitions, parses_cleanly, Definition, DefinitionKind, MatchStatus,
 };
 
 use crate::{DriverError, DriverOutput, LineDriver, MergeDriver, MergeInput};
@@ -154,11 +153,7 @@ impl MergeDriver for RustStructuralDriver {
         // Segment all three sides into top-level items + inter-item gaps, then
         // pin each side's conflict values to the item that contains them. A
         // conflict value outside any item (or spanning items) bails.
-        let (base, left, right) = match (
-            base_p.segment(),
-            left_p.segment(),
-            right_p.segment(),
-        ) {
+        let (base, left, right) = match (base_p.segment(), left_p.segment(), right_p.segment()) {
             (Some(b), Some(l), Some(r)) => (b, l, r),
             _ => return LineDriver::new().merge(input),
         };
@@ -228,11 +223,15 @@ fn scan_marker_blocks(text: &str) -> Option<Vec<(usize, usize, MarkerBlock)>> {
             // trailing newline (kept as surrounding text).
             let bend = start + stripped.len();
             let original = text.get(bstart..bend)?.to_owned();
-            blocks.push((bstart, bend, MarkerBlock {
-                original,
-                left,
-                right,
-            }));
+            blocks.push((
+                bstart,
+                bend,
+                MarkerBlock {
+                    original,
+                    left,
+                    right,
+                },
+            ));
         } else if let Some((_, left, right)) = cur.as_mut() {
             match right {
                 Some(r) => r.push(stripped.to_owned()),
@@ -299,13 +298,15 @@ impl Prepared {
         // and record the carried conflict values.
         for (idx, rel, block) in pins.into_iter().rev() {
             let item = seg.items.get_mut(idx)?;
-            item.original_text
-                .replace_range(rel, &block.original);
-            item.carried.insert(0, Conflict {
-                base: Vec::new(),
-                left: block.left.clone(),
-                right: block.right.clone(),
-            });
+            item.original_text.replace_range(rel, &block.original);
+            item.carried.insert(
+                0,
+                Conflict {
+                    base: Vec::new(),
+                    left: block.left.clone(),
+                    right: block.right.clone(),
+                },
+            );
         }
         Some(seg)
     }

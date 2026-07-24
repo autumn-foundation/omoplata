@@ -457,7 +457,11 @@ fn impl_header_change_falls_back_to_line_interior() {
     let left = IMPL_BASE.replace("impl Q {", "impl Q {\n    // note\n");
     let right = IMPL_BASE.replace("self.n -= 1;", "self.n = self.n.saturating_sub(1);");
     let out = structural(IMPL_BASE, &left, &right);
-    assert!(out.is_clean(), "line-disjoint edits should merge: {}", out.merged);
+    assert!(
+        out.is_clean(),
+        "line-disjoint edits should merge: {}",
+        out.merged
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +491,9 @@ fn conflict_value_rides_through_disjoint_merge() {
     assert_eq!(out.carried.len(), 1, "the value must be carried");
     assert!(out.is_mergeable() && !out.is_clean());
     // The carried block is preserved verbatim and the disjoint edit landed.
-    assert!(out.merged.contains("<<<<<<< left\n    10\n=======\n    11\n>>>>>>> right"));
+    assert!(out
+        .merged
+        .contains("<<<<<<< left\n    10\n=======\n    11\n>>>>>>> right"));
     assert!(out.merged.contains("    22\n"));
 }
 
@@ -496,11 +502,17 @@ fn conflict_value_rides_through_disjoint_merge() {
 #[test]
 fn conflict_value_nests_when_both_touch() {
     let left = cv_left();
-    let right = CV_BASE.replace("fn alpha() -> u32 {\n    1\n}", "fn alpha() -> u32 {\n    99\n}");
+    let right = CV_BASE.replace(
+        "fn alpha() -> u32 {\n    1\n}",
+        "fn alpha() -> u32 {\n    99\n}",
+    );
     let out = structural(CV_BASE, &left, &right);
     assert_eq!(out.conflicts.len(), 1, "must be a fresh conflict");
     assert!(out.merged.contains("    99"), "right's text must survive");
-    assert!(out.merged.contains("    10"), "carried left variant must survive");
+    assert!(
+        out.merged.contains("    10"),
+        "carried left variant must survive"
+    );
 }
 
 /// A side that differs from a conflict-carrying base is a resolution: it wins
@@ -508,7 +520,10 @@ fn conflict_value_nests_when_both_touch() {
 #[test]
 fn resolution_collapses_carried_conflict() {
     let base = cv_left(); // base itself carries the value
-    let left = CV_BASE.replace("fn alpha() -> u32 {\n    1\n}", "fn alpha() -> u32 {\n    10\n}");
+    let left = CV_BASE.replace(
+        "fn alpha() -> u32 {\n    1\n}",
+        "fn alpha() -> u32 {\n    10\n}",
+    );
     let right = base.clone(); // right leaves the conflict untouched
     let out = structural(&base, &left, &right);
     assert!(out.is_clean(), "resolution should collapse: {}", out.merged);
@@ -555,7 +570,11 @@ fn member_conflict_value_rides_through_next_merge() {
     // disjoint edit to a different top-level item.
     let right_b = IMPL_BASE.replace("struct Q { n: usize }", "struct Q { n: u64 }");
     let b = structural(IMPL_BASE, &a.merged, &right_b);
-    assert_eq!(b.driver, "rust-structural", "must not degrade: {}", b.merged);
+    assert_eq!(
+        b.driver, "rust-structural",
+        "must not degrade: {}",
+        b.merged
+    );
     assert!(b.conflicts.is_empty(), "no new conflicts: {}", b.merged);
     assert_eq!(b.carried.len(), 1, "member conflict must be carried");
     assert!(b.merged.contains("n: u64"), "disjoint edit must land");
