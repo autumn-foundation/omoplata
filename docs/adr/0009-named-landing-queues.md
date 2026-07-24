@@ -122,14 +122,32 @@ by an agent fleet.
 
 ## Future work
 
+Four of the items originally listed here have since shipped in their v1
+shapes: **`landed(<queue>)` in revsets** (registry-driven ref disambiguation;
+`landed(trunk) & ~landed(release-1.2)` is the needs-backport query),
+**Tier-0 batching** (`omo land a b c` — batch validated as one, landed in one
+locked transaction), **definition-granularity Tier-0 disjointness** (support is
+the set of definitions a submission changed *relative to the queue's landed
+base*, computed by `rust_support`; two agents editing different definitions of
+one file batch, while a shared definition refuses the batch naming it —
+containers compare by their shell so member additions stay disjoint), and
+**mechanical backport offers** (`omo backport` carries approval forward with an
+*identity* certificate — content byte-identical to the reviewed, landed tip;
+moved content demands re-review).
+
+Still open:
+
 - **Multi-approval thresholds and named-reviewer policies.** `Approval` is a
   single-reviewer assertion today; §5.6 wants approvals as bi-temporal,
   revocable assertions. When that model lands, `require_approval: bool`
   generalizes to a count or reviewer-set predicate without changing the gate's
   shape.
-- **Queue verbs in revsets** (`queued()`, `landed(<queue>)`, §5.8).
-- **Batching within a queue** (Tier-0 disjoint batching, §5.10) and the
-  single-writer landing daemon (ADR-0008 Option C) that owns all queues.
-- **Auto-offer to sibling queues**: after a trunk landing, a commutation
-  certificate (I5) can prove a change applies cleanly to a release line and
-  offer the backport mechanically.
+- **Commutation-certificate backports for moved content** (I5): today's
+  backport certificate covers only the identity case; a checked-commutation
+  certificate would carry approval across content that provably rebased
+  cleanly. The same algebra would sharpen batch disjointness from "changed the
+  same definition" to "changed the same definition *incompatibly*", letting
+  line-disjoint edits to one definition batch too.
+- **`queued()`** awaits persistent queue membership (landing is immediate in
+  v1), which arrives with the single-writer landing daemon (ADR-0008 Option C)
+  that owns all queues.

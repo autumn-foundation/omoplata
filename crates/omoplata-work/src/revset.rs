@@ -45,6 +45,10 @@ pub enum RevExpr {
     Draft,
     /// Commits whose phase is [`Public`](Phase::Public) (`public()`).
     Public,
+    /// Commits landed in a named queue (`landed(release-1.2)`; bare `landed()`
+    /// means the implicit `trunk` queue). See ADR-0009: `landed(release-1.2) &
+    /// ~landed(trunk)` is the "needs backporting to trunk" query.
+    Landed(String),
 }
 
 /// The context a revset is evaluated against.
@@ -66,6 +70,18 @@ pub trait RevsetContext {
 
     /// The phase of a commit, or `None` if unknown.
     fn phase(&self, commit: &CommitId) -> Option<Phase>;
+
+    /// The commits landed in queue `queue` (ADR-0009) — the targets of its
+    /// per-queue public refs.
+    ///
+    /// Ref-namespace disambiguation: a non-`trunk` queue's landings live at
+    /// `public/<queue>/<change>`; `trunk` keeps the legacy `public/<change>`
+    /// shape, where `<change>` may itself contain `/` (e.g. `ws/hotfix`). A
+    /// `public/…` ref therefore belongs to a non-trunk queue **iff** its first
+    /// segment after `public/` names a *registered* queue, and to `trunk`
+    /// otherwise — which is why implementations need the registered-queue
+    /// name set.
+    fn landed(&self, queue: &str) -> BTreeSet<CommitId>;
 }
 
 /// A simple in-memory [`RevsetContext`] built from a ref map plus optional phase
@@ -78,6 +94,7 @@ pub struct MapContext {
     refs: std::collections::BTreeMap<String, CommitId>,
     phases: std::collections::BTreeMap<CommitId, Phase>,
     extra: BTreeSet<CommitId>,
+    queues: BTreeSet<String>,
 }
 
 impl MapContext {
@@ -88,7 +105,17 @@ impl MapContext {
             refs,
             phases: std::collections::BTreeMap::new(),
             extra: BTreeSet::new(),
+            queues: BTreeSet::new(),
         }
+    }
+
+    /// Record the registered queue names (ADR-0009), used by
+    /// [`landed`](RevsetContext::landed) to disambiguate `public/…` refs
+    /// between `trunk`'s legacy shape and per-queue namespaces.
+    #[must_use]
+    pub fn with_queues(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.queues.extend(names);
+        self
     }
 
     /// Record the phase of a commit (adding it to the universe).
@@ -124,6 +151,26 @@ impl RevsetContext for MapContext {
 
     fn phase(&self, commit: &CommitId) -> Option<Phase> {
         self.phases.get(commit).copied()
+    }
+
+    fn landed(&self, queue: &str) -> BTreeSet<CommitId> {
+        let mut out = BTreeSet::new();
+        for (name, commit) in &self.refs {
+            let Some(rest) = name.strip_prefix("public/") else {
+                continue;
+            };
+            let owner = match rest.split_once('/') {
+                // First segment names a registered queue ⇒ that queue's ref;
+                // otherwise the whole rest is a trunk change id (which may
+                // itself contain '/', e.g. `ws/hotfix`).
+                Some((first, _)) if self.queues.contains(first) => first,
+                _ => "trunk",
+            };
+            if owner == queue {
+                out.insert(commit.clone());
+            }
+        }
+        out
     }
 }
 
@@ -170,6 +217,7 @@ pub fn eval(expr: &RevExpr, ctx: &dyn RevsetContext) -> Result<BTreeSet<CommitId
         }
         RevExpr::Draft => Ok(phase_filter(ctx, Phase::Draft)),
         RevExpr::Public => Ok(phase_filter(ctx, Phase::Public)),
+        RevExpr::Landed(queue) => Ok(ctx.landed(queue)),
     }
 }
 
@@ -321,20 +369,36 @@ impl Parser {
             }
             Some(Token::Word(word)) => {
                 if matches!(self.peek(), Some(Token::LParen)) {
-                    // A function call: consume '(' ')'.
+                    // A function call: consume '(' [word] ')'.
                     self.pos += 1;
+                    let arg = if let Some(Token::Word(a)) = self.peek() {
+                        let a = a.clone();
+                        self.pos += 1;
+                        Some(a)
+                    } else {
+                        None
+                    };
                     match self.next() {
                         Some(Token::RParen) => {}
                         _ => {
                             return Err(WorkError::Parse(format!("expected ')' after {word}(")));
                         }
                     }
-                    match word.as_str() {
-                        "all" => Ok(RevExpr::All),
-                        "heads" => Ok(RevExpr::Heads),
-                        "draft" => Ok(RevExpr::Draft),
-                        "public" => Ok(RevExpr::Public),
-                        other => Err(WorkError::Parse(format!("unknown function '{other}'"))),
+                    match (word.as_str(), arg) {
+                        ("all", None) => Ok(RevExpr::All),
+                        ("heads", None) => Ok(RevExpr::Heads),
+                        ("draft", None) => Ok(RevExpr::Draft),
+                        ("public", None) => Ok(RevExpr::Public),
+                        // Bare landed() means the implicit trunk queue.
+                        ("landed", arg) => {
+                            Ok(RevExpr::Landed(arg.unwrap_or_else(|| "trunk".to_owned())))
+                        }
+                        (other, Some(arg)) => Err(WorkError::Parse(format!(
+                            "function '{other}' takes no argument (got '{arg}')"
+                        ))),
+                        (other, None) => {
+                            Err(WorkError::Parse(format!("unknown function '{other}'")))
+                        }
                     }
                 } else if let Some(hex) = word.strip_prefix("id:") {
                     if hex.is_empty() {
@@ -482,5 +546,65 @@ mod tests {
     fn parens_override_precedence() {
         let set = query("(a | b) & b", &ctx()).unwrap();
         assert_eq!(set, [commit("bbb")].into_iter().collect());
+    }
+}
+
+#[cfg(test)]
+mod landed_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn ctx() -> MapContext {
+        let mut refs = BTreeMap::new();
+        // trunk landings (legacy shape; change ids contain '/').
+        refs.insert("public/ws/a".to_owned(), CommitId::new("c-a"));
+        refs.insert("public/ws/b".to_owned(), CommitId::new("c-b"));
+        // release-line landings.
+        refs.insert(
+            "public/release-1.2/ws/a".to_owned(),
+            CommitId::new("c-a-12"),
+        );
+        // an unrelated draft ref.
+        refs.insert("ws/a".to_owned(), CommitId::new("c-a"));
+        MapContext::new(refs).with_queues(["release-1.2".to_owned()])
+    }
+
+    #[test]
+    fn landed_splits_trunk_from_named_queue() {
+        let ctx = ctx();
+        let trunk = ctx.landed("trunk");
+        assert!(trunk.contains(&CommitId::new("c-a")) && trunk.contains(&CommitId::new("c-b")));
+        assert!(!trunk.contains(&CommitId::new("c-a-12")));
+
+        let rel = ctx.landed("release-1.2");
+        assert_eq!(rel.len(), 1);
+        assert!(rel.contains(&CommitId::new("c-a-12")));
+    }
+
+    #[test]
+    fn trunk_change_whose_first_segment_is_not_a_queue_stays_trunk() {
+        // `ws/a` starts with `ws`, which is NOT a registered queue, so
+        // `public/ws/a` is a trunk landing even though it contains '/'.
+        let ctx = ctx();
+        assert!(ctx.landed("ws").is_empty());
+    }
+
+    #[test]
+    fn needs_backport_query_evaluates() {
+        let ctx = ctx();
+        // Landed in trunk but not yet in the release line.
+        let out = query("landed(trunk) & ~landed(release-1.2)", &ctx).unwrap();
+        assert!(out.contains(&CommitId::new("c-a")) && out.contains(&CommitId::new("c-b")));
+        assert!(!out.contains(&CommitId::new("c-a-12")));
+    }
+
+    #[test]
+    fn bare_landed_means_trunk_and_args_are_rejected_elsewhere() {
+        let ctx = ctx();
+        assert_eq!(
+            query("landed()", &ctx).unwrap(),
+            query("landed(trunk)", &ctx).unwrap()
+        );
+        assert!(matches!(parse("draft(x)"), Err(WorkError::Parse(_))));
     }
 }

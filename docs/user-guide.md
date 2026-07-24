@@ -253,6 +253,55 @@ queue release-1.2: validation FAILED
 error: queue "release-1.2" validation gate failed: validator exited non-zero
 ```
 
+### Batching, backports, and the needs-backport query
+
+Several submissions land as one **Tier-0 batch** (§5.10): submissions with
+disjoint *definition* support validate as one and land in a single locked
+transaction, and after any landing `omo` offers the mechanical backports.
+Disjointness is judged at **definition granularity** relative to the queue's
+landed state (ADR-0009), so two agents editing *different definitions of the
+same file* still batch — the case a fleet hits constantly:
+
+```console
+$ omo land sub-a sub-b
+batched 2 pairwise-disjoint submission(s) into queue trunk (validated as one)
+  landed sub-a: Submission sub-a landed in queue trunk
+  landed sub-b: Submission sub-b landed in queue trunk
+backport available: omo backport sub-a --to release-1.2
+backport available: omo backport sub-b --to release-1.2
+```
+
+Two submissions that touch the **same definition** overlap and refuse the whole
+batch, naming the definition (overlapping changes serialize; land them
+separately):
+
+```console
+$ omo land sub-c sub-d
+error: submissions sub-c and sub-d overlap on 1 path(s) (src/lib.rs (fn priority_of)); overlapping changes serialize — land them separately
+```
+
+`omo backport` lands an already-landed submission into a second queue with its
+**approval carried forward under a certificate** (§5.10). The v1 certificate is
+the identity witness — the change's tip is byte-identical to the tip that was
+reviewed and landed, so nothing needs re-review; content that moved since its
+landing refuses with a re-review demand instead:
+
+```console
+$ omo backport sub-alpha --to release-1.2
+backported sub-alpha: Submission sub-alpha landed in queue release-1.2 (approval by auto-reviewer carried forward: 1 certificate(s), witness: identity — content unchanged since review)
+```
+
+What still needs backporting is a **revset query**, not a branch comparison —
+`landed(<queue>)` resolves each queue's public refs (bare `landed()` means
+`trunk`):
+
+```console
+$ omo revset 'landed(trunk) & ~landed(release-1.2)'
+sha256:a786f9439cffed5e1751f357d78df193fb1a7a60d4814b09b7741a4d8c9a5e49
+```
+
+— exactly one commit: `sub-beta`'s tip, since `sub-alpha` was just backported.
+
 
 ### "Branching" today
 

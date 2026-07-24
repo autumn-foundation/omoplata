@@ -106,6 +106,24 @@ pub enum WorkError {
         reason: String,
     },
 
+    /// Two submissions in a batch overlap (§5.10 Tier-0): the same path
+    /// carries different content in each, so they cannot batch — land them
+    /// separately (they will serialize).
+    #[error(
+        "submissions {a} and {b} overlap on {} path(s) ({}); overlapping \
+         changes serialize — land them separately",
+        paths.len(),
+        paths.join(", ")
+    )]
+    BatchOverlap {
+        /// One submission of the overlapping pair.
+        a: String,
+        /// The other submission.
+        b: String,
+        /// The colliding paths.
+        paths: Vec<String>,
+    },
+
     /// A [`switch`](crate::materialize) would overwrite uncommitted changes in a
     /// workspace's working directory (a dirty working copy). Commit first, or
     /// pass `--force`.
