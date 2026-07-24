@@ -73,6 +73,39 @@ pub enum WorkError {
     #[error("submission {0} is not approved")]
     SubmissionNotApproved(String),
 
+    /// [`add`](crate::QueueRegistry::add) was asked to register a queue whose
+    /// name is already taken.
+    #[error("a queue named {0:?} already exists")]
+    QueueExists(String),
+
+    /// A queue name did not resolve to a registered queue (and was not the
+    /// implicit `trunk`).
+    #[error("unknown queue: {0:?}")]
+    UnknownQueue(String),
+
+    /// The submission's content carries unresolved conflict values and the
+    /// target queue's policy refuses them (ADR-0009).
+    #[error(
+        "queue {queue:?} refuses to land content carrying {count} unresolved \
+         conflict value(s); resolve them first or land into a queue with \
+         allow_carried"
+    )]
+    QueueCarriedRefused {
+        /// The refusing queue.
+        queue: String,
+        /// How many conflict values the content carries.
+        count: usize,
+    },
+
+    /// The target queue's P9 validator did not pass (ADR-0009).
+    #[error("queue {queue:?} validation gate failed: {reason}")]
+    QueueValidationFailed {
+        /// The refusing queue.
+        queue: String,
+        /// Why the gate failed.
+        reason: String,
+    },
+
     /// A [`switch`](crate::materialize) would overwrite uncommitted changes in a
     /// workspace's working directory (a dirty working copy). Commit first, or
     /// pass `--force`.

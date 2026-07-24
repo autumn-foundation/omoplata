@@ -104,14 +104,27 @@ pub struct DriverOutput {
     pub merged: String,
     /// The conflicts as structured values; empty iff the merge is clean.
     pub conflicts: Vec<omoplata_algebra::Conflict>,
+    /// Conflict **values carried forward** from the inputs (§5.4, P3): regions
+    /// that were already conflicted before this merge and rode through it
+    /// untouched. Distinct from `conflicts`, which this merge produced. Only
+    /// the Rust structural driver populates this today.
+    pub carried: Vec<omoplata_algebra::Conflict>,
     /// The name of the driver that produced this output.
     pub driver: &'static str,
 }
 
 impl DriverOutput {
-    /// Whether the merge produced no conflicts.
+    /// Whether the merge produced no conflicts and carries none forward.
     #[must_use]
     pub fn is_clean(&self) -> bool {
+        self.conflicts.is_empty() && self.carried.is_empty()
+    }
+
+    /// Whether this merge produced no **new** conflicts (conflict values
+    /// carried forward from the inputs are allowed — they ride through, per
+    /// §5.4, and do not make the merge itself a failure).
+    #[must_use]
+    pub fn is_mergeable(&self) -> bool {
         self.conflicts.is_empty()
     }
 }

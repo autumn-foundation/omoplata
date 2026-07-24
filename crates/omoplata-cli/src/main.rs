@@ -23,8 +23,8 @@ use omoplata_sem::{
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
-    absorb, auto_snapshot, land_submission, MapContext, OpKind, OpLog, RebaseEngine, Stack,
-    WorkError, Workspace, WorkspaceRegistry,
+    absorb, auto_snapshot, land_submission_in_queue, MapContext, OpKind, OpLog, QueueGates,
+    QueuePolicy, QueueRegistry, RebaseEngine, Stack, Workspace, WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -125,6 +125,19 @@ enum Command {
         /// conflict.
         #[arg(long, value_name = "CMD")]
         validate: Option<String>,
+    },
+    /// List the conflict values carried by a file (§5.4: conflicts are
+    /// first-class, queryable values).
+    ///
+    /// Scans the file for `<<<<<<<` / `=======` / `>>>>>>>` marker blocks and
+    /// pins each to the definition containing it (Rust files; other files are
+    /// scanned without definition pinning). Prints one line per value:
+    /// `<definition> line <n>: <l> line(s) left | <r> line(s) right`.
+    /// Exits 0 when the file carries no values, 2 when it carries some, and
+    /// non-zero with an error for a malformed marker structure.
+    Conflicts {
+        /// The file to scan.
+        path: PathBuf,
     },
     /// Kernel admission of a three-way merge (§3 P1, §6 invariant I8).
     ///
@@ -260,17 +273,45 @@ enum Command {
         /// Author identifier.
         #[arg(long)]
         author: Option<String>,
+        /// Leave the submission pending review instead of auto-approving it —
+        /// required by any queue whose policy demands approval before landing.
+        #[arg(long)]
+        pending: bool,
         /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
     },
-    /// Land an approved submission through the merge queue (§5.10).
-    Land {
-        /// Submission ID to land.
+    /// Approve a pending submission (§5.10).
+    Approve {
+        /// Submission ID to approve.
         id: String,
+        /// Reviewer identifier recorded on the approval.
+        #[arg(long)]
+        by: Option<String>,
         /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
+    },
+    /// Land an approved submission through a merge queue (§5.10, ADR-0009).
+    ///
+    /// The target queue's policy gates the landing: approval requirement,
+    /// carried-conflict rule, and — when the queue configures a validator —
+    /// P9 dynamic validation of the submission's materialized content. A
+    /// refused landing mutates nothing.
+    Land {
+        /// Submission ID to land.
+        id: String,
+        /// Queue to land into (defaults to `trunk`).
+        #[arg(long, default_value = "trunk")]
+        queue: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Manage named landing queues and their policies (ADR-0009).
+    Queue {
+        #[command(subcommand)]
+        action: QueueCommand,
     },
 
     /// Inspect and update the repository's refs via the operation log (§5.6).
@@ -441,6 +482,53 @@ enum WorkspaceCommand {
     },
 }
 
+/// `omo queue …` — named landing-queue subcommands (ADR-0009).
+#[derive(Debug, Subcommand)]
+enum QueueCommand {
+    /// Register a landing queue with its policy.
+    ///
+    /// Registered queues default to the strict posture a release line wants:
+    /// approval required and carried conflict values refused. The implicit
+    /// `trunk` queue is the permissive opposite — the fleet keeps landing
+    /// while a conflict awaits resolution (§5.4).
+    Add {
+        /// The queue name, e.g. `release-1.2`.
+        name: String,
+        /// P9 validator: a shell command run against the submission's
+        /// materialized content before landing. `{}` is substituted with the
+        /// content directory; without a placeholder the directory is appended.
+        #[arg(long, value_name = "CMD")]
+        validate: Option<String>,
+        /// Allow landing content that still carries conflict values (§5.4).
+        #[arg(long)]
+        allow_carried: bool,
+        /// Waive the approval requirement (e.g. a sandbox queue).
+        #[arg(long)]
+        no_approval: bool,
+        /// Optional human description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List queues (including the implicit `trunk`) with their policies.
+    List {
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Remove a queue from the registry (landed refs are kept — history
+    /// tells the truth).
+    Remove {
+        /// The queue name to remove.
+        name: String,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
 /// `omo ref …` — ref subcommands backed by the operation log.
 #[derive(Debug, Subcommand)]
 enum RefCommand {
@@ -508,6 +596,7 @@ fn run() -> anyhow::Result<i32> {
             right,
             validate,
         } => cmd_merge_file(base, left, right, validate),
+        Command::Conflicts { path } => cmd_conflicts(path),
         Command::Admit { base, left, right } => cmd_admit(base, left, right),
         Command::Rebase { base, mine, onto } => cmd_rebase(base, mine, onto),
         Command::Autorebase {
@@ -542,9 +631,31 @@ fn run() -> anyhow::Result<i32> {
             title,
             changes,
             author,
+            pending,
             repo,
-        } => cmd_submit(repo, id, title, changes, author).map(|()| 0),
-        Command::Land { id, repo } => cmd_land(repo, id).map(|()| 0),
+        } => cmd_submit(repo, id, title, changes, author, pending).map(|()| 0),
+        Command::Approve { id, by, repo } => cmd_approve(repo, id, by).map(|()| 0),
+        Command::Land { id, queue, repo } => cmd_land(repo, id, queue).map(|()| 0),
+        Command::Queue { action } => match action {
+            QueueCommand::Add {
+                name,
+                validate,
+                allow_carried,
+                no_approval,
+                description,
+                repo,
+            } => cmd_queue_add(
+                repo,
+                name,
+                validate,
+                allow_carried,
+                no_approval,
+                description,
+            )
+            .map(|()| 0),
+            QueueCommand::List { repo } => cmd_queue_list(repo).map(|()| 0),
+            QueueCommand::Remove { name, repo } => cmd_queue_remove(repo, name).map(|()| 0),
+        },
 
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
@@ -783,6 +894,7 @@ fn cmd_submit(
     title: String,
     changes: Vec<String>,
     author: Option<String>,
+    pending: bool,
 ) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let change_ids: Vec<ChangeId> = changes.into_iter().map(ChangeId::new).collect();
@@ -807,11 +919,16 @@ fn cmd_submit(
         change_ids,
         author_str,
     );
-    sub.approve("auto-reviewer");
+    let status = if pending {
+        "pending approval"
+    } else {
+        sub.approve("auto-reviewer");
+        "approved"
+    };
 
     save_submission(&repo, &sub)?;
     println!(
-        "submitted {} {:?} with {} change(s) (approved)",
+        "submitted {} {:?} with {} change(s) ({status})",
         sub.id,
         sub.title,
         sub.changes.len()
@@ -819,11 +936,41 @@ fn cmd_submit(
     Ok(())
 }
 
-/// `omo land <id>` — land approved submission via merge queue (§5.10).
-fn cmd_land(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
+/// `omo approve <id>` — approve a pending submission (§5.10).
+fn cmd_approve(repo: Option<PathBuf>, id: String, by: Option<String>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let sub_id = SubmissionId::new(&id);
+    let mut sub = load_submission(&repo, &sub_id)?;
+    let reviewer = by.unwrap_or_else(|| "reviewer".to_string());
+    sub.approve(&reviewer);
+    save_submission(&repo, &sub)?;
+    println!("approved {} (by {reviewer})", sub.id);
+    Ok(())
+}
+
+/// `omo land <id> [--queue NAME]` — land a submission through a named merge
+/// queue (§5.10, ADR-0009).
+///
+/// The queue's policy gates the landing before any state changes:
+///
+/// 1. **approval** — required unless the policy waives it;
+/// 2. **carried conflict values** (§5.4) — the submission's content is
+///    materialized from the object store and scanned; a strict queue refuses
+///    content that still carries values, a permissive one lands them (and says
+///    so);
+/// 3. **P9 dynamic validation** — when the policy configures a validator, it
+///    runs against the materialized content and only a pass lands.
+///
+/// The observed gate facts go to [`land_submission_in_queue`], which applies
+/// policy and performs the `Draft -> Public` transition, writing
+/// `public/<change>` refs for `trunk` and `public/<queue>/<change>` for other
+/// queues — the same change may therefore land in several queues (the
+/// backport story) without forking its identity.
+fn cmd_land(repo: Option<PathBuf>, id: String, queue: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let sub_id = SubmissionId::new(&id);
     let sub = load_submission(&repo, &sub_id)?;
+    let policy = QueueRegistry::load(QueueRegistry::path_in(&repo))?.resolve(&queue)?;
 
     if let Ok(reg) = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo)) {
         let _ = OpLog::mutate_locked(&repo, |op_log| {
@@ -839,21 +986,52 @@ fn cmd_land(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
     }
 
     let mut cg = ChangeGraph::new();
+    let log = OpLog::load(oplog_path(&repo))?;
+    let refs = log.refs_now();
+    let mut tips: Vec<ObjectId> = Vec::new();
     for change_id in &sub.changes {
-        let log = OpLog::load(oplog_path(&repo))?;
-        if let Some(tip) = log.refs_now().get(change_id.as_str()) {
+        if let Some(tip) = refs.get(change_id.as_str()) {
             cg.add_change(omoplata_identity::Change::new(
                 change_id.clone(),
                 vec![tip.clone()],
                 Phase::Draft,
             ));
+            if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
+                tips.push(oid);
+            }
         } else {
             cg.add_change(omoplata_identity::Change::draft(change_id.clone()));
         }
     }
 
+    // The approval gate needs no content — check it before paying for
+    // materialization and validation (the core re-checks it either way).
+    if policy.require_approval && !sub.is_approved() {
+        anyhow::bail!(
+            "submission {} is not approved (queue {})",
+            sub.id,
+            policy.name
+        );
+    }
+
+    // Observe the gate facts against the materialized content (the stored
+    // trees, not whatever the working copy has drifted to since).
+    let gates = observe_gates(&repo, &sub_id, &tips, &policy)?;
+    if policy.validate.is_some() {
+        match gates.validated {
+            Some(true) => eprintln!("queue {}: validation PASSED", policy.name),
+            _ => eprintln!("queue {}: validation FAILED", policy.name),
+        }
+    }
+    if gates.carried_values > 0 {
+        eprintln!(
+            "queue {}: content carries {} conflict value(s)",
+            policy.name, gates.carried_values
+        );
+    }
+
     let result = OpLog::mutate_locked(&repo, |op_log| {
-        land_submission(&sub, &mut cg, op_log).map_err(|e| WorkError::Content(e.to_string()))
+        land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)
     })?;
 
     println!(
@@ -861,6 +1039,164 @@ fn cmd_land(repo: Option<PathBuf>, id: String) -> anyhow::Result<()> {
         result.submission_id, result.message
     );
     Ok(())
+}
+
+/// Materialize a submission's stored trees into a scratch directory and
+/// observe the queue-gate facts: how many conflict values (§5.4) the content
+/// carries, and — when the policy configures one — the P9 validator's verdict.
+///
+/// The scratch directory lives under `.omoplata/tmp` and is removed on the way
+/// out (best effort).
+fn observe_gates(
+    repo: &Repository,
+    sub_id: &SubmissionId,
+    tips: &[ObjectId],
+    policy: &QueuePolicy,
+) -> anyhow::Result<QueueGates> {
+    let scratch = repo.control_dir().join("tmp").join(format!(
+        "land-{}",
+        sub_id.as_str().replace(['/', '\\'], "_")
+    ));
+    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
+
+    let observe = || -> anyhow::Result<QueueGates> {
+        for (i, tip) in tips.iter().enumerate() {
+            let dir = scratch.join(format!("change-{i}"));
+            std::fs::create_dir_all(&dir)?;
+            omoplata_work::materialize(repo, tip, &dir)?;
+        }
+
+        let mut carried_values = 0usize;
+        for file in rs_files_under(&scratch) {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading {}", file.display()))?;
+            let values = omoplata_drivers::rust::conflict_values(&text)
+                .with_context(|| format!("{}: malformed conflict markers", file.display()))?;
+            carried_values += values.len();
+        }
+
+        let validated = match &policy.validate {
+            None => None,
+            Some(cmd) => Some(run_dir_validator(cmd, &scratch)?),
+        };
+        Ok(QueueGates {
+            carried_values,
+            validated,
+        })
+    };
+
+    let gates = observe();
+    let _ = std::fs::remove_dir_all(&scratch);
+    gates
+}
+
+/// Every `.rs` file under `dir`, recursively (control dirs are not present in
+/// materialized trees, so no filtering is needed).
+fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Run a queue's P9 validator command against a materialized content
+/// directory. `{}` in the command is replaced with the directory path; without
+/// a placeholder the path is appended as the final argument. Returns whether
+/// the command exited zero.
+fn run_dir_validator(cmd: &str, dir: &Path) -> anyhow::Result<bool> {
+    let dir_str = dir.to_string_lossy();
+    let full = if cmd.contains("{}") {
+        cmd.replace("{}", &dir_str)
+    } else {
+        format!("{cmd} {dir_str}")
+    };
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&full)
+        .status()
+        .with_context(|| format!("running validator `{full}`"))?;
+    Ok(status.success())
+}
+
+/// `omo queue add …` — register a landing queue with its policy (ADR-0009).
+fn cmd_queue_add(
+    repo: Option<PathBuf>,
+    name: String,
+    validate: Option<String>,
+    allow_carried: bool,
+    no_approval: bool,
+    description: Option<String>,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let policy = QueuePolicy {
+        name: name.clone(),
+        description,
+        validate,
+        require_approval: !no_approval,
+        allow_carried,
+    };
+    QueueRegistry::mutate_locked(&repo, |reg| {
+        reg.add(policy.clone())?;
+        Ok(())
+    })?;
+    println!("registered queue {name} ({})", describe_policy(&policy));
+    Ok(())
+}
+
+/// `omo queue list` — print every queue (including the implicit trunk).
+fn cmd_queue_list(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    if reg.get("trunk").is_none() {
+        let trunk = QueuePolicy::trunk();
+        println!("trunk  {} [implicit]", describe_policy(&trunk));
+    }
+    for q in reg.queues() {
+        println!("{}  {}", q.name, describe_policy(q));
+    }
+    Ok(())
+}
+
+/// `omo queue remove <name>` — drop a queue from the registry.
+fn cmd_queue_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    QueueRegistry::mutate_locked(&repo, |reg| {
+        reg.remove(&name)?;
+        Ok(())
+    })?;
+    println!("removed queue {name}");
+    Ok(())
+}
+
+/// One-line human summary of a queue policy.
+fn describe_policy(q: &QueuePolicy) -> String {
+    format!(
+        "approval={} carried={} validate={}",
+        if q.require_approval {
+            "required"
+        } else {
+            "waived"
+        },
+        if q.allow_carried {
+            "allowed"
+        } else {
+            "refused"
+        },
+        q.validate.as_deref().unwrap_or("(none)")
+    )
 }
 
 /// `omo ref set <name> <commit>` — append a `SetRef` op and persist.
@@ -1287,13 +1623,33 @@ fn cmd_merge_file(
     })?;
 
     let n = out.conflicts.len();
+    let k = out.carried.len();
 
     // A driver conflict is already honest; report and exit non-zero. Nothing
     // provisional to validate — the validator is not run (P9).
-    if !out.is_clean() {
+    if !out.is_mergeable() {
         print!("{}", out.merged);
-        eprintln!("{} merge: {n} conflict(s)", out.driver);
+        if k == 0 {
+            eprintln!("{} merge: {n} conflict(s)", out.driver);
+        } else {
+            eprintln!("{} merge: {n} conflict(s), {k} carried forward", out.driver);
+        }
         return Ok(1);
+    }
+
+    // No NEW conflicts, but conflict values from the inputs rode through
+    // (§5.4, P3: "rebase maps over conflicts"). The merge is mergeable — the
+    // rest of the file integrated structurally — but the output is not a
+    // candidate final document, so the kernel and validator are not run.
+    // Exit 2 distinguishes "landable, carrying unresolved values" from both
+    // success (0) and fresh conflict (1); `omo conflicts` lists the values.
+    if k > 0 {
+        print!("{}", out.merged);
+        eprintln!(
+            "{} merge: 0 new conflict(s), {k} carried forward (values ride through; resolve later)",
+            out.driver
+        );
+        return Ok(2);
     }
 
     eprintln!("{} merge: {n} conflict(s)", out.driver);
@@ -1403,6 +1759,33 @@ fn render_semantic_conflict(conflict: &Conflict) -> String {
     lines.push(">>>>>>> right".to_owned());
     // Trailing newline so the block reads cleanly on a terminal.
     format!("{}\n", lines.join("\n"))
+}
+
+/// `omo conflicts <path>` — list the conflict values a file carries (§5.4).
+///
+/// Each value is pinned to the definition containing it (via the same
+/// sanitize-then-parse pass the structural driver uses). Exit 0 = no values,
+/// 2 = values present, error on malformed marker structure.
+fn cmd_conflicts(path: PathBuf) -> anyhow::Result<i32> {
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let values = omoplata_drivers::rust::conflict_values(&text)
+        .with_context(|| format!("{}: malformed conflict markers", path.display()))?;
+    if values.is_empty() {
+        println!("no conflict values");
+        return Ok(0);
+    }
+    for v in &values {
+        let definition = v.definition.as_deref().unwrap_or("(between definitions)");
+        println!(
+            "{definition}  line {}: {} line(s) left | {} line(s) right",
+            v.line,
+            v.left.len(),
+            v.right.len()
+        );
+    }
+    eprintln!("{} conflict value(s) carried", values.len());
+    Ok(2)
 }
 
 /// `omo admit <base> <left> <right>` — trusted kernel admission (§3 P1, §6 I8).
