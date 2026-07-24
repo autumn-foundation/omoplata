@@ -1,0 +1,18 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -8,11 +8,14 @@
+     Low,
+     Normal,
+     High,
++    Critical,
+ }
+ 
+ /// Map a raw urgency score to a priority band.
+ pub fn priority_of(urgency: u32) -> Priority {
+-    if urgency >= 80 {
++    if urgency >= 95 {
++        Priority::Critical
++    } else if urgency >= 80 {
+         Priority::High
+     } else if urgency >= 40 {
+         Priority::Normal
