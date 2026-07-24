@@ -394,6 +394,105 @@ pub fn queue_ref(queue: &str, change: &ChangeId) -> String {
     }
 }
 
+/// The observed facts for a **batch** landing (§5.10 Tier-0 batching):
+/// per-submission content manifests plus the batch-wide gate observations.
+#[derive(Debug, Clone, Default)]
+pub struct BatchGates {
+    /// Per submission: its materialized content as `path -> content hash`.
+    /// Pairwise-disjointness is judged from these — the Tier-0 support check
+    /// at file granularity.
+    pub manifests: Vec<(SubmissionId, std::collections::BTreeMap<String, String>)>,
+    /// Conflict values carried across the whole batch's content.
+    pub carried_values: usize,
+    /// The P9 validator verdict for the batch validated **as one**.
+    pub validated: Option<bool>,
+}
+
+/// Land several submissions through a queue **as one batch** (§5.10):
+/// pairwise-disjoint submissions validate as one and land together; an
+/// overlapping pair refuses the whole batch with the colliding paths named.
+///
+/// Disjointness is the file-granularity Tier-0 check: two submissions overlap
+/// iff some path appears in both manifests **with different content**
+/// (identical bytes at the same path trivially commute). Disjointness is what
+/// licenses order-independence (I3′), which is why the landing order within
+/// the batch carries no meaning.
+///
+/// All gates are applied before any landing; a refused batch mutates nothing.
+///
+/// # Errors
+///
+/// The per-submission and policy errors of [`land_submission_in_queue`], plus
+/// [`WorkError::BatchOverlap`] for the first overlapping pair found.
+pub fn land_batch_in_queue(
+    submissions: &[&Submission],
+    policy: &QueuePolicy,
+    gates: &BatchGates,
+    change_graph: &mut ChangeGraph,
+    op_log: &mut OpLog,
+) -> Result<Vec<LandResult>, WorkError> {
+    // Approval gate for every submission first (cheapest, clearest error).
+    if policy.require_approval {
+        for sub in submissions {
+            if !sub.is_approved() {
+                return Err(WorkError::SubmissionNotApproved(sub.id.to_string()));
+            }
+        }
+    }
+
+    // Tier-0 pairwise disjointness over the manifests.
+    for (i, (id_a, man_a)) in gates.manifests.iter().enumerate() {
+        for (id_b, man_b) in gates.manifests.iter().skip(i + 1) {
+            let colliding: Vec<String> = man_a
+                .iter()
+                .filter(|(path, hash)| man_b.get(*path).is_some_and(|h| h != *hash))
+                .map(|(path, _)| path.clone())
+                .collect();
+            if !colliding.is_empty() {
+                return Err(WorkError::BatchOverlap {
+                    a: id_a.to_string(),
+                    b: id_b.to_string(),
+                    paths: colliding,
+                });
+            }
+        }
+    }
+
+    let single_gates = QueueGates {
+        carried_values: gates.carried_values,
+        validated: gates.validated,
+    };
+    // Check the remaining gates against the first submission WITHOUT landing,
+    // so a carried/validation refusal cannot leave a half-landed batch.
+    if gates.carried_values > 0 && !policy.allow_carried {
+        return Err(WorkError::QueueCarriedRefused {
+            queue: policy.name.clone(),
+            count: gates.carried_values,
+        });
+    }
+    if policy.validate.is_some() && gates.validated != Some(true) {
+        return Err(WorkError::QueueValidationFailed {
+            queue: policy.name.clone(),
+            reason: match gates.validated {
+                Some(false) => "validator exited non-zero".to_owned(),
+                _ => "validator was not run".to_owned(),
+            },
+        });
+    }
+
+    let mut results = Vec::with_capacity(submissions.len());
+    for sub in submissions {
+        results.push(land_submission_in_queue(
+            sub,
+            policy,
+            &single_gates,
+            change_graph,
+            op_log,
+        )?);
+    }
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use omoplata_identity::{Change, ChangeId, CommitId, SubmissionId};
@@ -560,6 +659,106 @@ mod tests {
             land_submission_in_queue(&sub, &queue, &QueueGates::default(), &mut cg, &mut log)
                 .is_ok()
         );
+    }
+
+    fn manifest(
+        id: &str,
+        entries: &[(&str, &str)],
+    ) -> (SubmissionId, std::collections::BTreeMap<String, String>) {
+        (
+            SubmissionId::new(id),
+            entries
+                .iter()
+                .map(|(p, h)| ((*p).to_owned(), (*h).to_owned()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn disjoint_batch_lands_together_overlap_refuses_whole_batch() {
+        let sub_a = approved_sub("sub-a", "ca");
+        let sub_b = approved_sub("sub-b", "cb");
+        let mut cg = graph_with("ca");
+        cg.add_change(Change::new(
+            ChangeId::new("cb"),
+            vec![CommitId::new("commit-b")],
+            Phase::Draft,
+        ));
+        let mut log = OpLog::new();
+
+        // Disjoint paths (and one identical shared path): batches.
+        let gates = BatchGates {
+            manifests: vec![
+                manifest("sub-a", &[("src/a.rs", "h1"), ("Cargo.toml", "same")]),
+                manifest("sub-b", &[("src/b.rs", "h2"), ("Cargo.toml", "same")]),
+            ],
+            carried_values: 0,
+            validated: None,
+        };
+        let results = land_batch_in_queue(
+            &[&sub_a, &sub_b],
+            &QueuePolicy::trunk(),
+            &gates,
+            &mut cg,
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            cg.change(&ChangeId::new("ca")).unwrap().phase,
+            Phase::Public
+        );
+        assert_eq!(
+            cg.change(&ChangeId::new("cb")).unwrap().phase,
+            Phase::Public
+        );
+
+        // Same path, different content: the whole batch refuses, nothing lands.
+        let mut cg = graph_with("ca");
+        cg.add_change(Change::draft(ChangeId::new("cb")));
+        let overlapping = BatchGates {
+            manifests: vec![
+                manifest("sub-a", &[("src/lib.rs", "h1")]),
+                manifest("sub-b", &[("src/lib.rs", "h2")]),
+            ],
+            carried_values: 0,
+            validated: None,
+        };
+        let err = land_batch_in_queue(
+            &[&sub_a, &sub_b],
+            &QueuePolicy::trunk(),
+            &overlapping,
+            &mut cg,
+            &mut log,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, WorkError::BatchOverlap { ref paths, .. } if paths == &vec!["src/lib.rs".to_owned()])
+        );
+        assert_eq!(cg.change(&ChangeId::new("ca")).unwrap().phase, Phase::Draft);
+    }
+
+    #[test]
+    fn batch_gates_apply_before_any_landing() {
+        // A failing validator refuses the batch with every change still Draft.
+        let sub_a = approved_sub("sub-a", "ca");
+        let mut cg = graph_with("ca");
+        let mut log = OpLog::new();
+        let queue = QueuePolicy {
+            name: "release-1.2".to_owned(),
+            description: None,
+            validate: Some("suite".to_owned()),
+            require_approval: true,
+            allow_carried: false,
+        };
+        let gates = BatchGates {
+            manifests: vec![manifest("sub-a", &[("src/a.rs", "h1")])],
+            carried_values: 0,
+            validated: Some(false),
+        };
+        let err = land_batch_in_queue(&[&sub_a], &queue, &gates, &mut cg, &mut log).unwrap_err();
+        assert!(matches!(err, WorkError::QueueValidationFailed { .. }));
+        assert_eq!(cg.change(&ChangeId::new("ca")).unwrap().phase, Phase::Draft);
     }
 
     #[test]

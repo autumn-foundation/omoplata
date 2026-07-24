@@ -38,6 +38,19 @@ commands (needs `omo` built at `../../target/release/omo`).
    resolution latency; the release line refuses it with an error naming the
    count. Same content, two policies, both honest.
 
+7. **Tier-0 batching.** `omo land sub-a sub-b` lands pairwise-disjoint
+   submissions as one batch — validated as one, landed in a single locked
+   transaction — while an overlapping pair (same path, different content)
+   refuses the *whole* batch naming the collision: overlapping changes
+   serialize.
+
+8. **Certified backports and the needs-backport query.** `omo backport sub-a
+   --to release-1.2` re-lands an already-landed submission with its approval
+   carried forward under an identity certificate (content byte-identical to
+   the reviewed tip — the §5.10 carry-forward, strongest case). What remains
+   to backport is `omo revset 'landed(trunk) & ~landed(release-1.2)'`, a
+   query — not a branch comparison.
+
 ## The git-flow mapping
 
 | git flow | omoplata |

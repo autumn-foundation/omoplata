@@ -253,6 +253,52 @@ queue release-1.2: validation FAILED
 error: queue "release-1.2" validation gate failed: validator exited non-zero
 ```
 
+### Batching, backports, and the needs-backport query
+
+Several submissions land as one **Tier-0 batch** (§5.10): pairwise-disjoint
+content validates as one and lands in a single locked transaction, and after
+any landing `omo` offers the mechanical backports:
+
+```console
+$ omo land sub-alpha sub-beta
+batched 2 pairwise-disjoint submission(s) into queue trunk (validated as one)
+  landed sub-alpha: Submission sub-alpha landed in queue trunk
+  landed sub-beta: Submission sub-beta landed in queue trunk
+backport available: omo backport sub-alpha --to release-1.2
+backport available: omo backport sub-beta --to release-1.2
+```
+
+An overlapping pair — the same path with different content — refuses the whole
+batch and names the collision (overlapping changes serialize; land them
+separately):
+
+```console
+$ omo land sub-gamma sub-alpha2
+error: submissions sub-gamma and sub-alpha2 overlap on 1 path(s) (change-0/feature-a.txt); overlapping changes serialize — land them separately
+```
+
+`omo backport` lands an already-landed submission into a second queue with its
+**approval carried forward under a certificate** (§5.10). The v1 certificate is
+the identity witness — the change's tip is byte-identical to the tip that was
+reviewed and landed, so nothing needs re-review; content that moved since its
+landing refuses with a re-review demand instead:
+
+```console
+$ omo backport sub-alpha --to release-1.2
+backported sub-alpha: Submission sub-alpha landed in queue release-1.2 (approval by auto-reviewer carried forward: 1 certificate(s), witness: identity — content unchanged since review)
+```
+
+What still needs backporting is a **revset query**, not a branch comparison —
+`landed(<queue>)` resolves each queue's public refs (bare `landed()` means
+`trunk`):
+
+```console
+$ omo revset 'landed(trunk) & ~landed(release-1.2)'
+sha256:a786f9439cffed5e1751f357d78df193fb1a7a60d4814b09b7741a4d8c9a5e49
+```
+
+— exactly one commit: `sub-beta`'s tip, since `sub-alpha` was just backported.
+
 
 ### "Branching" today
 

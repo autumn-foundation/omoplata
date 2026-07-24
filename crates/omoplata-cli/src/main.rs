@@ -14,8 +14,8 @@ use omoplata_git::{
     export_matches_source, export_repo, fetch_local, import_repo, verify_repo, GitError,
 };
 use omoplata_identity::{
-    extract_definitions, match_definitions, ChangeGraph, ChangeId, CommitId, Definition,
-    MatchStatus, Phase, Submission, SubmissionId,
+    extract_definitions, match_definitions, ApprovalCertificate, ChangeGraph, ChangeId, CommitId,
+    Definition, MatchStatus, Phase, Submission, SubmissionId,
 };
 use omoplata_sem::{
     embed_definitions, embed_workspace_dir, find_duplicates, search, Embedded, Embedder,
@@ -23,8 +23,9 @@ use omoplata_sem::{
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
-    absorb, auto_snapshot, land_submission_in_queue, MapContext, OpKind, OpLog, QueueGates,
-    QueuePolicy, QueueRegistry, RebaseEngine, Stack, Workspace, WorkspaceRegistry,
+    absorb, auto_snapshot, land_batch_in_queue, land_submission_in_queue, BatchGates, MapContext,
+    OpKind, OpLog, QueueGates, QueuePolicy, QueueRegistry, RebaseEngine, Stack, Workspace,
+    WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -299,11 +300,31 @@ enum Command {
     /// P9 dynamic validation of the submission's materialized content. A
     /// refused landing mutates nothing.
     Land {
-        /// Submission ID to land.
-        id: String,
+        /// Submission ID(s) to land. Several IDs form a **Tier-0 batch**
+        /// (§5.10): pairwise-disjoint submissions validate as one and land in
+        /// a single locked transaction; an overlapping pair refuses the whole
+        /// batch with the colliding paths named.
+        #[arg(required = true)]
+        ids: Vec<String>,
         /// Queue to land into (defaults to `trunk`).
         #[arg(long, default_value = "trunk")]
         queue: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Land an already-landed submission into a second queue, carrying its
+    /// approval forward with a certificate (ADR-0009 backports).
+    ///
+    /// Sound by identity: each change's tip must be byte-identical to the tip
+    /// reviewed and landed in the source queue; moved content refuses with a
+    /// re-review demand. The target queue's own gates still apply.
+    Backport {
+        /// Submission ID to backport.
+        id: String,
+        /// Target queue.
+        #[arg(long)]
+        to: String,
         /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -635,7 +656,8 @@ fn run() -> anyhow::Result<i32> {
             repo,
         } => cmd_submit(repo, id, title, changes, author, pending).map(|()| 0),
         Command::Approve { id, by, repo } => cmd_approve(repo, id, by).map(|()| 0),
-        Command::Land { id, queue, repo } => cmd_land(repo, id, queue).map(|()| 0),
+        Command::Land { ids, queue, repo } => cmd_land(repo, ids, queue).map(|()| 0),
+        Command::Backport { id, to, repo } => cmd_backport(repo, id, to).map(|()| 0),
         Command::Queue { action } => match action {
             QueueCommand::Add {
                 name,
@@ -966,18 +988,37 @@ fn cmd_approve(repo: Option<PathBuf>, id: String, by: Option<String>) -> anyhow:
 /// `public/<change>` refs for `trunk` and `public/<queue>/<change>` for other
 /// queues — the same change may therefore land in several queues (the
 /// backport story) without forking its identity.
-fn cmd_land(repo: Option<PathBuf>, id: String, queue: String) -> anyhow::Result<()> {
+fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
-    let sub_id = SubmissionId::new(&id);
-    let sub = load_submission(&repo, &sub_id)?;
-    let policy = QueueRegistry::load(QueueRegistry::path_in(&repo))?.resolve(&queue)?;
+    let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    let policy = registry.resolve(&queue)?;
+    let subs: Vec<Submission> = ids
+        .iter()
+        .map(|id| load_submission(&repo, &SubmissionId::new(id)))
+        .collect::<anyhow::Result<_>>()?;
+
+    // The approval gate needs no content — check it before paying for
+    // materialization and validation (the core re-checks it either way).
+    if policy.require_approval {
+        for sub in &subs {
+            if !sub.is_approved() {
+                anyhow::bail!(
+                    "submission {} is not approved (queue {})",
+                    sub.id,
+                    policy.name
+                );
+            }
+        }
+    }
 
     if let Ok(reg) = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo)) {
         let _ = OpLog::mutate_locked(&repo, |op_log| {
-            for change_id in &sub.changes {
-                for ws in reg.workspaces() {
-                    if &ws.change == change_id || ws.name == change_id.as_str() {
-                        let _ = auto_snapshot(&repo, op_log, ws);
+            for sub in &subs {
+                for change_id in &sub.changes {
+                    for ws in reg.workspaces() {
+                        if &ws.change == change_id || ws.name == change_id.as_str() {
+                            let _ = auto_snapshot(&repo, op_log, ws);
+                        }
                     }
                 }
             }
@@ -988,35 +1029,29 @@ fn cmd_land(repo: Option<PathBuf>, id: String, queue: String) -> anyhow::Result<
     let mut cg = ChangeGraph::new();
     let log = OpLog::load(oplog_path(&repo))?;
     let refs = log.refs_now();
-    let mut tips: Vec<ObjectId> = Vec::new();
-    for change_id in &sub.changes {
-        if let Some(tip) = refs.get(change_id.as_str()) {
-            cg.add_change(omoplata_identity::Change::new(
-                change_id.clone(),
-                vec![tip.clone()],
-                Phase::Draft,
-            ));
-            if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
-                tips.push(oid);
+    let mut sub_tips: Vec<(SubmissionId, Vec<ObjectId>)> = Vec::new();
+    for sub in &subs {
+        let mut tips = Vec::new();
+        for change_id in &sub.changes {
+            if let Some(tip) = refs.get(change_id.as_str()) {
+                cg.add_change(omoplata_identity::Change::new(
+                    change_id.clone(),
+                    vec![tip.clone()],
+                    Phase::Draft,
+                ));
+                if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
+                    tips.push(oid);
+                }
+            } else {
+                cg.add_change(omoplata_identity::Change::draft(change_id.clone()));
             }
-        } else {
-            cg.add_change(omoplata_identity::Change::draft(change_id.clone()));
         }
-    }
-
-    // The approval gate needs no content — check it before paying for
-    // materialization and validation (the core re-checks it either way).
-    if policy.require_approval && !sub.is_approved() {
-        anyhow::bail!(
-            "submission {} is not approved (queue {})",
-            sub.id,
-            policy.name
-        );
+        sub_tips.push((sub.id.clone(), tips));
     }
 
     // Observe the gate facts against the materialized content (the stored
     // trees, not whatever the working copy has drifted to since).
-    let gates = observe_gates(&repo, &sub_id, &tips, &policy)?;
+    let gates = observe_batch_gates(&repo, &sub_tips, &policy)?;
     if policy.validate.is_some() {
         match gates.validated {
             Some(true) => eprintln!("queue {}: validation PASSED", policy.name),
@@ -1030,44 +1065,219 @@ fn cmd_land(repo: Option<PathBuf>, id: String, queue: String) -> anyhow::Result<
         );
     }
 
+    if let [sub] = subs.as_slice() {
+        let single = QueueGates {
+            carried_values: gates.carried_values,
+            validated: gates.validated,
+        };
+        let result = OpLog::mutate_locked(&repo, |op_log| {
+            land_submission_in_queue(sub, &policy, &single, &mut cg, op_log)
+        })?;
+        println!(
+            "landed submission {}: {}",
+            result.submission_id, result.message
+        );
+    } else {
+        // Tier-0 batch (§5.10): pairwise-disjoint submissions validate as one
+        // and land in a single locked op-log transaction; an overlap refuses
+        // the whole batch with the colliding paths named.
+        let sub_refs: Vec<&Submission> = subs.iter().collect();
+        let results = OpLog::mutate_locked(&repo, |op_log| {
+            land_batch_in_queue(&sub_refs, &policy, &gates, &mut cg, op_log)
+        })?;
+        println!(
+            "batched {} pairwise-disjoint submission(s) into queue {} (validated as one)",
+            results.len(),
+            policy.name
+        );
+        for result in results {
+            println!("  landed {}: {}", result.submission_id, result.message);
+        }
+    }
+
+    // Mechanical backport offers (ADR-0009): every sibling queue this landing
+    // did not target. The offer is advisory; `omo backport` carries the
+    // approval forward with a certificate when content is unchanged.
+    let mut siblings: Vec<String> = registry.queues().iter().map(|q| q.name.clone()).collect();
+    if !siblings.iter().any(|n| n == "trunk") {
+        siblings.push("trunk".to_owned());
+    }
+    siblings.retain(|n| n != &policy.name);
+    for sub in &subs {
+        for sibling in &siblings {
+            eprintln!("backport available: omo backport {} --to {sibling}", sub.id);
+        }
+    }
+    Ok(())
+}
+
+/// `omo backport <id> --to <queue>` — land an already-landed submission into a
+/// second queue, carrying its approval forward with a certificate (ADR-0009,
+/// §5.10 approval carry-forward).
+///
+/// The carry-forward is sound by *identity*: each change's current tip must be
+/// byte-identical to the tip that was reviewed and landed in the source queue
+/// (the strongest commutation certificate — nothing changed, so nothing needs
+/// re-review). A change whose content moved since it landed refuses with a
+/// re-review demand instead. The target queue's own gates (carried values,
+/// P9 validation) still apply.
+fn cmd_backport(repo: Option<PathBuf>, id: String, to: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    let policy = registry.resolve(&to)?;
+    let sub_id = SubmissionId::new(&id);
+    let mut sub = load_submission(&repo, &sub_id)?;
+
+    let omoplata_identity::Approval::Approved { reviewer, .. } = sub.approval.clone() else {
+        anyhow::bail!(
+            "submission {} has no approval to carry forward — approve and land it first",
+            sub.id
+        );
+    };
+
+    let log = OpLog::load(oplog_path(&repo))?;
+    let refs = log.refs_now();
+    let mut cg = ChangeGraph::new();
+    let mut tips: Vec<ObjectId> = Vec::new();
+    let mut certificates: Vec<ApprovalCertificate> = Vec::new();
+    for change_id in &sub.changes {
+        let tip = refs.get(change_id.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("change {change_id} has no snapshot; nothing to backport")
+        })?;
+        let Some((source_queue, landed_tip)) = find_landed(&refs, &registry, change_id) else {
+            anyhow::bail!(
+                "change {change_id} is not landed in any queue; land it first — \
+                 backport carries an existing landing's approval forward"
+            );
+        };
+        if &landed_tip != tip {
+            anyhow::bail!(
+                "change {change_id} moved since it landed in {source_queue} \
+                 (reviewed {landed_tip}, now {tip}); approval cannot be carried \
+                 forward — re-review and land the new content"
+            );
+        }
+        certificates.push(ApprovalCertificate {
+            change_id: change_id.clone(),
+            original_commit: landed_tip,
+            rebased_commit: tip.clone(),
+            approved_by: reviewer.clone(),
+            proof_witness: format!(
+                "identity: content byte-identical to the tip reviewed and landed in {source_queue}"
+            ),
+        });
+        cg.add_change(omoplata_identity::Change::new(
+            change_id.clone(),
+            vec![tip.clone()],
+            Phase::Draft,
+        ));
+        if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
+            tips.push(oid);
+        }
+    }
+
+    for cert in &certificates {
+        sub.add_certificate(cert.clone());
+    }
+    save_submission(&repo, &sub)?;
+
+    let sub_tips = vec![(sub.id.clone(), tips)];
+    let batch = observe_batch_gates(&repo, &sub_tips, &policy)?;
+    let gates = QueueGates {
+        carried_values: batch.carried_values,
+        validated: batch.validated,
+    };
+    if policy.validate.is_some() {
+        match gates.validated {
+            Some(true) => eprintln!("queue {}: validation PASSED", policy.name),
+            _ => eprintln!("queue {}: validation FAILED", policy.name),
+        }
+    }
+
     let result = OpLog::mutate_locked(&repo, |op_log| {
         land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)
     })?;
-
     println!(
-        "landed submission {}: {}",
-        result.submission_id, result.message
+        "backported {}: {} (approval by {reviewer} carried forward: {} certificate(s), \
+         witness: identity — content unchanged since review)",
+        result.submission_id,
+        result.message,
+        certificates.len()
     );
     Ok(())
 }
 
-/// Materialize a submission's stored trees into a scratch directory and
-/// observe the queue-gate facts: how many conflict values (§5.4) the content
-/// carries, and — when the policy configures one — the P9 validator's verdict.
+/// Find the queue (and landed tip) a change is already landed in, if any:
+/// `trunk`'s legacy `public/<change>` ref first, then each registered queue's
+/// `public/<queue>/<change>`.
+fn find_landed(
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    registry: &QueueRegistry,
+    change: &ChangeId,
+) -> Option<(String, CommitId)> {
+    if let Some(tip) = refs.get(&omoplata_work::queue_ref("trunk", change)) {
+        return Some(("trunk".to_owned(), tip.clone()));
+    }
+    for q in registry.queues() {
+        if let Some(tip) = refs.get(&omoplata_work::queue_ref(&q.name, change)) {
+            return Some((q.name.clone(), tip.clone()));
+        }
+    }
+    None
+}
+
+/// Materialize a batch of submissions' stored trees into a scratch directory
+/// and observe the queue-gate facts: per-submission content manifests
+/// (`path -> content address`, the Tier-0 disjointness input), how many
+/// conflict values (§5.4) the content carries, and — when the policy
+/// configures one — the P9 validator's verdict over the batch **as one**.
 ///
-/// The scratch directory lives under `.omoplata/tmp` and is removed on the way
-/// out (best effort).
-fn observe_gates(
+/// The scratch directory lives under `.omoplata/tmp` (unique per process) and
+/// is removed on the way out (best effort).
+fn observe_batch_gates(
     repo: &Repository,
-    sub_id: &SubmissionId,
-    tips: &[ObjectId],
+    sub_tips: &[(SubmissionId, Vec<ObjectId>)],
     policy: &QueuePolicy,
-) -> anyhow::Result<QueueGates> {
-    let scratch = repo.control_dir().join("tmp").join(format!(
-        "land-{}",
-        sub_id.as_str().replace(['/', '\\'], "_")
-    ));
+) -> anyhow::Result<BatchGates> {
+    let scratch = repo
+        .control_dir()
+        .join("tmp")
+        .join(format!("land-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
 
-    let observe = || -> anyhow::Result<QueueGates> {
-        for (i, tip) in tips.iter().enumerate() {
-            let dir = scratch.join(format!("change-{i}"));
-            std::fs::create_dir_all(&dir)?;
-            omoplata_work::materialize(repo, tip, &dir)?;
+    let observe = || -> anyhow::Result<BatchGates> {
+        let mut manifests = Vec::new();
+        for (sid, tips) in sub_tips {
+            let sub_dir = scratch.join(format!("sub-{}", sid.as_str().replace(['/', '\\'], "_")));
+            let mut manifest = std::collections::BTreeMap::new();
+            for (i, tip) in tips.iter().enumerate() {
+                let dir = sub_dir.join(format!("change-{i}"));
+                std::fs::create_dir_all(&dir)?;
+                omoplata_work::materialize(repo, tip, &dir)?;
+                // Manifest keys are change-ordinal-relative paths so the same
+                // logical path aligns across submissions; values are content
+                // addresses (the blob is already in the store, so hashing via
+                // write_blob costs nothing extra).
+                for file in files_under(&dir) {
+                    let rel = file
+                        .strip_prefix(&sub_dir)
+                        .unwrap_or(&file)
+                        .to_string_lossy()
+                        .into_owned();
+                    let bytes = std::fs::read(&file)
+                        .with_context(|| format!("reading {}", file.display()))?;
+                    let address = repo.write_blob(bytes)?;
+                    manifest.insert(rel, address.to_string());
+                }
+            }
+            manifests.push((sid.clone(), manifest));
         }
 
         let mut carried_values = 0usize;
-        for file in rs_files_under(&scratch) {
+        for file in files_under(&scratch) {
+            if !file.extension().is_some_and(|e| e == "rs") {
+                continue;
+            }
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
             let values = omoplata_drivers::rust::conflict_values(&text)
@@ -1079,7 +1289,8 @@ fn observe_gates(
             None => None,
             Some(cmd) => Some(run_dir_validator(cmd, &scratch)?),
         };
-        Ok(QueueGates {
+        Ok(BatchGates {
+            manifests,
             carried_values,
             validated,
         })
@@ -1090,9 +1301,9 @@ fn observe_gates(
     gates
 }
 
-/// Every `.rs` file under `dir`, recursively (control dirs are not present in
+/// Every file under `dir`, recursively (control dirs are not present in
 /// materialized trees, so no filtering is needed).
-fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
+fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1103,7 +1314,7 @@ fn rs_files_under(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
+            } else {
                 out.push(path);
             }
         }
@@ -1293,7 +1504,11 @@ fn cmd_revset(repo: Option<PathBuf>, expr: String) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
     let log = OpLog::load(oplog_path(&repo))?;
     // Phase lookup is empty for now (phases live in `omoplata-identity`).
-    let ctx = MapContext::new(log.refs_now());
+    // Registered queue names feed `landed()`'s ref-namespace disambiguation
+    // (ADR-0009).
+    let queues = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    let ctx =
+        MapContext::new(log.refs_now()).with_queues(queues.queues().iter().map(|q| q.name.clone()));
     for commit in omoplata_work::query(&expr, &ctx)? {
         println!("{commit}");
     }

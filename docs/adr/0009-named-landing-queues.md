@@ -122,14 +122,29 @@ by an agent fleet.
 
 ## Future work
 
+Three of the items originally listed here have since shipped in their v1
+shapes: **`landed(<queue>)` in revsets** (registry-driven ref disambiguation;
+`landed(trunk) & ~landed(release-1.2)` is the needs-backport query),
+**Tier-0 batching** (`omo land a b c` — pairwise disjointness judged from
+content manifests at *file* granularity, batch validated as one, landed in one
+locked transaction), and **mechanical backport offers** (`omo backport`
+carries approval forward with an *identity* certificate — content
+byte-identical to the reviewed, landed tip; moved content demands re-review).
+
+Still open:
+
 - **Multi-approval thresholds and named-reviewer policies.** `Approval` is a
   single-reviewer assertion today; §5.6 wants approvals as bi-temporal,
   revocable assertions. When that model lands, `require_approval: bool`
   generalizes to a count or reviewer-set predicate without changing the gate's
   shape.
-- **Queue verbs in revsets** (`queued()`, `landed(<queue>)`, §5.8).
-- **Batching within a queue** (Tier-0 disjoint batching, §5.10) and the
-  single-writer landing daemon (ADR-0008 Option C) that owns all queues.
-- **Auto-offer to sibling queues**: after a trunk landing, a commutation
-  certificate (I5) can prove a change applies cleanly to a release line and
-  offer the backport mechanically.
+- **Definition-granularity Tier-0.** Batch disjointness compares whole files;
+  the definition-identity layer can refine it so two submissions touching
+  disjoint definitions of the same file still batch.
+- **Commutation-certificate backports for moved content** (I5): today's
+  backport certificate covers only the identity case; a checked-commutation
+  certificate would carry approval across content that provably rebased
+  cleanly.
+- **`queued()`** awaits persistent queue membership (landing is immediate in
+  v1), which arrives with the single-writer landing daemon (ADR-0008 Option C)
+  that owns all queues.
