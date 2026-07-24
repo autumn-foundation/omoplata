@@ -75,7 +75,8 @@ directory); `init`/`status` take a positional path.
 |---------|-------------|---------|
 | `omo submit <id> --title "..." <change...>` | Create a review submission for change ID revsets with approval certificates; `--pending` leaves it awaiting review instead of auto-approving. | `omo submit sub-101 --title "Add auth" ws/w1` |
 | `omo approve <id> [--by NAME]` | Approve a pending submission. | `omo approve sub-101 --by mark` |
-| `omo land <submission-id> [--queue NAME]` | Land approved submission through a named merge queue (default `trunk`), transitioning phase from `Draft` to `Public`. The queue's policy gates the landing: approval, carried conflict values, and P9 validation of the materialized content. | `omo land sub-101 --queue release-1.2` |
+| `omo land <id>... [--queue NAME]` | Land approved submission(s) through a named merge queue (default `trunk`), transitioning phase from `Draft` to `Public`. The queue's policy gates the landing: approval, carried conflict values, and P9 validation of the materialized content. Several IDs form a **Tier-0 batch** (§5.10): submissions with disjoint *definition* support (relative to the queue's landed state) validate as one and land in a single locked transaction — two agents editing different definitions of the same file still batch; an overlap refuses the whole batch naming the colliding definitions. | `omo land sub-101 sub-102 --queue release-1.2` |
+| `omo backport <id> --to <queue>` | Land an already-landed submission into a second queue, carrying its approval forward with a certificate — sound by identity (content byte-identical to the reviewed, landed tip; moved content demands re-review). Target queue gates still apply. | `omo backport sub-101 --to release-1.2` |
 | `omo queue add <name>` | Register a landing queue with its policy: `--validate CMD` (P9 validator, `{}` = content dir), `--allow-carried`, `--no-approval`, `--description`. Registered queues default strict (carried values refused); the implicit `trunk` is permissive. | `omo queue add release-1.2 --validate './regression.sh {}'` |
 | `omo queue list` | List queues (including the implicit `trunk`) with their policies. | `omo queue list` |
 | `omo queue remove <name>` | Remove a queue from the registry (landed refs are kept). | `omo queue remove release-1.2` |
@@ -104,7 +105,7 @@ directory); `init`/`status` take a positional path.
 | `omo ref list [--repo DIR]` | List the current refs as `name commit`. | `omo ref list` |
 | `omo op log [--repo DIR]` | Print the bi-temporal operation log, newest first. | `omo op log` |
 | `omo op undo [--repo DIR]` | Undo the most recent operation still in effect (total, invertible undo). | `omo op undo` |
-| `omo revset <expr> [--repo DIR]` | Evaluate a revset expression (`a & b`, `a \| b`, `~a`, `all()`, `heads()`, `draft()`, `public()`, `id:<hex>`). | `omo revset 'main \| feature'` |
+| `omo revset <expr> [--repo DIR]` | Evaluate a revset expression (`a & b`, `a \| b`, `~a`, `all()`, `heads()`, `draft()`, `public()`, `landed(<queue>)`, `id:<hex>`). `landed(release-1.2) & ~landed(trunk)` is the "needs backporting to trunk" query. | `omo revset 'landed(trunk) & ~landed(release-1.2)'` |
 
 ### Git interop
 
