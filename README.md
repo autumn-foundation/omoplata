@@ -92,6 +92,7 @@ directory); `init`/`status` take a positional path.
 | `omo remote add <name> <path>` | Register another omoplata repository as a named remote (local-path transport). | `omo remote add origin ../peer` |
 | `omo remote list` / `omo remote remove <name>` | List or drop registered remotes. | `omo remote list` |
 | `omo fetch <remote>` | Replicate a remote's landed (`public/*`) state: copy the object closure into the local store and record each tip under `remotes/<name>/*` via the op log. Idempotent (content-addressed); private `ws/*` refs are not fetched. Then `omo switch <name>/<change>` drops onto a teammate's remote-landed work — no git round-trip. | `omo fetch origin` |
+| `omo push <remote> <id> [--queue Q]` | Land a local submission on a remote through *its* landing policy (the remote is the authority, ADR-0010 Phase 2): replicate the submission's content, then run the remote's approval/carried/validator/disjointness gates against the remote's landed state and land under its lock — or refuse with the reason. Content is re-validated by the remote, not trusted. | `omo push origin sub-101 --queue release-1.2` |
 | `omo queue remove <name>` | Remove a queue from the registry (landed refs are kept). | `omo queue remove release-1.2` |
 
 ### Definitions

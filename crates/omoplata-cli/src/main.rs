@@ -385,6 +385,28 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Land a local submission on a remote through *its* landing policy
+    /// (ADR-0010, Phase 2 — the remote is the landing authority).
+    ///
+    /// Replicates the submission's change content into the remote store, records
+    /// the submission (its approval + certificates travel with it), then runs
+    /// the remote's queue policy against the remote's landed state — approval,
+    /// carried-conflict rule, P9 validation, and definition-granular batch
+    /// disjointness — and lands it under the remote's lock, or refuses with the
+    /// reason. The remote re-validates content against its own trunk; it does
+    /// not trust the client to have done so.
+    Push {
+        /// The remote to push to: a registered name, or a path to a repo.
+        remote: String,
+        /// The submission id to land on the remote.
+        id: String,
+        /// Target queue on the remote (defaults to `trunk`).
+        #[arg(long, default_value = "trunk")]
+        queue: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 
     /// Inspect and update the repository's refs via the operation log (§5.6).
     Ref {
@@ -770,6 +792,12 @@ fn run() -> anyhow::Result<i32> {
             RemoteCommand::Remove { name, repo } => cmd_remote_remove(repo, name).map(|()| 0),
         },
         Command::Fetch { remote, repo } => cmd_fetch(repo, remote).map(|()| 0),
+        Command::Push {
+            remote,
+            id,
+            queue,
+            repo,
+        } => cmd_push(repo, remote, id, queue).map(|()| 0),
 
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
@@ -1993,6 +2021,121 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
         Ok(())
     })?;
     println!("fetched {name}: {objects} object(s), {refs_written} ref(s) into remotes/{name}/*");
+    Ok(())
+}
+
+/// `omo push <remote> <id>` — land a local submission on a remote through the
+/// remote's landing policy (ADR-0010, Phase 2).
+///
+/// The remote is the **landing authority**: this replicates the submission's
+/// change content into the remote store and records the submission (so its
+/// approval and any certificates travel), then runs the *remote's* queue policy
+/// against the *remote's* landed state — the carried-conflict rule, P9
+/// validation, and definition-granular batch disjointness are all re-checked
+/// there, and the landing itself happens under the remote's lock. The client
+/// cannot bypass the remote's gates; it can only propose content the remote then
+/// re-validates against its own trunk.
+///
+/// Approval authenticity is the one thing still taken on trust here — the remote
+/// honours the submission's recorded approval rather than re-deriving who
+/// approved it (a signed/attested approval is later work) — but content
+/// soundness (builds, disjoint, no carried conflicts on a strict queue) is
+/// enforced by the remote, not assumed.
+fn cmd_push(
+    repo: Option<PathBuf>,
+    remote: String,
+    id: String,
+    queue: String,
+) -> anyhow::Result<()> {
+    let local = Repository::open(resolve(repo)?)?;
+
+    // Resolve the remote (a registered name wins; otherwise a bare path).
+    let registry = RemoteRegistry::load(RemoteRegistry::path_in(&local))?;
+    let (name, path) = match registry.get(&remote) {
+        Some(r) => (r.name.clone(), r.path.clone()),
+        None => (remote.clone(), PathBuf::from(&remote)),
+    };
+    let remote_repo = Repository::open(&path).with_context(|| {
+        format!(
+            "cannot open remote {name:?} at {} — register it with `omo remote add` \
+             or pass a path to an omoplata repo",
+            path.display()
+        )
+    })?;
+
+    let sub = load_submission(&local, &SubmissionId::new(&id))?;
+
+    // The target queue's policy is the *remote's*, checked against its state.
+    let remote_registry = QueueRegistry::load(QueueRegistry::path_in(&remote_repo))?;
+    let policy = remote_registry.resolve(&queue)?;
+    if policy.require_approval && !sub.is_approved() {
+        anyhow::bail!(
+            "submission {} is not approved (remote queue {})",
+            sub.id,
+            policy.name
+        );
+    }
+
+    // Replicate each change's content into the remote store and build the
+    // change graph + tips the remote lands from.
+    let local_refs = OpLog::load(oplog_path(&local))?.refs_now();
+    let mut cg = ChangeGraph::new();
+    let mut tips: Vec<ObjectId> = Vec::new();
+    for change_id in &sub.changes {
+        let tip = local_refs
+            .get(change_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("change {change_id} has no snapshot to push"))?;
+        let oid = tip.as_str().parse::<ObjectId>().map_err(|_| {
+            anyhow::anyhow!("change {change_id} tip {tip} is not a valid object id")
+        })?;
+        omoplata_work::copy_closure(&local, &remote_repo, &oid)?;
+        cg.add_change(omoplata_identity::Change::new(
+            change_id.clone(),
+            vec![tip.clone()],
+            Phase::Draft,
+        ));
+        tips.push(oid);
+    }
+
+    // Record the submission on the remote (its approval + certificates travel).
+    save_submission(&remote_repo, &sub)?;
+
+    // Run the remote's gates against the remote's landed base, then land under
+    // the remote's lock — a refused landing mutates nothing.
+    let remote_refs = OpLog::load(oplog_path(&remote_repo))?.refs_now();
+    let sub_tips = vec![(sub.id.clone(), tips)];
+    let batch = observe_batch_gates(
+        &remote_repo,
+        &remote_registry,
+        &remote_refs,
+        &policy.name,
+        &sub_tips,
+        &policy,
+    )?;
+    let gates = QueueGates {
+        carried_values: batch.carried_values,
+        validated: batch.validated,
+    };
+    if policy.validate.is_some() {
+        match gates.validated {
+            Some(true) => eprintln!("remote queue {}: validation PASSED", policy.name),
+            _ => eprintln!("remote queue {}: validation FAILED", policy.name),
+        }
+    }
+    if gates.carried_values > 0 {
+        eprintln!(
+            "remote queue {}: content carries {} conflict value(s)",
+            policy.name, gates.carried_values
+        );
+    }
+
+    let result = OpLog::mutate_locked(&remote_repo, |op_log| {
+        land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)
+    })?;
+    println!(
+        "pushed {} to {name} (queue {}): {}",
+        result.submission_id, policy.name, result.message
+    );
     Ok(())
 }
 

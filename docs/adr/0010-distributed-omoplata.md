@@ -1,6 +1,6 @@
 # ADR-0010: Distributed omoplata — remotes, replication, and remote landing authority
 
-**Status:** accepted (Phase 1 implemented); Phases 2–3 documented future.
+**Status:** accepted (Phases 1–2 implemented); Phase 3 documented future.
 
 ## Context
 
@@ -99,13 +99,19 @@ remote preserves the whole model.
   can **switch straight onto a teammate's remote-landed work** — the same
   one-liner as local switch, now across machines. Replication only: no remote
   landing yet.
-- **Phase 2 — remote submit/land (Option C as request/response).** `omo push` /
-  `omo submit --remote origin` sends a submission (its change objects, the
-  submission record, and its approval certificate) to the authority, which runs
-  the queue policy — approval, carried-conflict rule, P9 validation, batch
-  disjointness, kernel admission — and lands it or refuses with the reason. The
-  certificate machinery (ADR-0009, I5) is precisely the primitive that lets the
-  authority accept a review without trusting the client.
+- **Phase 2 — remote submit/land (this ADR ships it).** `omo push <remote> <id>`
+  replicates a submission's change content into the remote store, records the
+  submission (so its approval and any certificates travel), and runs the
+  *remote's* queue policy against the *remote's* landed state — the
+  carried-conflict rule, P9 validation, and definition-granular batch
+  disjointness are re-checked there, and the landing happens under the remote's
+  lock. A refused landing mutates nothing. The client cannot bypass the gates;
+  it can only propose content the remote then re-validates against its own
+  trunk. **Known limitation:** approval *authenticity* is still trusted — the
+  remote honours the submission's recorded approval rather than re-deriving who
+  approved it. A signed/attested approval (so the authority verifies the
+  reviewer, not just the assertion) is the natural next hardening; the ADR-0009
+  certificate machinery is the primitive it builds on.
 - **Phase 3 — optimistic concurrent landing with kernel reconciliation.** Many
   swarms push concurrently; the authority merges disjoint-definition lands in a
   single transaction (batch landing, lifted from local to the authority) and
@@ -129,5 +135,8 @@ remote preserves the whole model.
 
 - Networked (http/ssh) transports; `git push` / `receive-pack` encoding.
 - Multi-master op-log reconciliation between independent authorities.
-- Remote landing (Phase 2) and concurrent-push reconciliation (Phase 3) — these
-  are specified here but not yet implemented.
+- Attested approval — the remote trusts the submission's recorded approval
+  (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
+- Concurrent-push reconciliation (Phase 3): the authority merging several
+  simultaneous pushes of disjoint definitions in one transaction and carrying
+  genuine conflicts as values — specified here, not yet implemented.
