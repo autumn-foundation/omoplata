@@ -1413,3 +1413,127 @@ fn switch_unknown_target_fails() {
         .failure()
         .stderr(predicate::str::contains("cannot switch to"));
 }
+
+// --- Distributed: remotes + fetch (ADR-0010, Phase 1) ------------------------
+
+#[test]
+fn fetch_replicates_landed_state_and_switch_lands_on_it() {
+    // dev-a: the "remote" — a developer lands a change on its own trunk.
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    land_change(a, "alice", FOO, "sub-alice");
+
+    // dev-b: a second developer on a separate repo wants alice's work.
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    let bob_wc = b.join("wc-bob");
+    std::fs::create_dir_all(&bob_wc).unwrap();
+    omo()
+        .args([
+            "workspace",
+            "add",
+            "bob",
+            bob_wc.to_str().unwrap(),
+            "--repo",
+        ])
+        .arg(b)
+        .assert()
+        .success();
+
+    // Register dev-a as a remote (its path is the transport) and fetch.
+    omo()
+        .args(["remote", "add", "origin", a.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+    omo()
+        .args(["fetch", "origin", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("into remotes/origin/*"));
+
+    // The remote-tracking ref now exists locally.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes/origin/public/ws/alice"));
+
+    // bob switches onto alice's remote-landed change via the shorthand.
+    omo()
+        .args(["switch", "origin/alice", "--workspace", "bob", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("to change ws/alice"));
+
+    // bob's working copy holds alice's content, and his workspace tracks it.
+    assert_eq!(
+        std::fs::read_to_string(bob_wc.join("shared.rs")).unwrap(),
+        FOO
+    );
+    omo()
+        .args(["stack", "--workspace", "bob", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("change: ws/alice"));
+
+    // A re-fetch is idempotent — content-addressed, so nothing new is copied.
+    omo()
+        .args(["fetch", "origin", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 object(s)"));
+}
+
+#[test]
+fn fetch_unknown_remote_fails() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    omo()
+        .args(["fetch", "nope", "--repo"])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot open remote"));
+}
+
+#[test]
+fn remote_add_list_remove_roundtrip() {
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+
+    omo()
+        .args(["remote", "add", "origin", a.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+    omo()
+        .args(["remote", "list", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("origin"));
+    omo()
+        .args(["remote", "remove", "origin", "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+    omo()
+        .args(["remote", "list", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(no remotes registered)"));
+}

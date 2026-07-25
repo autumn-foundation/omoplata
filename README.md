@@ -84,6 +84,14 @@ directory); `init`/`status` take a positional path.
 | `omo backport <id> --to <queue>` | Land an already-landed submission into a second queue, carrying its approval forward with a certificate — *identity* (content byte-identical to the reviewed tip) or *commutation* (moved, but every changed definition matches the source queue's landed history, so nothing reviewed was altered); an invented, unreviewed definition demands re-review. Target queue gates still apply. | `omo backport sub-101 --to release-1.2` |
 | `omo queue add <name>` | Register a landing queue with its policy: `--validate CMD` (P9 validator, `{}` = content dir), `--allow-carried`, `--no-approval`, `--description`. Registered queues default strict (carried values refused); the implicit `trunk` is permissive. | `omo queue add release-1.2 --validate './regression.sh {}'` |
 | `omo queue list` | List queues (including the implicit `trunk`) with their policies. | `omo queue list` |
+
+### Remotes and distribution (ADR-0010, Phase 1)
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `omo remote add <name> <path>` | Register another omoplata repository as a named remote (local-path transport). | `omo remote add origin ../peer` |
+| `omo remote list` / `omo remote remove <name>` | List or drop registered remotes. | `omo remote list` |
+| `omo fetch <remote>` | Replicate a remote's landed (`public/*`) state: copy the object closure into the local store and record each tip under `remotes/<name>/*` via the op log. Idempotent (content-addressed); private `ws/*` refs are not fetched. Then `omo switch <name>/<change>` drops onto a teammate's remote-landed work — no git round-trip. | `omo fetch origin` |
 | `omo queue remove <name>` | Remove a queue from the registry (landed refs are kept). | `omo queue remove release-1.2` |
 
 ### Definitions

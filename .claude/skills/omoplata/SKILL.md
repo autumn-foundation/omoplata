@@ -66,6 +66,20 @@ shared repo** — no clones, no worktrees, no push/rebase retry loops. Every `om
 process serializes on an advisory lock and writes atomically, so N agents land
 concurrently without corrupting the op log.
 
+**Across machines (distributed, ADR-0010 Phase 1):** the shared repo is the
+local model; to work against another dev's repo, register it and replicate its
+landed state — no git import/export round-trip:
+
+```sh
+omo remote add origin ../peer-repo    # another omoplata repo (local-path transport)
+omo fetch origin                      # copy its public/* into remotes/origin/*
+omo switch origin/agent-2 --workspace me   # drop onto their remote-landed work
+```
+
+`fetch` is read-only replication of *landed* (`public/*`) state; private `ws/*`
+tips are not fetched (land to share), and remote *landing* through a policy gate
+is later-phase work. Back to the local swarm:
+
 ```sh
 for i in 1 2 3 4 5; do omo workspace add agent-$i ./agents/agent-$i --repo trunk; done
 # each agent edits its own dir, then:

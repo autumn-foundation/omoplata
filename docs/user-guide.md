@@ -381,13 +381,14 @@ switched workspace agent-1 to change ws/agent-2 (tip sha256:edb7bc02bc90abae6…
 ```
 
 It repoints workspace `agent-1` at `<target>` — a teammate's workspace
-(`ws/<name>`, or just the bare `<name>`), a change id, or a change landed on
-trunk — and materializes that change's current tip into `agent-1`'s working
-directory, so you continue from their work. Because omoplata is **one shared
-repo** (§3), `switch` reads the live op-log refs: whatever anyone has landed or
-snapshotted since you last looked is already visible, so there is no separate
-"pull" step. (If you are genuinely working across separate git repositories,
-run `omo git fetch <path>` first to bring the refs in, then switch.)
+(`ws/<name>`, or just the bare `<name>`), a change id, a change landed on trunk,
+or a **fetched remote change** (`<remote>/<change>`) — and materializes that
+change's current tip into `agent-1`'s working directory, so you continue from
+their work. Within **one shared repo** (§3), `switch` reads the live op-log
+refs, so whatever anyone landed or snapshotted since you last looked is already
+visible — there is no separate "pull". Across **separate repos on separate
+machines**, that visibility comes from `omo fetch` first — native replication,
+no git round-trip (see "Distributed", below).
 
 `switch` will not silently overwrite un-snapshotted edits — if the target
 workspace's working copy is dirty it refuses, so you snapshot first (`omo stack`,
@@ -402,6 +403,34 @@ Once switched, the workspace *tracks* that change: a later `omo stack` snapshots
 onto it, which is exactly how two people collaborate on one change. To inspect
 stored state without touching your working files, `omo ref list` and `omo cat`
 still read refs and object bytes directly.
+
+### Distributed: fetching another repo's work (ADR-0010)
+
+The shared-repo model above is single-machine. To swarm against a **teammate's
+repo on another machine**, replicate its landed state — natively, without the
+git import/export round-trip:
+
+```console
+$ omo remote add origin ../alice-repo
+added remote /abs/path/to/alice-repo
+
+$ omo fetch origin
+fetched origin: 2 object(s), 1 ref(s) into remotes/origin/*
+
+$ omo switch origin/alice --workspace me
+switched workspace me to change ws/alice (tip sha256:4994…)
+```
+
+`fetch` copies the object closure of the remote's `public/*` (landed) refs into
+your store and records each under `remotes/<name>/*` — content-addressed, so a
+re-fetch copies only what is new. Then `omo switch <remote>/<change>` drops your
+workspace straight onto that work. Private `ws/*` tips are **not** fetched: a
+workspace's in-progress state is not shareable until it lands. This is **Phase 1
+(read-replication)** of the distributed design — the remote as a **landing
+authority** (remote submit/land, and concurrent-push reconciliation through the
+kernel) is specified in [ADR-0010](adr/0010-distributed-omoplata.md) and is the
+next step. The transport today is the local path (a shared mount or sibling
+clone); networked transports follow, exactly as git interop began at `file://`.
 
 ### Undo and history
 
