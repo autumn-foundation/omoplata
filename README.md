@@ -70,6 +70,7 @@ directory); `init`/`status` take a positional path.
 | `omo workspace list` | List all active registered workspaces and their working directories. | `omo workspace list` |
 | `omo workspace remove <name>` | Unregister a workspace. | `omo workspace remove w1` |
 | `omo stack [--workspace WS]` | View linear change stack; auto-snapshots working copy modifications into tree commits (P4). | `omo stack --workspace w1` |
+| `omo switch <target> [--workspace WS] [--force]` | Repoint a workspace at another change (a teammate's `ws/<name>`, a change id, or a landed change) and materialize its live tip into the working dir — the one-liner to switch to someone's work and pull in what landed since. Refuses to clobber uncommitted edits unless `--force`. | `omo switch ws/agent-2 --workspace agent-1` |
 | `omo absorb <change...>` | Auto-route working copy edits to stack changes by definition identity. | `omo absorb c1 c2` |
 | `omo reorder <index>` | Swap adjacent changes in a stack (carrying conflict values if non-disjoint). | `omo reorder 0` |
 

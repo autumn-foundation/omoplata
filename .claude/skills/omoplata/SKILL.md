@@ -31,8 +31,9 @@ mental shifts decide whether you use it well:
    value you resolve *later*, when convenient. Landing throughput never waits on
    resolution.
 3. **There are no branches.** The primary objects are **changes** and **stacks**.
-   You do not `git branch` / `switch` / `commit`. You register a **workspace**,
-   edit files, and the working copy **auto-snapshots** into a change.
+   You do not `git branch` / `commit`. You register a **workspace**, edit files,
+   and the working copy **auto-snapshots** into a change; to move a workspace onto
+   another change you `omo switch`, not `git checkout`.
 4. **Landing is a policy gate, not a push.** Work reaches trunk (or a release
    line) by `submit` → `approve` → `land` through a **merge queue** whose policy
    (validator, approval, conflict rules) is checked *before* the change goes
@@ -144,10 +145,14 @@ omo land sub-42 --queue release-1.2       # gated on approval, carried-conflict 
 
 ## Gotchas that bite git habits
 
-- **Don't look for `commit` / `branch` / `switch`.** There is no `omo commit`
-  (workspaces auto-snapshot), no `omo branch` (branches are deliberately not a
-  primary object), and no `omo switch`/`checkout` yet (nothing swaps your working
-  tree to a ref). Assemble state via workspaces, not pointers.
+- **Don't look for `commit` / `branch`.** There is no `omo commit` (workspaces
+  auto-snapshot) and no `omo branch` (branches are deliberately not a primary
+  object). Assemble state via workspaces, not pointers. **To take over a
+  teammate's work and get the latest, use `omo switch <target>`** — it repoints a
+  workspace at another change (`ws/<name>`, a change id, or a landed change) and
+  materializes its live tip into the working dir. Since the repo is shared,
+  that also brings in everything landed since; it refuses to clobber
+  un-snapshotted edits unless `--force`.
 - **Approve before landing into a strict queue,** or the land is refused (exit 2,
   stderr `not approved`).
 - **Exit 2 is overloaded:** it means *either* "carried conflict values present"

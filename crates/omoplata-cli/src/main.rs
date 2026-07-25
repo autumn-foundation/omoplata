@@ -239,6 +239,30 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Switch a workspace's working copy to another change and pull in the
+    /// latest (§5.9).
+    ///
+    /// Repoints the workspace at <target> — a teammate's workspace (`ws/<name>`
+    /// or just `<name>`), a change id, or a change landed on trunk — and
+    /// materializes that change's current tip into the working directory, so you
+    /// continue from their work. It reads the live shared op-log refs, so it also
+    /// brings in everything landed since you last looked: in a shared repo there
+    /// is nothing else to "pull"; across separate git repos, run
+    /// `omo git fetch <path>` first to update the refs, then switch. Refuses to
+    /// clobber uncommitted edits unless `--force`.
+    Switch {
+        /// Workspace, change, or ref to switch to (e.g. `ws/agent-2`, `agent-2`).
+        target: String,
+        /// Which workspace to switch (defaults to the current-directory workspace).
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Discard uncommitted edits in the working copy instead of refusing.
+        #[arg(long)]
+        force: bool,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Route uncommitted working-copy edits into stack changes by touched definitions (§5.9).
     Absorb {
         /// Target change IDs to absorb hunks into.
@@ -642,6 +666,12 @@ fn run() -> anyhow::Result<i32> {
             WorkspaceCommand::Remove { name, repo } => cmd_workspace_remove(repo, name).map(|()| 0),
         },
         Command::Stack { workspace, repo } => cmd_stack(repo, workspace).map(|()| 0),
+        Command::Switch {
+            target,
+            workspace,
+            force,
+            repo,
+        } => cmd_switch(repo, target, workspace, force).map(|()| 0),
         Command::Absorb {
             target,
             workspace,
@@ -860,6 +890,88 @@ fn cmd_stack(repo: Option<PathBuf>, workspace: Option<String>) -> anyhow::Result
     }
     println!("  stack changes: [{}]", ws.change);
     Ok(())
+}
+
+/// `omo switch <target>` — repoint a workspace at another change and
+/// materialize its live tip into the working copy (§5.9).
+///
+/// The target resolves (via [`resolve_switch_target`]) against the shared
+/// op-log refs, so the content is always the latest anyone has landed or
+/// snapshotted — the "pull in what changed since I last looked" is inherent to
+/// the shared repo. A dirty working copy is protected: switching would overwrite
+/// un-snapshotted edits, so it refuses unless `--force`.
+fn cmd_switch(
+    repo: Option<PathBuf>,
+    target: String,
+    workspace: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
+    let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
+
+    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
+    let (change_id, tip) = resolve_switch_target(&refs, &reg, &target).with_context(|| {
+        format!("cannot switch to {target:?}: no matching workspace, change, or landed ref")
+    })?;
+
+    // Never clobber un-snapshotted edits: they live only in the working copy
+    // until `omo stack` records them onto the current change.
+    let current_tip = refs.get(ws.change.as_str()).cloned();
+    let (dirty, _) = omoplata_work::is_dirty(&repo, &ws.working_dir, current_tip.as_ref())?;
+    if dirty && !force {
+        anyhow::bail!(
+            "workspace {} has uncommitted edits — snapshot them with `omo stack` (they stay on \
+             change {}) or pass --force to discard and switch",
+            ws.name,
+            ws.change
+        );
+    }
+
+    let oid = tip
+        .as_str()
+        .parse::<ObjectId>()
+        .map_err(|_| anyhow::anyhow!("target {change_id} tip {tip} is not a valid object id"))?;
+    omoplata_work::materialize(&repo, &oid, &ws.working_dir)?;
+
+    let name = ws.name.clone();
+    let bind = change_id.clone();
+    WorkspaceRegistry::mutate_locked(&repo, move |reg| reg.set_change(&name, bind))?;
+
+    println!(
+        "switched workspace {} to change {change_id} (tip {tip})",
+        ws.name
+    );
+    Ok(())
+}
+
+/// Resolve an `omo switch` target to `(change id, tip commit)` against the live
+/// refs. Tries, first hit wins: an exact ref / change id; a registered workspace
+/// name (`agent-2` → its current change); the `ws/<name>` shorthand; and a
+/// change landed on trunk (`public/<name>`). Returns `None` if nothing matches
+/// or the match has no tip yet (an empty change).
+fn resolve_switch_target(
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    reg: &WorkspaceRegistry,
+    target: &str,
+) -> Option<(ChangeId, CommitId)> {
+    if let Some(tip) = refs.get(target) {
+        return Some((ChangeId::new(target), tip.clone()));
+    }
+    if let Some(ws) = reg.get(target) {
+        if let Some(tip) = refs.get(ws.change.as_str()) {
+            return Some((ws.change.clone(), tip.clone()));
+        }
+    }
+    let ws_ref = format!("ws/{target}");
+    if let Some(tip) = refs.get(&ws_ref) {
+        return Some((ChangeId::new(ws_ref), tip.clone()));
+    }
+    let public_ref = omoplata_work::queue_ref("trunk", &ChangeId::new(target));
+    if let Some(tip) = refs.get(&public_ref) {
+        return Some((ChangeId::new(target), tip.clone()));
+    }
+    None
 }
 
 /// `omo absorb <target...>` — route hunks into stack changes (§5.9).

@@ -1303,3 +1303,113 @@ fn backport_refuses_moved_novel_definition() {
         .stderr(predicate::str::contains("disturbed definition(s)"))
         .stderr(predicate::str::contains("fn baz"));
 }
+
+// --- omo switch (§5.9) -------------------------------------------------------
+
+/// Register two workspaces over their own dirs and return the repo root path.
+fn two_workspaces(root: &std::path::Path) {
+    omo().arg("init").arg(root).assert().success();
+    for name in ["agent-1", "agent-2"] {
+        let wc = root.join(format!("wc-{name}"));
+        std::fs::create_dir_all(&wc).unwrap();
+        omo()
+            .args(["workspace", "add", name, wc.to_str().unwrap(), "--repo"])
+            .arg(root)
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn switch_moves_workspace_to_another_change_and_materializes_its_tip() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    two_workspaces(root);
+
+    // agent-2 does some work and snapshots it onto its change.
+    std::fs::write(root.join("wc-agent-2").join("lib.rs"), FOO).unwrap();
+    omo()
+        .args(["stack", "--workspace", "agent-2", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // One line: agent-1 switches to agent-2's work.
+    omo()
+        .args(["switch", "ws/agent-2", "--workspace", "agent-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "switched workspace agent-1 to change ws/agent-2",
+        ));
+
+    // agent-1's working copy now holds agent-2's content...
+    assert_eq!(
+        std::fs::read_to_string(root.join("wc-agent-1").join("lib.rs")).unwrap(),
+        FOO
+    );
+    // ...and its current change pointer tracks ws/agent-2.
+    omo()
+        .args(["stack", "--workspace", "agent-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("change: ws/agent-2"));
+}
+
+#[test]
+fn switch_refuses_dirty_working_copy_unless_forced() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    two_workspaces(root);
+    std::fs::write(root.join("wc-agent-2").join("lib.rs"), FOO).unwrap();
+    omo()
+        .args(["stack", "--workspace", "agent-2", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // Un-snapshotted edit in agent-1's working copy.
+    std::fs::write(root.join("wc-agent-1").join("scratch.txt"), "wip\n").unwrap();
+
+    // A plain switch would clobber it, so it refuses.
+    omo()
+        .args(["switch", "ws/agent-2", "--workspace", "agent-1", "--repo"])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uncommitted edits"));
+
+    // --force discards the edit and switches.
+    omo()
+        .args([
+            "switch",
+            "ws/agent-2",
+            "--workspace",
+            "agent-1",
+            "--force",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+    assert!(!root.join("wc-agent-1").join("scratch.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("wc-agent-1").join("lib.rs")).unwrap(),
+        FOO
+    );
+}
+
+#[test]
+fn switch_unknown_target_fails() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    two_workspaces(root);
+    omo()
+        .args(["switch", "ws/nobody", "--workspace", "agent-1", "--repo"])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot switch to"));
+}

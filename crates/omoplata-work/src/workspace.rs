@@ -149,6 +149,25 @@ impl WorkspaceRegistry {
         Ok(&self.workspaces[idx])
     }
 
+    /// Repoint a workspace's current change (the `omo switch` mutation).
+    ///
+    /// The workspace keeps its name and working directory but now tracks
+    /// `change`'s tip, so it edits that change going forward. The change's
+    /// recorded history is untouched; only this workspace's pointer moves.
+    ///
+    /// # Errors
+    ///
+    /// [`WorkError::UnknownWorkspace`] if no workspace with `name` is registered.
+    pub fn set_change(&mut self, name: &str, change: ChangeId) -> Result<(), WorkError> {
+        let ws = self
+            .workspaces
+            .iter_mut()
+            .find(|w| w.name == name)
+            .ok_or_else(|| WorkError::UnknownWorkspace(name.to_owned()))?;
+        ws.change = change;
+        Ok(())
+    }
+
     /// Remove a workspace by name, returning it.
     ///
     /// This drops the registry entry only; the shared op log (and therefore the
