@@ -1537,3 +1537,144 @@ fn remote_add_list_remove_roundtrip() {
         .success()
         .stdout(predicate::str::contains("(no remotes registered)"));
 }
+
+// --- Distributed Phase 2: push to a remote landing authority (ADR-0010) ------
+
+/// Register workspace `name` in repo `root`, write `content`, snapshot, and
+/// submit as `sub`. `pending` leaves it awaiting approval instead of
+/// auto-approving. Does *not* land — the submission is left ready to push.
+fn prepare_submission(root: &std::path::Path, name: &str, content: &str, sub: &str, pending: bool) {
+    let wc = root.join(format!("wc-{name}"));
+    std::fs::create_dir_all(&wc).unwrap();
+    std::fs::write(wc.join("lib.rs"), content).unwrap();
+    omo()
+        .args(["workspace", "add", name, wc.to_str().unwrap(), "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args(["stack", "--workspace", name, "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    let mut args = vec!["submit", sub, "--title", sub];
+    if pending {
+        args.push("--pending");
+    }
+    let change = format!("ws/{name}");
+    args.push(&change);
+    args.push("--repo");
+    omo().args(args).arg(root).assert().success();
+}
+
+#[test]
+fn push_lands_submission_on_remote_authority() {
+    // A is the remote landing authority; B is a developer on a separate repo.
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    prepare_submission(b, "dev", FOO, "sub-b", false);
+    omo()
+        .args(["remote", "add", "origin", a.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+
+    // Push lands it on A's trunk, running A's policy under A's lock.
+    omo()
+        .args(["push", "origin", "sub-b", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pushed sub-b to origin"))
+        .stdout(predicate::str::contains("landed in queue trunk"));
+
+    // A now carries the landed change; a third party could fetch + switch to it.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(a)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("public/ws/dev"));
+}
+
+#[test]
+fn push_unapproved_to_strict_remote_queue_refuses() {
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    // A registers a strict release queue (approval required by default).
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(a)
+        .assert()
+        .success();
+
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    prepare_submission(b, "dev", FOO, "sub-pending", true); // --pending
+    omo()
+        .args(["remote", "add", "origin", a.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+
+    // The remote's approval gate refuses it — the client cannot self-certify.
+    omo()
+        .args([
+            "push",
+            "origin",
+            "sub-pending",
+            "--queue",
+            "release-1",
+            "--repo",
+        ])
+        .arg(b)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not approved"));
+}
+
+#[test]
+fn push_refused_by_remote_validator_does_not_land() {
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    // A's queue runs a validator that always fails — the remote re-validates
+    // content against its own policy, so nothing lands.
+    omo()
+        .args(["queue", "add", "gated", "--validate", "false", "--repo"])
+        .arg(a)
+        .assert()
+        .success();
+
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    prepare_submission(b, "dev", FOO, "sub-v", false); // auto-approved
+    omo()
+        .args(["remote", "add", "origin", a.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+
+    omo()
+        .args(["push", "origin", "sub-v", "--queue", "gated", "--repo"])
+        .arg(b)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("validation FAILED"));
+
+    // The refusal mutated nothing on A: no landed ref for the change.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(a)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("public/").not());
+}

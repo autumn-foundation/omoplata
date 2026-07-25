@@ -74,11 +74,14 @@ landed state — no git import/export round-trip:
 omo remote add origin ../peer-repo    # another omoplata repo (local-path transport)
 omo fetch origin                      # copy its public/* into remotes/origin/*
 omo switch origin/agent-2 --workspace me   # drop onto their remote-landed work
+omo push origin sub-7 --queue trunk   # land YOUR submission on the remote's queue
 ```
 
-`fetch` is read-only replication of *landed* (`public/*`) state; private `ws/*`
-tips are not fetched (land to share), and remote *landing* through a policy gate
-is later-phase work. Back to the local swarm:
+`fetch` is read-only replication of *landed* (`public/*`) state (private `ws/*`
+tips are not fetched — land to share). `push` is the write path: the **remote is
+the landing authority** — it re-runs its own approval/validator/disjointness
+gates against its own trunk and lands under its lock, or refuses. The client
+can't bypass the remote's policy. Back to the local swarm:
 
 ```sh
 for i in 1 2 3 4 5; do omo workspace add agent-$i ./agents/agent-$i --repo trunk; done

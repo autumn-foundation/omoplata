@@ -425,12 +425,39 @@ switched workspace me to change ws/alice (tip sha256:4994…)
 your store and records each under `remotes/<name>/*` — content-addressed, so a
 re-fetch copies only what is new. Then `omo switch <remote>/<change>` drops your
 workspace straight onto that work. Private `ws/*` tips are **not** fetched: a
-workspace's in-progress state is not shareable until it lands. This is **Phase 1
-(read-replication)** of the distributed design — the remote as a **landing
-authority** (remote submit/land, and concurrent-push reconciliation through the
-kernel) is specified in [ADR-0010](adr/0010-distributed-omoplata.md) and is the
-next step. The transport today is the local path (a shared mount or sibling
-clone); networked transports follow, exactly as git interop began at `file://`.
+workspace's in-progress state is not shareable until it lands.
+
+The write path is `omo push`, and it makes the remote the **landing authority**:
+
+```console
+$ omo push origin sub-7 --queue trunk
+pushed sub-7 to origin (queue trunk): Submission sub-7 landed in queue trunk
+```
+
+`push` replicates the submission's content into the remote store, records the
+submission (so its approval and any certificates travel), then runs the
+*remote's* queue policy against the *remote's* landed state — approval, the
+carried-conflict rule, P9 validation, and definition-granular batch
+disjointness — and lands under the remote's lock, or refuses:
+
+```console
+$ omo push origin sub-pending --queue release-1
+error: submission sub-pending is not approved (remote queue release-1)
+```
+
+The remote **re-validates content against its own trunk**; it does not trust the
+client to have done so, so a push that would not build, collides on a definition
+already landed there, or carries conflict values into a strict queue is refused
+and mutates nothing. The one thing still taken on trust is approval
+*authenticity* — the remote honours the submission's recorded approval rather
+than re-deriving who approved it; attested approval is the next hardening.
+
+This is **Phases 1–2** of the distributed design; concurrent-push reconciliation
+(the authority merging simultaneous disjoint pushes in one transaction, carrying
+genuine conflicts as values — what git's non-fast-forward model cannot do) is
+**Phase 3**, specified in [ADR-0010](adr/0010-distributed-omoplata.md). The
+transport today is the local path (a shared mount or sibling clone); networked
+transports follow, exactly as git interop began at `file://`.
 
 ### Undo and history
 
