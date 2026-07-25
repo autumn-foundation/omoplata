@@ -83,6 +83,14 @@ pub enum WorkError {
     #[error("unknown queue: {0:?}")]
     UnknownQueue(String),
 
+    /// A remote with the requested name is already registered (ADR-0010).
+    #[error("a remote named {0:?} already exists")]
+    RemoteExists(String),
+
+    /// No remote with the requested name is registered (ADR-0010).
+    #[error("unknown remote: {0:?}")]
+    UnknownRemote(String),
+
     /// The submission's content carries unresolved conflict values and the
     /// target queue's policy refuses them (ADR-0009).
     #[error(

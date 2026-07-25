@@ -31,8 +31,9 @@ mental shifts decide whether you use it well:
    value you resolve *later*, when convenient. Landing throughput never waits on
    resolution.
 3. **There are no branches.** The primary objects are **changes** and **stacks**.
-   You do not `git branch` / `switch` / `commit`. You register a **workspace**,
-   edit files, and the working copy **auto-snapshots** into a change.
+   You do not `git branch` / `commit`. You register a **workspace**, edit files,
+   and the working copy **auto-snapshots** into a change; to move a workspace onto
+   another change you `omo switch`, not `git checkout`.
 4. **Landing is a policy gate, not a push.** Work reaches trunk (or a release
    line) by `submit` → `approve` → `land` through a **merge queue** whose policy
    (validator, approval, conflict rules) is checked *before* the change goes
@@ -64,6 +65,20 @@ This is what omoplata is *for*. Give each agent its own workspace over **one
 shared repo** — no clones, no worktrees, no push/rebase retry loops. Every `omo`
 process serializes on an advisory lock and writes atomically, so N agents land
 concurrently without corrupting the op log.
+
+**Across machines (distributed, ADR-0010 Phase 1):** the shared repo is the
+local model; to work against another dev's repo, register it and replicate its
+landed state — no git import/export round-trip:
+
+```sh
+omo remote add origin ../peer-repo    # another omoplata repo (local-path transport)
+omo fetch origin                      # copy its public/* into remotes/origin/*
+omo switch origin/agent-2 --workspace me   # drop onto their remote-landed work
+```
+
+`fetch` is read-only replication of *landed* (`public/*`) state; private `ws/*`
+tips are not fetched (land to share), and remote *landing* through a policy gate
+is later-phase work. Back to the local swarm:
 
 ```sh
 for i in 1 2 3 4 5; do omo workspace add agent-$i ./agents/agent-$i --repo trunk; done
@@ -144,10 +159,14 @@ omo land sub-42 --queue release-1.2       # gated on approval, carried-conflict 
 
 ## Gotchas that bite git habits
 
-- **Don't look for `commit` / `branch` / `switch`.** There is no `omo commit`
-  (workspaces auto-snapshot), no `omo branch` (branches are deliberately not a
-  primary object), and no `omo switch`/`checkout` yet (nothing swaps your working
-  tree to a ref). Assemble state via workspaces, not pointers.
+- **Don't look for `commit` / `branch`.** There is no `omo commit` (workspaces
+  auto-snapshot) and no `omo branch` (branches are deliberately not a primary
+  object). Assemble state via workspaces, not pointers. **To take over a
+  teammate's work and get the latest, use `omo switch <target>`** — it repoints a
+  workspace at another change (`ws/<name>`, a change id, or a landed change) and
+  materializes its live tip into the working dir. Since the repo is shared,
+  that also brings in everything landed since; it refuses to clobber
+  un-snapshotted edits unless `--force`.
 - **Approve before landing into a strict queue,** or the land is refused (exit 2,
   stderr `not approved`).
 - **Exit 2 is overloaded:** it means *either* "carried conflict values present"

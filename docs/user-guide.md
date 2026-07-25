@@ -144,7 +144,7 @@ renamed compute_area -> area_of_rect (fn)
 
 ## 3. The change-stack workflow: workspaces, stacks, submissions, and landing
 
-Omoplata rejects traditional Git-style `commit`, `branch`, and `switch` pointers in favor of **auto-snapshotted workspaces**, **change stacks**, **typed submissions**, and **merge queue landing** (§5.9, §5.10).
+Omoplata rejects traditional Git-style `commit` and `branch` pointers in favor of **auto-snapshotted workspaces**, **change stacks**, **typed submissions**, and **merge queue landing** (§5.9, §5.10). Switching between lines of work is a workspace operation — `omo switch` (§3) — not a branch checkout.
 
 ### Workspaces and auto-snapshotting
 
@@ -369,35 +369,68 @@ $ omo diff notes.txt notes.feature.txt
 Missing verb flagged: `omo branch` (create/list/delete branches by name). Today a
 branch is a ref you set by hand; there's no first-class branch command over it.
 
-### "Switching" / "checking out" today — the biggest gap
+### "Switching" / "checking out" — `omo switch`
 
-Be direct: there is **no `omo switch` / `checkout`**. omo does **not** materialize
-a stored tree back into your working files — nothing writes a ref's content over
-your working directory. So you never "check out" `feature` into the working dir
-the way `git switch feature` would.
-
-What you *can* do is inspect stored state without touching your working files —
-list refs, and read an object's bytes back with `omo cat`:
+The git muscle memory here is `git switch feature && git pull`: point your
+working tree at someone else's line of work and take on everything that has
+happened since. In omoplata that is **one command**, `omo switch <target>`:
 
 ```console
-$ omo ref list
-main sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-
-$ omo cat sha256:ef05874983205a31de1a8b0803550fc7c3cd662ad8d38a10c8bcbe60126da120
-title: notes
-body: first draft
-
-$ omo cat main
-error: sha256 prefix required (e.g. 'sha256:abcd...')
+$ omo switch ws/agent-2 --workspace agent-1
+switched workspace agent-1 to change ws/agent-2 (tip sha256:edb7bc02bc90abae6…)
 ```
 
-To act on a ref's content you redirect `omo cat` into a file yourself and
-diff it — there is no command that swaps your working tree to match a ref.
-Workspaces (§3, M2) landed with per-agent working directories and
-auto-snapshotting, and the object store can already materialize a stored tree
-back to disk (it is how the merge queue validates a submission's content), but a
-user-facing `omo switch` / `checkout` verb that swaps your working tree to a ref
-is still the single biggest ergonomic gap versus git.
+It repoints workspace `agent-1` at `<target>` — a teammate's workspace
+(`ws/<name>`, or just the bare `<name>`), a change id, a change landed on trunk,
+or a **fetched remote change** (`<remote>/<change>`) — and materializes that
+change's current tip into `agent-1`'s working directory, so you continue from
+their work. Within **one shared repo** (§3), `switch` reads the live op-log
+refs, so whatever anyone landed or snapshotted since you last looked is already
+visible — there is no separate "pull". Across **separate repos on separate
+machines**, that visibility comes from `omo fetch` first — native replication,
+no git round-trip (see "Distributed", below).
+
+`switch` will not silently overwrite un-snapshotted edits — if the target
+workspace's working copy is dirty it refuses, so you snapshot first (`omo stack`,
+which keeps them on your current change) or pass `--force` to discard them:
+
+```console
+$ omo switch ws/agent-2 --workspace agent-1
+error: workspace agent-1 has uncommitted edits — snapshot them with `omo stack` (they stay on change ws/agent-1) or pass --force to discard and switch
+```
+
+Once switched, the workspace *tracks* that change: a later `omo stack` snapshots
+onto it, which is exactly how two people collaborate on one change. To inspect
+stored state without touching your working files, `omo ref list` and `omo cat`
+still read refs and object bytes directly.
+
+### Distributed: fetching another repo's work (ADR-0010)
+
+The shared-repo model above is single-machine. To swarm against a **teammate's
+repo on another machine**, replicate its landed state — natively, without the
+git import/export round-trip:
+
+```console
+$ omo remote add origin ../alice-repo
+added remote /abs/path/to/alice-repo
+
+$ omo fetch origin
+fetched origin: 2 object(s), 1 ref(s) into remotes/origin/*
+
+$ omo switch origin/alice --workspace me
+switched workspace me to change ws/alice (tip sha256:4994…)
+```
+
+`fetch` copies the object closure of the remote's `public/*` (landed) refs into
+your store and records each under `remotes/<name>/*` — content-addressed, so a
+re-fetch copies only what is new. Then `omo switch <remote>/<change>` drops your
+workspace straight onto that work. Private `ws/*` tips are **not** fetched: a
+workspace's in-progress state is not shareable until it lands. This is **Phase 1
+(read-replication)** of the distributed design — the remote as a **landing
+authority** (remote submit/land, and concurrent-push reconciliation through the
+kernel) is specified in [ADR-0010](adr/0010-distributed-omoplata.md) and is the
+next step. The transport today is the local path (a shared mount or sibling
+clone); networked transports follow, exactly as git interop began at `file://`.
 
 ### Undo and history
 
@@ -431,12 +464,13 @@ you rewrite. (More on the op log vs the reflog in §6.)
 
 The workspaces milestone **has landed**: `omo workspace add` registers per-agent
 working directories over one shared object store, working-copy edits
-auto-snapshot into change stacks (§3.1), and submissions land through named
-queues (§3.4). The `ref set` / `hash-object` dance above is the low-level
-substrate those verbs sit on, not the everyday path.
+auto-snapshot into change stacks (§3.1), submissions land through named queues
+(§3.4), and `omo switch` repoints a workspace at another change and materializes
+its tip (see "Switching / checking out", above). The `ref set` / `hash-object`
+dance above is the low-level substrate those verbs sit on, not the everyday path.
 
-What is **still absent** is the git-verb ergonomics a git user reaches for by
-name — and two of the three are deliberate omissions, not pending work:
+Of the git-verb ergonomics a git user reaches for by name, `switch` now exists;
+the remaining two are deliberate omissions, not pending work:
 
 - **`omo commit`** — there is no message-bearing snapshot verb; workspaces
   **auto-snapshot** instead (P4), so a "commit" is a query/mutation side effect,
@@ -445,9 +479,6 @@ name — and two of the three are deliberate omissions, not pending work:
 - **`omo branch`** — intentionally absent. Branches are **not a primary object**
   (§5.9); the primary objects are changes and stacks, and bookmarks are
   read-only interop shadows. There is no plan for locally-mutable branch names.
-- **`omo switch` / `checkout`** — genuinely missing: nothing swaps your working
-  tree to a ref yet, though the underlying materialize capability exists (see
-  the note in "Switching today", above).
 
 ---
 
@@ -829,13 +860,13 @@ lower `--threshold` (e.g. `0.5`) when using `--real-embeddings`.
 This build implements the design doc's core end to end but is explicit about
 what is not yet the real thing:
 
-- **No `commit` / `branch` / `switch` verbs — mostly by design.** Workspaces (M2)
-  landed (`omo workspace`, `omo stack`, auto-snapshotting), so the everyday path
-  is workspaces + stacks + submissions, not the hand-assembled `hash-object` /
-  `ref set` loop. But there is no `omo commit` (auto-snapshot replaces it), no
-  `omo branch` (branches are deliberately not a primary object, §5.9), and no
-  `omo switch` / `checkout` — nothing yet swaps your working tree to a ref, though
-  the underlying materialize capability exists. See §3's "git verbs still missing".
+- **No `commit` / `branch` verbs — by design.** Workspaces (M2) landed
+  (`omo workspace`, `omo stack`, `omo switch`, auto-snapshotting), so the everyday
+  path is workspaces + stacks + submissions, not the hand-assembled `hash-object`
+  / `ref set` loop. `omo switch` now swaps a workspace's working tree to another
+  change's tip. But there is still no `omo commit` (auto-snapshot replaces it) and
+  no `omo branch` (branches are deliberately not a primary object, §5.9). See
+  §3's "git verbs still missing".
 - **Landing is immediate, not a persistent queue.** `omo land` applies queue
   policy and transitions `Draft → Public` synchronously; there is no standing
   queue membership, `queued()` revset, or single-writer landing daemon

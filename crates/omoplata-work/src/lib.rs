@@ -47,6 +47,7 @@ mod autorebase;
 mod error;
 mod oplog;
 mod queue;
+mod remote;
 mod revset;
 mod stack;
 mod workspace;
@@ -58,6 +59,7 @@ pub use queue::{
     land_batch_in_queue, land_submission, land_submission_in_queue, queue_ref, rust_support,
     BatchGates, LandResult, QueueGates, QueuePolicy, QueueRegistry, WHOLE_FILE_SUPPORT,
 };
+pub use remote::{copy_closure, Remote, RemoteRegistry};
 pub use revset::{eval, parse, query, MapContext, RevExpr, RevsetContext};
 pub use stack::{absorb, Stack};
 pub use workspace::{auto_snapshot, is_dirty, materialize, snapshot, Workspace, WorkspaceRegistry};

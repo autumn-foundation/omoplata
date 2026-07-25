@@ -25,8 +25,8 @@ use omoplata_sem::{
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
     absorb, auto_snapshot, land_batch_in_queue, land_submission_in_queue, BatchGates, MapContext,
-    OpKind, OpLog, QueueGates, QueuePolicy, QueueRegistry, RebaseEngine, Stack, Workspace,
-    WorkspaceRegistry,
+    OpKind, OpLog, QueueGates, QueuePolicy, QueueRegistry, RebaseEngine, RemoteRegistry, Stack,
+    Workspace, WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -239,6 +239,30 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Switch a workspace's working copy to another change and pull in the
+    /// latest (§5.9).
+    ///
+    /// Repoints the workspace at <target> — a teammate's workspace (`ws/<name>`
+    /// or just `<name>`), a change id, or a change landed on trunk — and
+    /// materializes that change's current tip into the working directory, so you
+    /// continue from their work. It reads the live shared op-log refs, so it also
+    /// brings in everything landed since you last looked: in a shared repo there
+    /// is nothing else to "pull"; across separate git repos, run
+    /// `omo git fetch <path>` first to update the refs, then switch. Refuses to
+    /// clobber uncommitted edits unless `--force`.
+    Switch {
+        /// Workspace, change, or ref to switch to (e.g. `ws/agent-2`, `agent-2`).
+        target: String,
+        /// Which workspace to switch (defaults to the current-directory workspace).
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Discard uncommitted edits in the working copy instead of refusing.
+        #[arg(long)]
+        force: bool,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Route uncommitted working-copy edits into stack changes by touched definitions (§5.9).
     Absorb {
         /// Target change IDs to absorb hunks into.
@@ -338,6 +362,28 @@ enum Command {
     Queue {
         #[command(subcommand)]
         action: QueueCommand,
+    },
+
+    /// Manage remotes: other omoplata repos this one can fetch from (ADR-0010).
+    Remote {
+        #[command(subcommand)]
+        action: RemoteCommand,
+    },
+    /// Replicate a remote's landed state into local remote-tracking refs
+    /// (ADR-0010, Phase 1).
+    ///
+    /// Copies the object closure of each of the remote's `public/*` refs into
+    /// this store and records them under `remotes/<name>/…` via the op log, so
+    /// `omo switch <name>/<change>` (or `remotes/<name>/…`) drops your workspace
+    /// onto a teammate's remote-landed work. Reads only — landing stays local.
+    /// Because the repo is content-addressed, a re-fetch copies only what is
+    /// new. Private `ws/*` refs are not fetched; land to share.
+    Fetch {
+        /// The remote to fetch from: a registered name, or a path to a repo.
+        remote: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
 
     /// Inspect and update the repository's refs via the operation log (§5.6).
@@ -555,6 +601,35 @@ enum QueueCommand {
     },
 }
 
+/// `omo remote …` — remote registry subcommands (ADR-0010).
+#[derive(Debug, Subcommand)]
+enum RemoteCommand {
+    /// Register a remote: a name bound to another omoplata repository's path.
+    Add {
+        /// The remote name, e.g. `origin`.
+        name: String,
+        /// Path to the remote repository root (the dir holding `.omoplata`).
+        path: PathBuf,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// List the registered remotes as `name  <path>`.
+    List {
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Remove a remote from the registry.
+    Remove {
+        /// The remote name to remove.
+        name: String,
+        /// Repository directory (defaults to the current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+}
+
 /// `omo ref …` — ref subcommands backed by the operation log.
 #[derive(Debug, Subcommand)]
 enum RefCommand {
@@ -642,6 +717,12 @@ fn run() -> anyhow::Result<i32> {
             WorkspaceCommand::Remove { name, repo } => cmd_workspace_remove(repo, name).map(|()| 0),
         },
         Command::Stack { workspace, repo } => cmd_stack(repo, workspace).map(|()| 0),
+        Command::Switch {
+            target,
+            workspace,
+            force,
+            repo,
+        } => cmd_switch(repo, target, workspace, force).map(|()| 0),
         Command::Absorb {
             target,
             workspace,
@@ -683,6 +764,12 @@ fn run() -> anyhow::Result<i32> {
             QueueCommand::List { repo } => cmd_queue_list(repo).map(|()| 0),
             QueueCommand::Remove { name, repo } => cmd_queue_remove(repo, name).map(|()| 0),
         },
+        Command::Remote { action } => match action {
+            RemoteCommand::Add { name, path, repo } => cmd_remote_add(repo, name, path).map(|()| 0),
+            RemoteCommand::List { repo } => cmd_remote_list(repo).map(|()| 0),
+            RemoteCommand::Remove { name, repo } => cmd_remote_remove(repo, name).map(|()| 0),
+        },
+        Command::Fetch { remote, repo } => cmd_fetch(repo, remote).map(|()| 0),
 
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
@@ -860,6 +947,121 @@ fn cmd_stack(repo: Option<PathBuf>, workspace: Option<String>) -> anyhow::Result
     }
     println!("  stack changes: [{}]", ws.change);
     Ok(())
+}
+
+/// `omo switch <target>` — repoint a workspace at another change and
+/// materialize its live tip into the working copy (§5.9).
+///
+/// The target resolves (via [`resolve_switch_target`]) against the shared
+/// op-log refs, so the content is always the latest anyone has landed or
+/// snapshotted — the "pull in what changed since I last looked" is inherent to
+/// the shared repo. A dirty working copy is protected: switching would overwrite
+/// un-snapshotted edits, so it refuses unless `--force`.
+fn cmd_switch(
+    repo: Option<PathBuf>,
+    target: String,
+    workspace: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = WorkspaceRegistry::load(WorkspaceRegistry::path_in(&repo))?;
+    let ws = resolve_workspace(&reg, workspace.as_deref())?.clone();
+
+    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
+    let (change_id, tip) = resolve_switch_target(&refs, &reg, &target).with_context(|| {
+        format!("cannot switch to {target:?}: no matching workspace, change, or landed ref")
+    })?;
+
+    // Never clobber un-snapshotted edits: they live only in the working copy
+    // until `omo stack` records them onto the current change.
+    let current_tip = refs.get(ws.change.as_str()).cloned();
+    let (dirty, _) = omoplata_work::is_dirty(&repo, &ws.working_dir, current_tip.as_ref())?;
+    if dirty && !force {
+        anyhow::bail!(
+            "workspace {} has uncommitted edits — snapshot them with `omo stack` (they stay on \
+             change {}) or pass --force to discard and switch",
+            ws.name,
+            ws.change
+        );
+    }
+
+    let oid = tip
+        .as_str()
+        .parse::<ObjectId>()
+        .map_err(|_| anyhow::anyhow!("target {change_id} tip {tip} is not a valid object id"))?;
+    omoplata_work::materialize(&repo, &oid, &ws.working_dir)?;
+
+    let name = ws.name.clone();
+    let bind = change_id.clone();
+    WorkspaceRegistry::mutate_locked(&repo, move |reg| reg.set_change(&name, bind))?;
+
+    println!(
+        "switched workspace {} to change {change_id} (tip {tip})",
+        ws.name
+    );
+    Ok(())
+}
+
+/// Resolve an `omo switch` target to `(change id, tip commit)` against the live
+/// refs. Tries, first hit wins: an exact ref / change id; a registered workspace
+/// name (`agent-2` → its current change); the `ws/<name>` shorthand; and a
+/// change landed on trunk (`public/<name>`). Returns `None` if nothing matches
+/// or the match has no tip yet (an empty change).
+fn resolve_switch_target(
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    reg: &WorkspaceRegistry,
+    target: &str,
+) -> Option<(ChangeId, CommitId)> {
+    // Exact ref / change id (covers `ws/<name>` and a full `remotes/…` ref).
+    if let Some(tip) = refs.get(target) {
+        return Some((change_id_of_ref(target), tip.clone()));
+    }
+    // A registered workspace name → its current change.
+    if let Some(ws) = reg.get(target) {
+        if let Some(tip) = refs.get(ws.change.as_str()) {
+            return Some((ws.change.clone(), tip.clone()));
+        }
+    }
+    // `ws/<name>` shorthand.
+    let ws_ref = format!("ws/{target}");
+    if let Some(tip) = refs.get(&ws_ref) {
+        return Some((ChangeId::new(ws_ref), tip.clone()));
+    }
+    // A change landed on the local trunk.
+    let public_ref = omoplata_work::queue_ref("trunk", &ChangeId::new(target));
+    if let Some(tip) = refs.get(&public_ref) {
+        return Some((ChangeId::new(target), tip.clone()));
+    }
+    // Remote-tracking shorthand `<remote>/<change>` (ADR-0010): e.g.
+    // `origin/agent-2` or `origin/ws/agent-2` → a `remotes/origin/public/…` ref.
+    if let Some((remote, rest)) = target.split_once('/') {
+        for cand in [
+            format!("remotes/{remote}/public/{rest}"),
+            format!("remotes/{remote}/public/ws/{rest}"),
+            format!("remotes/{remote}/{rest}"),
+        ] {
+            if let Some(tip) = refs.get(&cand) {
+                return Some((change_id_of_ref(&cand), tip.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// The change id a ref ultimately names: strip the `remotes/<name>/` and
+/// `public/` framing so switching onto a fetched or landed ref binds the
+/// workspace to the underlying change (e.g. `ws/agent-2`), not the decorated
+/// tracking-ref name.
+fn change_id_of_ref(refname: &str) -> ChangeId {
+    let mut rest = refname;
+    if let Some(after_remotes) = rest.strip_prefix("remotes/") {
+        // Drop the `<remote>/` segment.
+        rest = after_remotes
+            .split_once('/')
+            .map_or(after_remotes, |(_, r)| r);
+    }
+    let rest = rest.strip_prefix("public/").unwrap_or(rest);
+    ChangeId::new(rest)
 }
 
 /// `omo absorb <target...>` — route hunks into stack changes (§5.9).
@@ -1691,6 +1893,106 @@ fn cmd_queue_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<()> {
         Ok(())
     })?;
     println!("removed queue {name}");
+    Ok(())
+}
+
+/// `omo remote add <name> <path>` — register a remote (ADR-0010).
+fn cmd_remote_add(repo: Option<PathBuf>, name: String, path: PathBuf) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    // Store the path canonicalized when it exists, so the remote resolves from
+    // any working directory; fall back to the given path otherwise.
+    let stored = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let (name, stored_for_reg) = (name, stored.clone());
+    RemoteRegistry::mutate_locked(&repo, move |reg| {
+        reg.add(name, stored_for_reg)?;
+        Ok(())
+    })?;
+    println!("added remote {}", stored.display());
+    Ok(())
+}
+
+/// `omo remote list` — print `name  <path>` for each registered remote.
+fn cmd_remote_list(repo: Option<PathBuf>) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let reg = RemoteRegistry::load(RemoteRegistry::path_in(&repo))?;
+    if reg.remotes().is_empty() {
+        println!("(no remotes registered)");
+        return Ok(());
+    }
+    for r in reg.remotes() {
+        println!("{} {}", r.name, r.path.display());
+    }
+    Ok(())
+}
+
+/// `omo remote remove <name>` — drop a remote from the registry.
+fn cmd_remote_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let name_for_reg = name.clone();
+    RemoteRegistry::mutate_locked(&repo, move |reg| {
+        reg.remove(&name_for_reg)?;
+        Ok(())
+    })?;
+    println!("removed remote {name}");
+    Ok(())
+}
+
+/// `omo fetch <remote>` — replicate a remote's landed state into local
+/// remote-tracking refs (ADR-0010, Phase 1).
+///
+/// Resolves `<remote>` to a registered name or a bare repo path, opens that
+/// omoplata store, and for every `public/*` ref it advertises copies the object
+/// closure into the local store and records the tip under `remotes/<name>/<ref>`
+/// through the op log. Private `ws/*` refs are never fetched — a workspace's
+/// in-progress tip is not shareable until it lands. Landing itself is not
+/// performed here (that is ADR-0010 Phase 2); this is pure, idempotent
+/// replication of already-public content.
+fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let registry = RemoteRegistry::load(RemoteRegistry::path_in(&repo))?;
+
+    // A registered name wins; otherwise treat the argument as a path, named by
+    // itself, so `omo fetch ../peer` works without a prior `remote add`.
+    let (name, path) = match registry.get(&remote) {
+        Some(r) => (r.name.clone(), r.path.clone()),
+        None => (remote.clone(), PathBuf::from(&remote)),
+    };
+    let remote_repo = Repository::open(&path).with_context(|| {
+        format!(
+            "cannot open remote {name:?} at {} — register it with `omo remote add` \
+             or pass a path to an omoplata repo",
+            path.display()
+        )
+    })?;
+
+    let remote_refs = OpLog::load(oplog_path(&remote_repo))?.refs_now();
+    let public: Vec<(String, CommitId)> = remote_refs
+        .into_iter()
+        .filter(|(k, _)| k.starts_with("public/"))
+        .collect();
+    if public.is_empty() {
+        println!("fetched {name}: nothing landed to fetch (no public refs)");
+        return Ok(());
+    }
+
+    let mut objects = 0usize;
+    let mut tracking: Vec<(String, CommitId)> = Vec::new();
+    for (refname, tip) in &public {
+        let oid = tip.as_str().parse::<ObjectId>().map_err(|_| {
+            anyhow::anyhow!("remote ref {refname} tip {tip} is not a valid object id")
+        })?;
+        objects += omoplata_work::copy_closure(&remote_repo, &repo, &oid)?;
+        tracking.push((format!("remotes/{name}/{refname}"), tip.clone()));
+    }
+
+    let refs_written = tracking.len();
+    OpLog::mutate_locked(&repo, |log| {
+        for (refname, tip) in &tracking {
+            log.set_ref(refname.clone(), Some(tip.clone()), None);
+        }
+        Ok(())
+    })?;
+    println!("fetched {name}: {objects} object(s), {refs_written} ref(s) into remotes/{name}/*");
     Ok(())
 }
 

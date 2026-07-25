@@ -38,6 +38,9 @@ outcomes go to **stderr**.
 | `omo workspace list [--repo DIR]` | List workspaces: `name  <dir>  change=<id>  tip=<commit>`. |
 | `omo workspace remove <name> [--repo DIR]` | Unregister a workspace (op-log history is kept). |
 | `omo stack [--workspace WS] [--repo DIR]` | View the workspace's change stack; **auto-snapshots** a dirty working copy into a tree commit (P4). |
+| `omo switch <target> [--workspace WS] [--force] [--repo DIR]` | Repoint a workspace at another change — a teammate's workspace (`ws/<name>` or bare `<name>`), a change id, a landed change, or a fetched remote change (`<remote>/<change>`) — and materialize its live tip into the working dir. Reads shared refs, so it also pulls in whatever landed since; refuses to clobber uncommitted edits unless `--force`. |
+| `omo remote add <name> <path> [--repo DIR]` | Register another omoplata repo as a named remote (local-path transport, ADR-0010). `omo remote list` / `omo remote remove <name>` manage them. |
+| `omo fetch <remote> [--repo DIR]` | Replicate a remote's landed (`public/*`) state into local `remotes/<name>/*` refs (copies the object closure; idempotent). Then `omo switch <name>/<change>` drops onto a teammate's remote-landed work — no git import/export. Private `ws/*` refs are not fetched; land to share. |
 | `omo absorb <change...> [--workspace WS] [--repo DIR]` | Route working-copy edits into stack changes by touched definition identity (§5.9). |
 | `omo reorder <index> [--workspace WS] [--repo DIR]` | Swap adjacent stack changes (disjoint/commuting swap cleanly; else a conflict value is carried). |
 
