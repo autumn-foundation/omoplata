@@ -338,6 +338,29 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// Reconcile several submissions into one merged tree against a queue's
+    /// landed base, carrying conflicts as values (ADR-0010, Phase 3).
+    ///
+    /// This is the git-beating move: where git rejects a non-fast-forward push,
+    /// omoplata *merges*. The submissions are folded through the Tier-2
+    /// structural driver against the queue's current landed state (their shared
+    /// base) — changes to different definitions of one file combine cleanly;
+    /// changes to the *same* definition ride through as first-class **conflict
+    /// values** (§5.4) rather than refusing the reconciliation. The merged tree
+    /// is written to a `reconciled/<queue>` head you can `omo switch` onto. A
+    /// strict queue still refuses to keep carried values; a permissive one keeps
+    /// them for later resolution. Exit 0 clean, 2 if it carries conflict values.
+    Reconcile {
+        /// Submission ID(s) to reconcile against the queue base.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Queue whose landed state is the shared base (defaults to `trunk`).
+        #[arg(long, default_value = "trunk")]
+        queue: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// Land an already-landed submission into a second queue, carrying its
     /// approval forward with a certificate (ADR-0009 backports, I5).
     ///
@@ -765,6 +788,7 @@ fn run() -> anyhow::Result<i32> {
         } => cmd_submit(repo, id, title, changes, author, pending).map(|()| 0),
         Command::Approve { id, by, repo } => cmd_approve(repo, id, by).map(|()| 0),
         Command::Land { ids, queue, repo } => cmd_land(repo, ids, queue).map(|()| 0),
+        Command::Reconcile { ids, queue, repo } => cmd_reconcile(repo, ids, queue),
         Command::Backport { id, to, repo } => cmd_backport(repo, id, to).map(|()| 0),
         Command::Queue { action } => match action {
             QueueCommand::Add {
@@ -1345,6 +1369,176 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// `omo reconcile <id...>` — fold several submissions into one merged tree
+/// against a queue's landed base, carrying conflicts as values (ADR-0010,
+/// Phase 3).
+///
+/// The queue's current landed state is the submissions' shared base — the real,
+/// available common ancestor for *simultaneous* work (each was made against this
+/// state). For every touched file, the submissions are folded through the
+/// Tier-2 structural driver: `acc` starts at the base and each submission's
+/// version is merged in against that fixed base, so edits to different
+/// definitions combine and edits to the *same* definition surface as conflict
+/// values (§5.4) instead of refusing. The reconciled tree is written to a
+/// `reconciled/<queue>` head (switch onto it with `omo switch`), subject to the
+/// queue's carried-conflict rule. Returns exit 2 when the result carries
+/// conflict values (landable, resolve later), 0 when clean.
+fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::Result<i32> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    let policy = registry.resolve(&queue)?;
+    let subs: Vec<Submission> = ids
+        .iter()
+        .map(|id| load_submission(&repo, &SubmissionId::new(id)))
+        .collect::<anyhow::Result<_>>()?;
+
+    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
+    let scratch = repo
+        .control_dir()
+        .join("tmp")
+        .join(format!("reconcile-{}", std::process::id()));
+    let base_dir = scratch.join("base");
+    std::fs::create_dir_all(&base_dir)
+        .with_context(|| format!("creating {}", base_dir.display()))?;
+
+    let run = || -> anyhow::Result<(ObjectId, usize, usize, Vec<String>)> {
+        // The shared base: the queue's landed content, keyed by path.
+        let base = materialize_queue_base(
+            &repo,
+            &registry,
+            &refs,
+            &policy.name,
+            &scratch.join("base-refs"),
+            None,
+        )?;
+
+        // Each submission's file contents, in submission order.
+        let mut contributions: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            let mut files: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            for change_id in &sub.changes {
+                let Some(tip) = refs.get(change_id.as_str()) else {
+                    continue;
+                };
+                let Ok(oid) = tip.as_str().parse::<ObjectId>() else {
+                    continue;
+                };
+                let dir = scratch.join(format!("sub-{i}"));
+                std::fs::create_dir_all(&dir)?;
+                omoplata_work::materialize(&repo, &oid, &dir)?;
+                for file in files_under(&dir) {
+                    if let Ok(text) = std::fs::read_to_string(&file) {
+                        let rel = file
+                            .strip_prefix(&dir)
+                            .unwrap_or(&file)
+                            .to_string_lossy()
+                            .into_owned();
+                        files.insert(rel, text);
+                    }
+                }
+            }
+            contributions.push(files);
+        }
+
+        // Every path any submission touched.
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for files in &contributions {
+            paths.extend(files.keys().cloned());
+        }
+
+        // Fold-merge each path against the fixed base.
+        let mut reconciled: std::collections::BTreeMap<String, String> = base.clone();
+        let mut conflicted: Vec<String> = Vec::new();
+        for path in &paths {
+            let base_text = base.get(path).map_or("", String::as_str);
+            let driver = select_driver(path);
+            let mut acc = base_text.to_owned();
+            let mut had_conflict = false;
+            for files in &contributions {
+                if let Some(version) = files.get(path) {
+                    let out = driver.merge(&MergeInput {
+                        base: base_text,
+                        left: &acc,
+                        right: version,
+                        path,
+                    })?;
+                    acc = out.merged;
+                    if !out.conflicts.is_empty() {
+                        had_conflict = true;
+                    }
+                }
+            }
+            if had_conflict {
+                conflicted.push(path.clone());
+            }
+            reconciled.insert(path.clone(), acc);
+        }
+
+        // Materialize the reconciled content and snapshot it into a tree.
+        for (path, text) in &reconciled {
+            let p = base_dir.join(path);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&p, text)?;
+        }
+        let tip = omoplata_work::snapshot(&repo, &base_dir)?;
+
+        // Count the conflict values the reconciled content carries (§5.4).
+        let mut carried = 0usize;
+        for (path, text) in &reconciled {
+            if path.ends_with(".rs") {
+                if let Some(values) = omoplata_drivers::rust::conflict_values(text) {
+                    carried += values.len();
+                }
+            }
+        }
+        Ok((tip, reconciled.len(), carried, conflicted))
+    };
+
+    let outcome = run();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let (tip, file_count, carried, conflicted) = outcome?;
+
+    // A strict queue keeps no carried values; a permissive one does (§5.4).
+    if carried > 0 && !policy.allow_carried {
+        anyhow::bail!(
+            "queue {} refuses carried conflict values ({carried} present after reconciliation); \
+             reconcile against a permissive queue or resolve the conflicts first",
+            policy.name
+        );
+    }
+
+    let refname = format!("reconciled/{}", policy.name);
+    let tip_commit = CommitId::new(tip.to_string());
+    OpLog::mutate_locked(&repo, |op_log| {
+        op_log.set_ref(refname.clone(), Some(tip_commit.clone()), None);
+        Ok(())
+    })?;
+
+    let clean = file_count - conflicted.len();
+    println!(
+        "reconciled {} submission(s) on {} into {refname} ({tip}): \
+         {clean} file(s) merged clean, {} carrying {carried} conflict value(s)",
+        subs.len(),
+        policy.name,
+        conflicted.len()
+    );
+    for path in &conflicted {
+        println!(
+            "  conflict values in {path} (resolve with `omo merge-file` / edit, then re-land)"
+        );
+    }
+    if carried > 0 {
+        eprintln!(
+            "reconciled/{}: carries {carried} conflict value(s) — landable, resolve later (§5.4)",
+            policy.name
+        );
+    }
+    Ok(i32::from(carried > 0) * 2)
 }
 
 /// `omo backport <id> --to <queue>` — land an already-landed submission into a
