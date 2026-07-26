@@ -481,13 +481,14 @@ reconciled 2 submission(s) on trunk into reconciled/trunk (sha256:8c10…): 0 fi
   conflict values in shared.rs (resolve with `omo merge-file` / edit, then re-land)
 ```
 
-This is the git-beating move, and it's on by default. One piece of the phase
-remains: *cross-time base tracking* — the fold is exact when the inputs were made
-against the current landed state (the simultaneous case); a change made against
-an *older* head reconciles against the current head rather than its true base
-(the store records no commit parents, ADR-0002, so that base isn't available
-yet), conservatively surfacing a few extra conflict values until a per-change
-base pointer exists.
+This is the git-beating move, and it's on by default. It is also correct
+**across time**: a change is reconciled against the trunk it was actually
+authored on, not merely the current head. If a teammate lands something *after*
+you snapshot your work but *before* you land, your change still merges cleanly —
+the definitions they added are preserved rather than looking reverted. omoplata
+recovers your change's true base from the op log (`refs_at` at the change's first
+commit), so it works even though the store keeps no commit parents (ADR-0002).
+For simultaneous work the base is just the current head, and nothing changes.
 
 The transport today is the local path (a shared mount or sibling clone);
 networked transports follow, exactly as git interop began at `file://`. The full

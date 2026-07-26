@@ -1,7 +1,11 @@
 # ADR-0010: Distributed omoplata — remotes, replication, and remote landing authority
 
-**Status:** accepted (Phases 1–2 implemented; Phase 3 implemented — `omo reconcile`
-plus auto-wiring into `omo land`/`omo push`; cross-time base tracking remains).
+**Status:** accepted. Phases 1–3 implemented: replication (`omo remote`/`fetch`),
+remote landing authority (`omo push`), and reconciliation (`omo reconcile` plus
+auto-wiring into `omo land`/`omo push`) — including **cross-time base tracking**
+(a change reconciles against the trunk it was authored on, recovered from the op
+log). Remaining future work is transport reach (networked http/ssh) and attested
+approval; see Non-goals.
 
 ## Context
 
@@ -144,13 +148,22 @@ remote preserves the whole model.
   to keep carried values, keeping release lines clean). `omo reconcile` remains
   as the explicit primitive for reconciling without landing.
 
-  **Still open on this phase — cross-time base tracking.** The shared-base fold
-  is exactly right when the inputs were made against the current landed state
-  (the simultaneous case). A change made against an **older** head has no recorded
-  base (the store has no commit parents — ADR-0002), so reconciling it against the
-  current head over-approximates and conservatively surfaces more conflict values
-  than a true three-way against its real base would. A per-change base pointer (or
-  an op-log-derived base) is the missing piece, and the natural next step.
+  **Cross-time base tracking (implemented).** The fold no longer assumes every
+  input was authored against the current head. Each change is reconciled against
+  *its own* base — the queue's merged trunk **as of the change's first commit**,
+  recovered from the op log: `OpLog::refs_at(seq)` reconstructs the ref state at
+  any past sequence, and a change's first `Commit` op marks its authoring time
+  (the store keeps no commit parents — ADR-0002 — but the op log is a complete
+  bi-temporal record, so the base is derivable without them). Then
+  `merge(base_C, left = current trunk, right = change)` is a sound three-way,
+  because the trunk only advances, so it descends from `base_C`: a change built
+  on an older trunk contributes exactly its own edit, and definitions that landed
+  since are preserved rather than appearing reverted. The fold target and each
+  historical base are read from the maintained `reconciled/<queue>` head (a true
+  structural merge), not the last-wins per-change ref overlay — otherwise two
+  landed changes to one file would already have collapsed to one before the merge
+  ran. For simultaneous work `base_C` equals the current head and the behavior is
+  unchanged.
 
 ## Consequences
 
@@ -170,8 +183,7 @@ remote preserves the whole model.
 - Multi-master op-log reconciliation between independent authorities.
 - Attested approval — the remote trusts the submission's recorded approval
   (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
-- Cross-time base tracking: reconciling a change made against an older head using
-  its true base rather than the current head (needs a per-change base pointer;
-  the store has no commit parents today). `omo reconcile` and the auto-wired
-  `land`/`push` merge against the current landed state — exact for simultaneous
-  work, conservative (extra conflict values) for a change built on an older head.
+- Networked transports (http/ssh) and a git-compatible `push`/`receive-pack`
+  path, beyond the local-path transport (a shared mount or sibling clone).
+- Attested approval: the authority verifying *who* approved a submission, rather
+  than honouring the recorded approval (Phase 2's known limitation).

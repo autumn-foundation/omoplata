@@ -1332,7 +1332,7 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
     // *structurally* — sharper than the definition-support batch check: two
     // line-disjoint edits to one definition merge, incompatible ones become
     // conflict values (§5.4) instead of refusing the batch.
-    let rec = reconcile_core(&repo, &registry, &refs, &policy, &subs)?;
+    let rec = reconcile_core(&repo, &registry, &log, &policy, &subs)?;
     if rec.carried > 0 && !policy.allow_carried {
         anyhow::bail!(
             "queue {} refuses carried conflict values ({} after reconciling the landing); \
@@ -1437,7 +1437,7 @@ struct Reconciliation {
 fn reconcile_core(
     repo: &Repository,
     registry: &QueueRegistry,
-    refs: &std::collections::BTreeMap<String, CommitId>,
+    log: &OpLog,
     policy: &QueuePolicy,
     subs: &[Submission],
 ) -> anyhow::Result<Reconciliation> {
@@ -1445,83 +1445,83 @@ fn reconcile_core(
         .control_dir()
         .join("tmp")
         .join(format!("reconcile-{}", std::process::id()));
-    let base_dir = scratch.join("base");
+    let base_dir = scratch.join("out");
     std::fs::create_dir_all(&base_dir)
         .with_context(|| format!("creating {}", base_dir.display()))?;
 
     let run = || -> anyhow::Result<Reconciliation> {
-        let base = materialize_queue_base(
+        let refs_now = log.refs_now();
+
+        // The accumulator starts at the queue's *current* merged trunk — the
+        // `reconciled/<queue>` head each change is being reconciled onto.
+        let mut acc = materialize_trunk(
             repo,
             registry,
-            refs,
+            &refs_now,
             &policy.name,
-            &scratch.join("base-refs"),
-            None,
+            &scratch.join("head"),
         )?;
 
-        // Each submission's file contents, in submission order.
-        let mut contributions: Vec<std::collections::BTreeMap<String, String>> = Vec::new();
-        for (i, sub) in subs.iter().enumerate() {
-            let mut files: std::collections::BTreeMap<String, String> =
-                std::collections::BTreeMap::new();
+        let mut conflicted: BTreeSet<String> = BTreeSet::new();
+
+        // Fold each change onto the head using *its own* base — the queue's
+        // landed state as of when the change was authored (cross-time, ADR-0010).
+        // `merge(base_C, left = head, right = change)` is a valid three-way
+        // because the head descends from `base_C` (trunk only advances), so
+        // intervening lands and the change's edit combine, and a change built
+        // against an older trunk no longer looks like it reverted what landed
+        // since. For simultaneous work `base_C` equals the head, collapsing to
+        // the previous behavior.
+        let mut change_seq = 0usize;
+        for sub in subs {
             for change_id in &sub.changes {
-                let Some(tip) = refs.get(change_id.as_str()) else {
+                let Some(tip) = refs_now.get(change_id.as_str()) else {
                     continue;
                 };
                 let Ok(oid) = tip.as_str().parse::<ObjectId>() else {
                     continue;
                 };
-                let dir = scratch.join(format!("sub-{i}"));
-                std::fs::create_dir_all(&dir)?;
-                omoplata_work::materialize(repo, &oid, &dir)?;
-                for file in files_under(&dir) {
-                    if let Ok(text) = std::fs::read_to_string(&file) {
-                        let rel = file
-                            .strip_prefix(&dir)
-                            .unwrap_or(&file)
-                            .to_string_lossy()
-                            .into_owned();
-                        files.insert(rel, text);
-                    }
-                }
-            }
-            contributions.push(files);
-        }
 
-        let mut paths: BTreeSet<String> = BTreeSet::new();
-        for files in &contributions {
-            paths.extend(files.keys().cloned());
-        }
+                // The change's content.
+                let content_dir = scratch.join(format!("change-{change_seq}"));
+                std::fs::create_dir_all(&content_dir)?;
+                omoplata_work::materialize(repo, &oid, &content_dir)?;
+                let content = read_tree_files(&content_dir);
 
-        // Fold-merge each path against the fixed base.
-        let mut reconciled: std::collections::BTreeMap<String, String> = base.clone();
-        let mut conflicted: Vec<String> = Vec::new();
-        for path in &paths {
-            let base_text = base.get(path).map_or("", String::as_str);
-            let driver = select_driver(path);
-            let mut acc = base_text.to_owned();
-            let mut had_conflict = false;
-            for files in &contributions {
-                if let Some(version) = files.get(path) {
-                    let out = driver.merge(&MergeInput {
+                // The change's true base: the queue's landed state as of its
+                // first snapshot (its authoring time). Falls back to the current
+                // head for a change with no recorded commit.
+                let base = match change_first_commit_seq(log, change_id) {
+                    Some(seq) => materialize_trunk(
+                        repo,
+                        registry,
+                        &log.refs_at(seq),
+                        &policy.name,
+                        &scratch.join(format!("base-{change_seq}")),
+                    )?,
+                    None => acc.clone(),
+                };
+                change_seq += 1;
+
+                for (path, version) in &content {
+                    let base_text = base.get(path).map_or("", String::as_str);
+                    let left = acc.get(path).map_or("", String::as_str);
+                    let out = select_driver(path).merge(&MergeInput {
                         base: base_text,
-                        left: &acc,
+                        left,
                         right: version,
                         path,
                     })?;
-                    acc = out.merged;
                     if !out.conflicts.is_empty() {
-                        had_conflict = true;
+                        conflicted.insert(path.clone());
                     }
+                    acc.insert(path.clone(), out.merged);
                 }
             }
-            if had_conflict {
-                conflicted.push(path.clone());
-            }
-            reconciled.insert(path.clone(), acc);
         }
 
-        for (path, text) in &reconciled {
+        // Materialize the reconciled content and snapshot it into a tree.
+        for (path, text) in &acc {
             let p = base_dir.join(path);
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1531,7 +1531,7 @@ fn reconcile_core(
         let tip = omoplata_work::snapshot(repo, &base_dir)?;
 
         let mut carried = 0usize;
-        for (path, text) in &reconciled {
+        for (path, text) in &acc {
             if path.ends_with(".rs") {
                 if let Some(values) = omoplata_drivers::rust::conflict_values(text) {
                     carried += values.len();
@@ -1540,15 +1540,69 @@ fn reconcile_core(
         }
         Ok(Reconciliation {
             tip,
-            files: reconciled.len(),
+            files: acc.len(),
             carried,
-            conflicted,
+            conflicted: conflicted.into_iter().collect(),
         })
     };
 
     let out = run();
     let _ = std::fs::remove_dir_all(&scratch);
     out
+}
+
+/// The op-log sequence of a change's **first** `Commit` — its earliest
+/// snapshot, i.e. its authoring time. `None` for a change with no commit (e.g.
+/// one set directly via a ref), which callers treat as "authored against the
+/// current head".
+fn change_first_commit_seq(log: &OpLog, change: &ChangeId) -> Option<u64> {
+    log.operations().iter().find_map(|op| match &op.kind {
+        OpKind::Commit { change: c, .. } if c == change => Some(op.seq),
+        _ => None,
+    })
+}
+
+/// The queue's **merged trunk** content, keyed by path: the maintained
+/// `reconciled/<queue>` head if one exists (a true structural merge of
+/// concurrent same-file work), otherwise the per-change ref overlay
+/// ([`materialize_queue_base`]).
+///
+/// Preferring the reconciled head matters: the overlay is last-wins per file, so
+/// when two landed changes touch one file it silently keeps only one — the very
+/// bug reconciliation exists to fix. Folding onto the reconciled head (and using
+/// it as the historical base via `refs_at`) keeps the merge correct across time.
+fn materialize_trunk(
+    repo: &Repository,
+    registry: &QueueRegistry,
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    queue: &str,
+    into: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    if let Some(tip) = refs.get(&format!("reconciled/{queue}")) {
+        if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
+            std::fs::create_dir_all(into)
+                .with_context(|| format!("creating {}", into.display()))?;
+            omoplata_work::materialize(repo, &oid, into)?;
+            return Ok(read_tree_files(into));
+        }
+    }
+    materialize_queue_base(repo, registry, refs, queue, into, None)
+}
+
+/// Read a materialized tree directory into `tree-relative path -> content`.
+fn read_tree_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut files = std::collections::BTreeMap::new();
+    for file in files_under(dir) {
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            let rel = file
+                .strip_prefix(dir)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .into_owned();
+            files.insert(rel, text);
+        }
+    }
+    files
 }
 
 /// Point `reconciled/<queue>` at a merged tree, appending a `SetRef` op.
@@ -1569,8 +1623,8 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
         .map(|id| load_submission(&repo, &SubmissionId::new(id)))
         .collect::<anyhow::Result<_>>()?;
 
-    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
-    let rec = reconcile_core(&repo, &registry, &refs, &policy, &subs)?;
+    let log = OpLog::load(oplog_path(&repo))?;
+    let rec = reconcile_core(&repo, &registry, &log, &policy, &subs)?;
 
     // A strict queue keeps no carried values; a permissive one does (§5.4).
     if rec.carried > 0 && !policy.allow_carried {
@@ -2367,7 +2421,8 @@ fn cmd_push(
 
     // Run the remote's gates against the remote's landed base, then land under
     // the remote's lock — a refused landing mutates nothing.
-    let remote_refs = OpLog::load(oplog_path(&remote_repo))?.refs_now();
+    let remote_log = OpLog::load(oplog_path(&remote_repo))?;
+    let remote_refs = remote_log.refs_now();
     let sub_tips = vec![(sub.id.clone(), tips)];
     let batch = observe_batch_gates(
         &remote_repo,
@@ -2400,7 +2455,7 @@ fn cmd_push(
     let rec = reconcile_core(
         &remote_repo,
         &remote_registry,
-        &remote_refs,
+        &remote_log,
         &policy,
         std::slice::from_ref(&sub),
     )?;
