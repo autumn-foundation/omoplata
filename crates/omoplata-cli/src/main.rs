@@ -2402,7 +2402,7 @@ fn cmd_push(
         &remote_registry,
         &remote_refs,
         &policy,
-        &[sub.clone()],
+        std::slice::from_ref(&sub),
     )?;
     if rec.carried > 0 && !policy.allow_carried {
         anyhow::bail!(
