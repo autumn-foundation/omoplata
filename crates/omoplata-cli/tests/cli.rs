@@ -1905,3 +1905,55 @@ fn land_same_definition_batch_refuses_on_strict_queue() {
         .failure()
         .stderr(predicate::str::contains("refuses carried conflict values"));
 }
+
+// --- Cross-time base tracking: reconcile against a change's true base --------
+
+#[test]
+fn reconcile_uses_change_true_base_not_current_head() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+
+    // Trunk T0 = { foo }.
+    land_change(root, "base", FOO, "s0");
+
+    // Alice authors against T0 (snapshots now, while trunk is still { foo }) and
+    // does NOT land yet — her first commit is recorded against T0.
+    submit_shared(root, "a", &format!("{FOO}{BAR}"), "sub-a");
+
+    // Bob lands a *different* definition AFTER Alice's snapshot, advancing trunk
+    // to { foo, baz }.
+    land_change(root, "b", &format!("{FOO}{BAZ}"), "sub-b");
+
+    // Alice reconciles against the advanced trunk. With her *true* base (T0, via
+    // the op log's refs_at at her first-commit seq) this is a clean disjoint
+    // merge — Bob's `baz` is preserved. Reconciling against the current head
+    // instead would make Alice look like she reverted `baz` (a spurious
+    // conflict, or a lost definition).
+    omo()
+        .args(["reconcile", "sub-a", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 conflict value(s)"));
+
+    omo()
+        .args([
+            "switch",
+            "reconciled/trunk",
+            "--workspace",
+            "a",
+            "--force",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+    let merged = std::fs::read_to_string(root.join("wc-a").join("shared.rs")).unwrap();
+    for f in ["fn foo", "fn bar", "fn baz"] {
+        assert!(
+            merged.contains(f),
+            "{f} missing after cross-time reconcile (baz would be lost against current head): {merged}"
+        );
+    }
+}

@@ -120,6 +120,11 @@ permissive queue (`omo switch reconciled/trunk` to see the merged trunk). A
 strict queue refuses to keep carried values — release lines stay clean. Use
 `omo reconcile` explicitly only to preview a merge without landing.
 
+Reconciliation is correct **across time**: each change merges against the trunk
+it was *authored* on (recovered from the op log), not just the current head — so
+if a teammate lands after you snapshot but before you land, their definitions are
+preserved instead of looking reverted. You don't manage bases; it's automatic.
+
 ## Merging content: propose, then let the kernel check
 
 `omo merge-file <base> <left> <right>` runs the Tier-2 driver (Rust `.rs` files
