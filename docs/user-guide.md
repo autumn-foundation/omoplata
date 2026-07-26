@@ -452,12 +452,40 @@ and mutates nothing. The one thing still taken on trust is approval
 *authenticity* — the remote honours the submission's recorded approval rather
 than re-deriving who approved it; attested approval is the next hardening.
 
-This is **Phases 1–2** of the distributed design; concurrent-push reconciliation
-(the authority merging simultaneous disjoint pushes in one transaction, carrying
-genuine conflicts as values — what git's non-fast-forward model cannot do) is
-**Phase 3**, specified in [ADR-0010](adr/0010-distributed-omoplata.md). The
-transport today is the local path (a shared mount or sibling clone); networked
-transports follow, exactly as git interop began at `file://`.
+When two developers change the **same file**, git makes the second one rebase or
+rejects the push as a non-fast-forward. omoplata **merges** — `omo reconcile`:
+
+```console
+$ omo reconcile sub-a sub-b
+reconciled 2 submission(s) on trunk into reconciled/trunk (sha256:58f2…): 1 file(s) merged clean, 0 carrying 0 conflict value(s)
+```
+
+It folds the submissions through the Tier-2 structural driver against the queue's
+current landed state — their **shared base**, the real common ancestor of
+simultaneous work. Edits to *different* definitions of one file combine into a
+single merged tree (something a last-wins overlay could never represent); edits
+to the *same* definition ride through as first-class **conflict values** (§5.4)
+instead of refusing:
+
+```console
+$ omo reconcile sub-a sub-b
+reconciled 2 submission(s) on trunk into reconciled/trunk (sha256:8c10…): 0 file(s) merged clean, 1 carrying 1 conflict value(s)
+  conflict values in shared.rs (resolve with `omo merge-file` / edit, then re-land)
+```
+
+The merged tree is written to a `reconciled/<queue>` head you can `omo switch`
+onto; a strict queue refuses to keep carried values, a permissive one keeps them
+for later resolution (exit 2 = landable, carrying values). This is **Phase 3's
+primitive** — the git-beating move. Two pieces of the phase remain: *auto-wiring*
+reconciliation into `push`/batch-landing so the authority always presents a
+merged trunk, and *cross-time base tracking* so a change made against an older
+head reconciles against its true base rather than the current head (the store
+records no commit parents, ADR-0002, so that base isn't available yet — it
+conservatively surfaces a few extra conflict values until then).
+
+The transport today is the local path (a shared mount or sibling clone);
+networked transports follow, exactly as git interop began at `file://`. The full
+picture is in [ADR-0010](adr/0010-distributed-omoplata.md).
 
 ### Undo and history
 

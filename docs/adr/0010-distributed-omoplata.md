@@ -1,6 +1,7 @@
 # ADR-0010: Distributed omoplata — remotes, replication, and remote landing authority
 
-**Status:** accepted (Phases 1–2 implemented); Phase 3 documented future.
+**Status:** accepted (Phases 1–2 implemented; Phase 3 primitive `omo reconcile`
+implemented — auto-wiring and cross-time base tracking remain).
 
 ## Context
 
@@ -112,12 +113,33 @@ remote preserves the whole model.
   approved it. A signed/attested approval (so the authority verifies the
   reviewer, not just the assertion) is the natural next hardening; the ADR-0009
   certificate machinery is the primitive it builds on.
-- **Phase 3 — optimistic concurrent landing with kernel reconciliation.** Many
-  swarms push concurrently; the authority merges disjoint-definition lands in a
-  single transaction (batch landing, lifted from local to the authority) and
-  carries genuine conflicts forward as values, refusing only same-definition
-  incompatibilities — *as values, not as push rejections*. This is where
-  omoplata decisively beats git's non-fast-forward model.
+- **Phase 3 — optimistic concurrent landing with kernel reconciliation
+  (primitive shipped).** Many swarms push concurrently; the authority merges
+  disjoint-definition work in a single transaction and carries genuine conflicts
+  forward as values, refusing only against a queue that forbids carried values —
+  *as values, not as push rejections*. This is where omoplata decisively beats
+  git's non-fast-forward model.
+
+  The reconciliation primitive is `omo reconcile <id…>`: it folds several
+  submissions through the Tier-2 structural driver against the queue's current
+  landed state (their **shared base** — the real common ancestor of
+  *simultaneous* work), so edits to different definitions of one file combine
+  into a single tree and edits to the *same* definition surface as first-class
+  conflict values (§5.4). The result is written to a `reconciled/<queue>` head
+  you can `omo switch` onto; a strict queue still refuses to keep carried values.
+  This is the exact case a shared-base overlay could not represent before: two
+  concurrent changes to one file now merge into one tree instead of one silently
+  winning.
+
+  **Still open on this phase.** (a) *Auto-wiring*: making `omo push` / batch
+  landing reconcile by default (rather than an explicit `reconcile` step), so the
+  authority always presents a merged trunk. (b) *Cross-time base tracking*: the
+  shared-base fold is exactly right when all inputs were made against the current
+  landed state; a change made against an **older** head has no recorded base
+  (the store has no commit parents — ADR-0002), so reconciling it against the
+  current head over-approximates and conservatively surfaces more conflict values
+  than a true three-way against its real base would. A per-change base pointer
+  (or an op-log-derived base) is the missing piece, and the natural next step.
 
 ## Consequences
 
@@ -137,6 +159,9 @@ remote preserves the whole model.
 - Multi-master op-log reconciliation between independent authorities.
 - Attested approval — the remote trusts the submission's recorded approval
   (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
-- Concurrent-push reconciliation (Phase 3): the authority merging several
-  simultaneous pushes of disjoint definitions in one transaction and carrying
-  genuine conflicts as values — specified here, not yet implemented.
+- Auto-wired reconciliation: `omo push` / batch landing reconciling by default
+  so the authority always presents a merged trunk (the `omo reconcile` primitive
+  ships; wiring it into the landing path is the next step).
+- Cross-time base tracking: reconciling a change made against an older head using
+  its true base rather than the current head (needs a per-change base pointer;
+  the store has no commit parents today).

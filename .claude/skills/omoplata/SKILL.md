@@ -81,7 +81,19 @@ omo push origin sub-7 --queue trunk   # land YOUR submission on the remote's que
 tips are not fetched — land to share). `push` is the write path: the **remote is
 the landing authority** — it re-runs its own approval/validator/disjointness
 gates against its own trunk and lands under its lock, or refuses. The client
-can't bypass the remote's policy. Back to the local swarm:
+can't bypass the remote's policy.
+
+When two agents change the **same file**, don't reach for a rebase — reconcile:
+
+```sh
+omo reconcile sub-a sub-b            # merge both against the queue base into one tree
+```
+
+Different definitions of one file combine cleanly; edits to the *same* definition
+ride through as **conflict values** (§5.4), not a refusal — where git rejects a
+non-fast-forward, omoplata merges. It writes a `reconciled/<queue>` head you can
+`omo switch` onto; exit 2 means it carries conflict values (landable, resolve
+later), and a strict queue refuses to keep them. Back to the local swarm:
 
 ```sh
 for i in 1 2 3 4 5; do omo workspace add agent-$i ./agents/agent-$i --repo trunk; done

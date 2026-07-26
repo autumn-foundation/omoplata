@@ -1678,3 +1678,139 @@ fn push_refused_by_remote_validator_does_not_land() {
         .success()
         .stdout(predicate::str::contains("public/").not());
 }
+
+// --- Distributed Phase 3: reconcile concurrent work, conflicts as values -----
+
+const QUX: &str = "fn qux() -> i32 {\n    4\n}\n";
+
+/// Register workspace `name` over `shared.rs = content`, snapshot, and submit as
+/// `sub` (auto-approved). Does not land — leaves it ready to reconcile.
+fn submit_shared(root: &std::path::Path, name: &str, content: &str, sub: &str) {
+    let wc = root.join(format!("wc-{name}"));
+    std::fs::create_dir_all(&wc).unwrap();
+    std::fs::write(wc.join("shared.rs"), content).unwrap();
+    omo()
+        .args(["workspace", "add", name, wc.to_str().unwrap(), "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args(["stack", "--workspace", name, "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    omo()
+        .args([
+            "submit",
+            sub,
+            "--title",
+            sub,
+            &format!("ws/{name}"),
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+}
+
+#[test]
+fn reconcile_disjoint_definitions_merges_into_one_tree() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    // A base landed on trunk: fn foo + fn bar.
+    land_change(root, "base", &format!("{FOO}{BAR}"), "sub0");
+
+    // Two agents each add a *different* function to the same file.
+    submit_shared(root, "a", &format!("{FOO}{BAR}{BAZ}"), "sub-a");
+    submit_shared(root, "b", &format!("{FOO}{BAR}{QUX}"), "sub-b");
+
+    // Reconcile merges both against the shared trunk base — clean, no conflicts.
+    omo()
+        .args(["reconcile", "sub-a", "sub-b", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("merged clean"))
+        .stdout(predicate::str::contains("0 conflict value(s)"))
+        .stdout(predicate::str::contains("reconciled/trunk"));
+
+    // The merged trunk holds *both* additions (last-wins overlay never could):
+    // switch onto the reconciled head and check all four functions are present.
+    omo()
+        .args([
+            "switch",
+            "reconciled/trunk",
+            "--workspace",
+            "a",
+            "--force",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+    let merged = std::fs::read_to_string(root.join("wc-a").join("shared.rs")).unwrap();
+    assert!(merged.contains("fn foo"), "foo missing: {merged}");
+    assert!(merged.contains("fn bar"), "bar missing: {merged}");
+    assert!(merged.contains("fn baz"), "baz missing: {merged}");
+    assert!(merged.contains("fn qux"), "qux missing: {merged}");
+}
+
+#[test]
+fn reconcile_same_definition_carries_conflict_values_not_refused() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    land_change(root, "base", FOO, "sub0");
+
+    // Two agents edit the *same* function incompatibly.
+    submit_shared(root, "a", "fn foo() -> i32 {\n    111\n}\n", "sub-a");
+    submit_shared(root, "b", "fn foo() -> i32 {\n    999\n}\n", "sub-b");
+
+    // git would reject the second as a non-fast-forward; omoplata reconciles it,
+    // carrying the conflict as a value (exit 2, landable) rather than refusing.
+    omo()
+        .args(["reconcile", "sub-a", "sub-b", "--repo"])
+        .arg(root)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("1 conflict value(s)"))
+        .stdout(predicate::str::contains("conflict values in shared.rs"));
+}
+
+#[test]
+fn reconcile_strict_queue_refuses_carried_values() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    // A strict release queue with a base landed on it.
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    submit_shared(root, "base", FOO, "sub0");
+    omo()
+        .args(["land", "sub0", "--queue", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    submit_shared(root, "a", "fn foo() -> i32 {\n    111\n}\n", "sub-a");
+    submit_shared(root, "b", "fn foo() -> i32 {\n    999\n}\n", "sub-b");
+
+    // The conflict would land as a carried value — a strict queue refuses that.
+    omo()
+        .args([
+            "reconcile",
+            "sub-a",
+            "sub-b",
+            "--queue",
+            "release-1",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refuses carried conflict values"));
+}
