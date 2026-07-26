@@ -1957,3 +1957,141 @@ fn reconcile_uses_change_true_base_not_current_head() {
         );
     }
 }
+
+// --- Networked transport: omo serve + http fetch/push (ADR-0010) -------------
+
+/// Spawn `omo serve` on a free loopback port over `repo`, returning the child
+/// and its `http://host:port` URL (read from the daemon's first stdout line).
+fn spawn_serve(repo: &std::path::Path) -> (std::process::Child, String) {
+    use std::io::BufRead;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omo"))
+        .args(["serve", "--addr", "127.0.0.1:0", "--repo"])
+        .arg(repo)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn omo serve");
+    let stdout = child.stdout.take().unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("read serve startup line");
+    // "omo serve: <path> on http://127.0.0.1:PORT"
+    let authority = line
+        .rsplit("http://")
+        .next()
+        .expect("startup line has a URL")
+        .trim()
+        .to_owned();
+    (child, format!("http://{authority}"))
+}
+
+#[test]
+fn push_and_fetch_over_http() {
+    // A serving repo with a base landed on trunk.
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    land_change(a, "base", FOO, "s0");
+
+    let (mut server, url) = spawn_serve(a);
+
+    // A client on a separate repo pushes a submission over http; the daemon
+    // lands it through its own policy.
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    submit_shared(b, "wd", &format!("{FOO}{BAR}"), "sub-b");
+    omo()
+        .args(["push", &url, "sub-b", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed in queue trunk"));
+
+    // The server now carries the landed change and an advanced merged trunk.
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(a)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("public/ws/wd"))
+        .stdout(predicate::str::contains("reconciled/trunk"));
+
+    // A third repo fetches the server's landed state over http.
+    let dir_c = tempdir().unwrap();
+    let c = dir_c.path();
+    omo().arg("init").arg(c).assert().success();
+    omo()
+        .args(["fetch", &url, "--repo"])
+        .arg(c)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("into remotes/"));
+    omo()
+        .args(["ref", "list", "--repo"])
+        .arg(c)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remotes/"))
+        .stdout(predicate::str::contains("public/ws/wd"));
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn push_over_http_refused_by_server_policy() {
+    // The server's target queue is strict (approval required).
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(a)
+        .assert()
+        .success();
+
+    let (mut server, url) = spawn_serve(a);
+
+    // The client pushes an *unapproved* submission — the server refuses it, and
+    // the refusal comes back over the wire.
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    let wc = b.join("wc-wd");
+    std::fs::create_dir_all(&wc).unwrap();
+    std::fs::write(wc.join("shared.rs"), FOO).unwrap();
+    omo()
+        .args(["workspace", "add", "wd", wc.to_str().unwrap(), "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+    omo()
+        .args(["stack", "--workspace", "wd", "--repo"])
+        .arg(b)
+        .assert()
+        .success();
+    omo()
+        .args([
+            "submit",
+            "sub-p",
+            "--title",
+            "p",
+            "--pending",
+            "ws/wd",
+            "--repo",
+        ])
+        .arg(b)
+        .assert()
+        .success();
+
+    omo()
+        .args(["push", &url, "sub-p", "--queue", "release-1", "--repo"])
+        .arg(b)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not approved"));
+
+    let _ = server.kill();
+    let _ = server.wait();
+}

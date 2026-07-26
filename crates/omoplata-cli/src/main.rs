@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+
+mod sync;
 use omoplata_algebra::{
     diff, dynamic_validate, kernel, merge3, rebase, Admission, Conflict, Doc, Validated,
 };
@@ -419,13 +421,29 @@ enum Command {
     /// reason. The remote re-validates content against its own trunk; it does
     /// not trust the client to have done so.
     Push {
-        /// The remote to push to: a registered name, or a path to a repo.
+        /// The remote to push to: a registered name, a path, or an http:// URL.
         remote: String,
         /// The submission id to land on the remote.
         id: String,
         /// Target queue on the remote (defaults to `trunk`).
         #[arg(long, default_value = "trunk")]
         queue: String,
+        /// Repository directory (defaults to current directory).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+    /// Serve a repository as a networked landing authority over HTTP (ADR-0010).
+    ///
+    /// Exposes the repo at `--addr` so remote clients can
+    /// `omo fetch http://<addr>` its landed state and
+    /// `omo push http://<addr> <id>` submissions through its policy — the
+    /// landing authority, now off-box. HTTP only, no TLS or auth: for loopback
+    /// or a trusted network. Runs until interrupted.
+    Serve {
+        /// Address to bind, e.g. `127.0.0.1:8080` (`:0` picks a free port,
+        /// printed on startup).
+        #[arg(long, default_value = "127.0.0.1:0")]
+        addr: String,
         /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -822,6 +840,7 @@ fn run() -> anyhow::Result<i32> {
             queue,
             repo,
         } => cmd_push(repo, remote, id, queue).map(|()| 0),
+        Command::Serve { addr, repo } => cmd_serve(repo, addr).map(|()| 0),
 
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
@@ -855,7 +874,7 @@ fn run() -> anyhow::Result<i32> {
 }
 
 /// The path to the operation log inside a repository's control directory.
-fn oplog_path(repo: &Repository) -> PathBuf {
+pub(crate) fn oplog_path(repo: &Repository) -> PathBuf {
     OpLog::path_in(repo)
 }
 
@@ -2295,28 +2314,54 @@ fn cmd_remote_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<()> 
 /// performed here (that is ADR-0010 Phase 2); this is pure, idempotent
 /// replication of already-public content.
 fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
-    let repo = Repository::open(resolve(repo)?)?;
+    let repo_path = resolve(repo)?;
+    let repo = Repository::open(&repo_path)?;
     let registry = RemoteRegistry::load(RemoteRegistry::path_in(&repo))?;
 
-    // A registered name wins; otherwise treat the argument as a path, named by
-    // itself, so `omo fetch ../peer` works without a prior `remote add`.
-    let (name, path) = match registry.get(&remote) {
-        Some(r) => (r.name.clone(), r.path.clone()),
-        None => (remote.clone(), PathBuf::from(&remote)),
+    // A registered name wins; otherwise treat the argument as a target (path or
+    // http:// URL), named by itself, so `omo fetch ../peer` works without a
+    // prior `remote add`.
+    let (name, target) = match registry.get(&remote) {
+        Some(r) => (r.name.clone(), r.path.to_string_lossy().into_owned()),
+        None => (remote.clone(), remote.clone()),
     };
-    let remote_repo = Repository::open(&path).with_context(|| {
-        format!(
-            "cannot open remote {name:?} at {} — register it with `omo remote add` \
-             or pass a path to an omoplata repo",
-            path.display()
-        )
-    })?;
 
-    let remote_refs = OpLog::load(oplog_path(&remote_repo))?.refs_now();
-    let public: Vec<(String, CommitId)> = remote_refs
-        .into_iter()
-        .filter(|(k, _)| k.starts_with("public/"))
-        .collect();
+    // The remote's landed (`public/*`) refs, and a way to pull each object — over
+    // http for an `omo serve` daemon, or straight from the local repo otherwise.
+    type Puller = Box<dyn FnMut(&ObjectId) -> anyhow::Result<usize>>;
+    let (public, mut pull): (Vec<(String, CommitId)>, Puller) =
+        if let Some(authority) = sync::http_authority(&target) {
+            let refs = sync::fetch_refs(&authority)?;
+            let public = refs
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("public/"))
+                .map(|(k, v)| (k, CommitId::new(v)))
+                .collect();
+            let local = Repository::open(&repo_path)?;
+            let authority = authority.clone();
+            let pull = move |oid: &ObjectId| -> anyhow::Result<usize> {
+                pull_closure_http(&authority, &local, oid)
+            };
+            (public, Box::new(pull))
+        } else {
+            let remote_repo = Repository::open(&target).with_context(|| {
+                format!(
+                    "cannot open remote {name:?} at {target} — register it with `omo remote add`, \
+                     pass a path to an omoplata repo, or an http:// URL of an `omo serve` daemon"
+                )
+            })?;
+            let refs = OpLog::load(oplog_path(&remote_repo))?.refs_now();
+            let public = refs
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("public/"))
+                .collect();
+            let local = Repository::open(&repo_path)?;
+            let pull = move |oid: &ObjectId| -> anyhow::Result<usize> {
+                omoplata_work::copy_closure(&remote_repo, &local, oid).map_err(Into::into)
+            };
+            (public, Box::new(pull))
+        };
+
     if public.is_empty() {
         println!("fetched {name}: nothing landed to fetch (no public refs)");
         return Ok(());
@@ -2328,7 +2373,7 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
         let oid = tip.as_str().parse::<ObjectId>().map_err(|_| {
             anyhow::anyhow!("remote ref {refname} tip {tip} is not a valid object id")
         })?;
-        objects += omoplata_work::copy_closure(&remote_repo, &repo, &oid)?;
+        objects += pull(&oid)?;
         tracking.push((format!("remotes/{name}/{refname}"), tip.clone()));
     }
 
@@ -2341,6 +2386,44 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
     })?;
     println!("fetched {name}: {objects} object(s), {refs_written} ref(s) into remotes/{name}/*");
     Ok(())
+}
+
+/// Pull the object closure rooted at `root` from an `omo serve` authority into
+/// `local`, requesting each missing object over `GET /object/<id>`. Returns how
+/// many objects were newly written (content-addressed, so re-fetch is cheap).
+fn pull_closure_http(
+    authority: &str,
+    local: &Repository,
+    root: &ObjectId,
+) -> anyhow::Result<usize> {
+    let mut written = 0usize;
+    let mut stack = vec![root.clone()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        if local.has_object(&id) {
+            // Already present, but still walk its children in case they are not.
+            if let Ok(Object::Tree(tree)) = local.read_object(&id) {
+                for entry in tree.entries() {
+                    stack.push(entry.id.clone());
+                }
+            }
+            continue;
+        }
+        let bytes = sync::fetch_object(authority, &id.to_string())?;
+        let obj =
+            Object::deserialize(&bytes).map_err(|e| anyhow::anyhow!("remote object {id}: {e}"))?;
+        if let Object::Tree(tree) = &obj {
+            for entry in tree.entries() {
+                stack.push(entry.id.clone());
+            }
+        }
+        local.write_object(&obj)?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 /// `omo push <remote> <id>` — land a local submission on a remote through the
@@ -2368,116 +2451,219 @@ fn cmd_push(
 ) -> anyhow::Result<()> {
     let local = Repository::open(resolve(repo)?)?;
 
-    // Resolve the remote (a registered name wins; otherwise a bare path).
+    // Resolve the remote (a registered name wins; otherwise a bare target).
     let registry = RemoteRegistry::load(RemoteRegistry::path_in(&local))?;
-    let (name, path) = match registry.get(&remote) {
-        Some(r) => (r.name.clone(), r.path.clone()),
-        None => (remote.clone(), PathBuf::from(&remote)),
+    let (name, target) = match registry.get(&remote) {
+        Some(r) => (r.name.clone(), r.path.to_string_lossy().into_owned()),
+        None => (remote.clone(), remote.clone()),
     };
-    let remote_repo = Repository::open(&path).with_context(|| {
-        format!(
-            "cannot open remote {name:?} at {} — register it with `omo remote add` \
-             or pass a path to an omoplata repo",
-            path.display()
-        )
-    })?;
 
     let sub = load_submission(&local, &SubmissionId::new(&id))?;
 
-    // The target queue's policy is the *remote's*, checked against its state.
-    let remote_registry = QueueRegistry::load(QueueRegistry::path_in(&remote_repo))?;
-    let policy = remote_registry.resolve(&queue)?;
-    if policy.require_approval && !sub.is_approved() {
-        anyhow::bail!(
-            "submission {} is not approved (remote queue {})",
-            sub.id,
-            policy.name
-        );
-    }
-
-    // Replicate each change's content into the remote store and build the
-    // change graph + tips the remote lands from.
+    // Resolve each change's tip in the local op log.
     let local_refs = OpLog::load(oplog_path(&local))?.refs_now();
-    let mut cg = ChangeGraph::new();
-    let mut tips: Vec<ObjectId> = Vec::new();
+    let mut tips: Vec<(ChangeId, CommitId)> = Vec::new();
     for change_id in &sub.changes {
         let tip = local_refs
             .get(change_id.as_str())
             .ok_or_else(|| anyhow::anyhow!("change {change_id} has no snapshot to push"))?;
-        let oid = tip.as_str().parse::<ObjectId>().map_err(|_| {
-            anyhow::anyhow!("change {change_id} tip {tip} is not a valid object id")
-        })?;
+        tips.push((change_id.clone(), tip.clone()));
+    }
+
+    // Networked transport: gather the object closure and POST it to the
+    // authority, which runs the land server-side.
+    if let Some(authority) = sync::http_authority(&target) {
+        let mut objects: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (_cid, tip) in &tips {
+            let oid = tip
+                .as_str()
+                .parse::<ObjectId>()
+                .map_err(|_| anyhow::anyhow!("change tip {tip} is not a valid object id"))?;
+            gather_closure(&local, &oid, &mut objects, &mut seen)?;
+        }
+        let payload = sync::PushPayload {
+            queue: queue.clone(),
+            submission: sub.clone(),
+            tips: tips
+                .iter()
+                .map(|(c, t)| (c.to_string(), t.to_string()))
+                .collect(),
+            objects,
+        };
+        let result = sync::push(&authority, &payload)?;
+        if !result.ok {
+            anyhow::bail!("{}", result.message);
+        }
+        println!(
+            "pushed {} to {name} (queue {queue}): {}",
+            sub.id, result.message
+        );
+        return Ok(());
+    }
+
+    // Local-path transport: open the remote repo, replicate the closure into it,
+    // and land in-process under the remote's lock.
+    let remote_repo = Repository::open(&target).with_context(|| {
+        format!(
+            "cannot open remote {name:?} at {target} — register it with `omo remote add`, \
+             pass a path to an omoplata repo, or an http:// URL of an `omo serve` daemon"
+        )
+    })?;
+    for (_cid, tip) in &tips {
+        let oid = tip
+            .as_str()
+            .parse::<ObjectId>()
+            .map_err(|_| anyhow::anyhow!("change tip {tip} is not a valid object id"))?;
         omoplata_work::copy_closure(&local, &remote_repo, &oid)?;
+    }
+    let message = land_pushed(&remote_repo, &queue, &sub, &tips)?;
+    println!("pushed {} to {name} (queue {queue}): {message}", sub.id);
+    Ok(())
+}
+
+/// Land a pushed submission on `repo` through *its* queue policy — the shared
+/// server-side of `omo push`, run by both the local-path transport (the client
+/// opens the remote repo directly) and the networked `omo serve` daemon.
+///
+/// `tips` are `(change id, tip commit)` pairs whose object closures are assumed
+/// already present in `repo`. It records each change's ref (so the
+/// reconciliation and the land resolve the pushed content), runs the queue's
+/// gates against the repo's landed state, reconciles into the merged trunk, and
+/// lands — all under the repo's lock. Returns the human land message.
+fn land_pushed(
+    repo: &Repository,
+    queue: &str,
+    submission: &Submission,
+    tips: &[(ChangeId, CommitId)],
+) -> anyhow::Result<String> {
+    let registry = QueueRegistry::load(QueueRegistry::path_in(repo))?;
+    let policy = registry.resolve(queue)?;
+    if policy.require_approval && !submission.is_approved() {
+        anyhow::bail!(
+            "submission {} is not approved (queue {})",
+            submission.id,
+            policy.name
+        );
+    }
+
+    // Record each change's tip so refs_now (used by the reconciliation and the
+    // land) resolves the pushed content — otherwise a freshly pushed change is
+    // invisible to the reconcile step.
+    OpLog::mutate_locked(repo, |log| {
+        let current = log.refs_now();
+        for (cid, tip) in tips {
+            if current.get(cid.as_str()) != Some(tip) {
+                log.set_ref(cid.to_string(), Some(tip.clone()), None);
+            }
+        }
+        Ok(())
+    })?;
+
+    let mut cg = ChangeGraph::new();
+    let mut oid_tips: Vec<ObjectId> = Vec::new();
+    for (cid, tip) in tips {
         cg.add_change(omoplata_identity::Change::new(
-            change_id.clone(),
+            cid.clone(),
             vec![tip.clone()],
             Phase::Draft,
         ));
-        tips.push(oid);
+        if let Ok(oid) = tip.as_str().parse::<ObjectId>() {
+            oid_tips.push(oid);
+        }
     }
 
-    // Record the submission on the remote (its approval + certificates travel).
-    save_submission(&remote_repo, &sub)?;
-
-    // Run the remote's gates against the remote's landed base, then land under
-    // the remote's lock — a refused landing mutates nothing.
-    let remote_log = OpLog::load(oplog_path(&remote_repo))?;
-    let remote_refs = remote_log.refs_now();
-    let sub_tips = vec![(sub.id.clone(), tips)];
-    let batch = observe_batch_gates(
-        &remote_repo,
-        &remote_registry,
-        &remote_refs,
-        &policy.name,
-        &sub_tips,
-        &policy,
-    )?;
+    let log = OpLog::load(oplog_path(repo))?;
+    let refs = log.refs_now();
+    let sub_tips = vec![(submission.id.clone(), oid_tips)];
+    let batch = observe_batch_gates(repo, &registry, &refs, &policy.name, &sub_tips, &policy)?;
     let gates = QueueGates {
         carried_values: batch.carried_values,
         validated: batch.validated,
     };
     if policy.validate.is_some() {
         match gates.validated {
-            Some(true) => eprintln!("remote queue {}: validation PASSED", policy.name),
-            _ => eprintln!("remote queue {}: validation FAILED", policy.name),
+            Some(true) => eprintln!("queue {}: validation PASSED", policy.name),
+            _ => eprintln!("queue {}: validation FAILED", policy.name),
         }
     }
-    if gates.carried_values > 0 {
-        eprintln!(
-            "remote queue {}: content carries {} conflict value(s)",
-            policy.name, gates.carried_values
-        );
-    }
 
-    // Reconcile the pushed content into the remote's merged trunk against its
-    // pre-land base (ADR-0010, Phase 3), and refuse if a strict remote queue
-    // would have to keep carried conflict values.
     let rec = reconcile_core(
-        &remote_repo,
-        &remote_registry,
-        &remote_log,
+        repo,
+        &registry,
+        &log,
         &policy,
-        std::slice::from_ref(&sub),
+        std::slice::from_ref(submission),
     )?;
     if rec.carried > 0 && !policy.allow_carried {
         anyhow::bail!(
-            "remote queue {} refuses carried conflict values ({} after reconciling the push): {}",
+            "queue {} refuses carried conflict values ({} after reconciling the push): {}",
             policy.name,
             rec.carried,
             rec.conflicted.join(", ")
         );
     }
 
-    let result = OpLog::mutate_locked(&remote_repo, |op_log| {
-        let landed = land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)?;
+    save_submission(repo, submission)?;
+    let result = OpLog::mutate_locked(repo, |op_log| {
+        let landed = land_submission_in_queue(submission, &policy, &gates, &mut cg, op_log)?;
         write_reconciled_head(op_log, &policy.name, &rec.tip);
         Ok(landed)
     })?;
-    println!(
-        "pushed {} to {name} (queue {}): {} (reconciled/{} advanced to {})",
-        result.submission_id, policy.name, result.message, policy.name, rec.tip
-    );
+    Ok(format!(
+        "{} (reconciled/{} advanced to {})",
+        result.message, policy.name, rec.tip
+    ))
+}
+
+/// Server entry for `POST /push` (ADR-0010 networked transport): write the
+/// pushed object closure into the repo, then land the submission through its
+/// policy. Called by the `omo serve` daemon; returns the land message.
+pub(crate) fn accept_push(repo_path: &Path, payload: sync::PushPayload) -> anyhow::Result<String> {
+    let repo = Repository::open(repo_path)?;
+    for (_id, hex) in &payload.objects {
+        let obj = sync::object_from_hex(hex)?;
+        repo.write_object(&obj)?;
+    }
+    let tips: Vec<(ChangeId, CommitId)> = payload
+        .tips
+        .iter()
+        .map(|(c, t)| (ChangeId::new(c.clone()), CommitId::new(t.clone())))
+        .collect();
+    land_pushed(&repo, &payload.queue, &payload.submission, &tips)
+}
+
+/// Walk the object closure rooted at `root`, appending `(id, hex)` for each
+/// object (deduplicated by `seen`) — the push-side of replication over the wire.
+fn gather_closure(
+    repo: &Repository,
+    root: &ObjectId,
+    out: &mut Vec<(String, String)>,
+    seen: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let mut stack = vec![root.clone()];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        let obj = repo.read_object(&id)?;
+        if let Object::Tree(tree) = &obj {
+            for entry in tree.entries() {
+                stack.push(entry.id.clone());
+            }
+        }
+        out.push((id.to_string(), sync::to_hex(&obj.serialize())));
+    }
     Ok(())
+}
+
+/// `omo serve` — run the networked landing-authority daemon (ADR-0010).
+fn cmd_serve(repo: Option<PathBuf>, addr: String) -> anyhow::Result<()> {
+    let repo_path = resolve(repo)?;
+    // Fail fast if it is not an omoplata repository.
+    Repository::open(&repo_path)
+        .with_context(|| format!("{} is not an omoplata repository", repo_path.display()))?;
+    sync::serve(repo_path, &addr)
 }
 
 /// One-line human summary of a queue policy.

@@ -1773,6 +1773,7 @@ dependencies = [
  "omoplata-store",
  "omoplata-work",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
 ]

@@ -1,11 +1,13 @@
 # ADR-0010: Distributed omoplata — remotes, replication, and remote landing authority
 
 **Status:** accepted. Phases 1–3 implemented: replication (`omo remote`/`fetch`),
-remote landing authority (`omo push`), and reconciliation (`omo reconcile` plus
-auto-wiring into `omo land`/`omo push`) — including **cross-time base tracking**
-(a change reconciles against the trunk it was authored on, recovered from the op
-log). Remaining future work is transport reach (networked http/ssh) and attested
-approval; see Non-goals.
+remote landing authority (`omo push` / `omo serve`), and reconciliation
+(`omo reconcile` plus auto-wiring into `omo land`/`omo push`) — including
+**cross-time base tracking** (a change reconciles against the trunk it was
+authored on, recovered from the op log) and a **networked HTTP transport**
+(`omo serve` is the landing authority off-box; `fetch`/`push` speak to it over
+`http://`). Remaining future work is TLS + authentication on that transport, and
+attested approval; see Non-goals.
 
 ## Context
 
@@ -83,16 +85,28 @@ one substrate."
 
 ### Transport
 
-Start with the **local-path transport**: a remote is another `.omoplata`
-reachable as a filesystem path (a shared mount, an NFS export, a sibling clone).
-Replication is a copy of the content-addressed object closure — trivially
-idempotent, since equal content has equal id. Networked transports (http/ssh)
-and a git-compatible `push`/`receive-pack` path are future work, mirroring how
-git interop deliberately began at `file://` before the wire (ADR-0005). A
-git-compatible remote stays valuable for interop but is *lossy at the boundary*
-(git carries commits/trees/refs, not op-log entries, queue policy, or
+Two transports are implemented, sharing the same object-replication and landing
+logic:
+
+- **Local-path**: a remote is another `.omoplata` reachable as a filesystem path
+  (a shared mount, an NFS export, a sibling clone). The client opens it as a
+  `Repository` and operates directly.
+- **Networked (HTTP)**: `omo serve` exposes a repository as the landing authority
+  over a minimal, dependency-free HTTP/1.1 server (`std::net`), and `fetch` /
+  `push` speak to it at an `http://host:port` URL. `GET /refs` advertises the
+  queue-visible refs; `GET /object/<id>` streams the content-addressed objects a
+  client is missing; `POST /push` carries a submission plus its object closure,
+  and the server runs *its* policy and lands under *its* lock — the authority is
+  now genuinely off-box.
+
+Replication is idempotent either way, since equal content has equal id. The HTTP
+transport is an MVP: **no TLS, no authentication** — for loopback or a trusted
+network; TLS + auth are the productionization follow-on. A git-compatible
+`push`/`receive-pack` path stays possible for interop but is *lossy at the
+boundary* (git carries commits/trees/refs, not op-log entries, queue policy, or
 certificates), so it can never be the full-fidelity substrate — only the native
-remote preserves the whole model.
+remote preserves the whole model (this is why the wire is omoplata-native, not
+git, mirroring how git interop itself began at `file://`, ADR-0005).
 
 ## Phasing
 
@@ -183,7 +197,9 @@ remote preserves the whole model.
 - Multi-master op-log reconciliation between independent authorities.
 - Attested approval — the remote trusts the submission's recorded approval
   (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
-- Networked transports (http/ssh) and a git-compatible `push`/`receive-pack`
-  path, beyond the local-path transport (a shared mount or sibling clone).
+- **TLS and authentication** on the HTTP transport (the wire itself is
+  implemented; it is plaintext and unauthenticated, so loopback/trusted-network
+  only for now), and an ssh transport or a git-compatible `push`/`receive-pack`
+  path for interop.
 - Attested approval: the authority verifying *who* approved a submission, rather
   than honouring the recorded approval (Phase 2's known limitation).
