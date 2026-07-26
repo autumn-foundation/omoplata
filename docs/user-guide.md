@@ -490,9 +490,27 @@ recovers your change's true base from the op log (`refs_at` at the change's firs
 commit), so it works even though the store keeps no commit parents (ADR-0002).
 For simultaneous work the base is just the current head, and nothing changes.
 
-The transport today is the local path (a shared mount or sibling clone);
-networked transports follow, exactly as git interop began at `file://`. The full
-picture is in [ADR-0010](adr/0010-distributed-omoplata.md).
+A remote is reached one of two ways. **Local-path** — a filesystem path (a shared
+mount or sibling clone), as above. **Networked** — an `http://` URL of an
+`omo serve` daemon, which exposes a repository as the landing authority off-box:
+
+```console
+# on the host:
+$ omo serve --addr 127.0.0.1:9000
+omo serve: /srv/trunk on http://127.0.0.1:9000
+
+# on a client, anywhere that can reach it:
+$ omo remote add origin http://host:9000
+$ omo push origin sub-7          # lands on the host, through the host's policy
+$ omo fetch origin               # pulls the host's landed state back
+```
+
+The commands and semantics are identical to the local-path transport — the
+server runs the same gates, reconciliation, and land under its own lock; the
+client just packages the submission and its object closure and sends them over
+HTTP. The networked transport is an MVP: **plaintext HTTP, no authentication**,
+so loopback or a trusted network for now — TLS and auth are the productionization
+follow-on. The full picture is in [ADR-0010](adr/0010-distributed-omoplata.md).
 
 ### Undo and history
 

@@ -71,11 +71,16 @@ local model; to work against another dev's repo, register it and replicate its
 landed state — no git import/export round-trip:
 
 ```sh
-omo remote add origin ../peer-repo    # another omoplata repo (local-path transport)
+omo serve --addr 127.0.0.1:9000 --repo trunk   # (on the host) landing authority over HTTP
+omo remote add origin http://host:9000  # or a filesystem path for the local-path transport
 omo fetch origin                      # copy its public/* into remotes/origin/*
 omo switch origin/agent-2 --workspace me   # drop onto their remote-landed work
 omo push origin sub-7 --queue trunk   # land YOUR submission on the remote's queue
 ```
+
+A remote is a filesystem path (shared mount / sibling clone) *or* an
+`http://host:port` URL of an `omo serve` daemon — same commands, same semantics.
+The HTTP transport is plaintext, no auth (loopback / trusted network).
 
 `fetch` is read-only replication of *landed* (`public/*`) state (private `ws/*`
 tips are not fetched — land to share). `push` is the write path: the **remote is
