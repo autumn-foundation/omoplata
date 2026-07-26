@@ -508,9 +508,32 @@ $ omo fetch origin               # pulls the host's landed state back
 The commands and semantics are identical to the local-path transport — the
 server runs the same gates, reconciliation, and land under its own lock; the
 client just packages the submission and its object closure and sends them over
-HTTP. The networked transport is an MVP: **plaintext HTTP, no authentication**,
-so loopback or a trusted network for now — TLS and auth are the productionization
-follow-on. The full picture is in [ADR-0010](adr/0010-distributed-omoplata.md).
+HTTP.
+
+**Authentication.** Start the daemon with a bearer token and every request must
+present it:
+
+```console
+# on the host:
+$ omo serve --addr 127.0.0.1:9000 --token s3cret      # or export OMO_TOKEN=s3cret
+omo serve: /srv/trunk on http://127.0.0.1:9000 (authenticated)
+
+# on a client — supply the token per-remote, or via the environment:
+$ omo remote add origin http://host:9000 --token s3cret
+$ omo push origin sub-7
+$ OMO_TOKEN=s3cret omo fetch http://host:9000         # env works for ad-hoc targets
+```
+
+A request without the token (or with the wrong one) is answered `401`, which the
+client surfaces as an error. An open server (no `--token`) accepts all comers —
+fine for loopback or a trusted network.
+
+**TLS** is deliberately *not* built into `omo`: terminate it at a fronting proxy
+or tunnel (nginx/caddy, an SSH tunnel, a service mesh) and point `omo` at the
+local plaintext side. This keeps omoplata's single-dependency-family posture (no
+crypto stack) and avoids hand-rolling TLS. Because the token travels in plaintext
+on the HTTP hop, it is only meaningful behind such a terminator or on a trusted
+segment. The full picture is in [ADR-0010](adr/0010-distributed-omoplata.md).
 
 ### Undo and history
 

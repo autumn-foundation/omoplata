@@ -5,8 +5,11 @@
 //! a socket: `omo serve` exposes a repository as a **landing authority** off-box,
 //! and `omo fetch` / `omo push` speak to it over `http://`.
 //!
-//! Scope: HTTP only, no TLS, no authentication — a loopback / trusted-network
-//! MVP. TLS and auth are the productionization follow-ons (see ADR-0010).
+//! Scope: HTTP only, no TLS — TLS is terminated by a fronting proxy/tunnel
+//! (see ADR-0010), not built in. Authentication is an optional bearer token:
+//! `omo serve --token <t>` requires `Authorization: Bearer <t>` on every request
+//! and answers `401` otherwise; an open server (no token) accepts all comers, for
+//! loopback / trusted networks.
 //!
 //! Protocol (all bodies are UTF-8):
 //! * `GET /refs` → JSON `{ "<ref>": "<commit>", … }` — the queue-visible refs
@@ -46,21 +49,36 @@ pub fn http_authority(remote: &str) -> Option<String> {
     }
 }
 
-/// `GET path` against `authority` (`host:port`).
-pub fn get(authority: &str, path: &str) -> anyhow::Result<HttpResponse> {
-    request(authority, "GET", path, &[])
+/// `GET path` against `authority` (`host:port`), optionally bearer-authenticated.
+pub fn get(authority: &str, path: &str, token: Option<&str>) -> anyhow::Result<HttpResponse> {
+    request(authority, "GET", path, &[], token)
 }
 
-/// `POST path` with `body` against `authority`.
-pub fn post(authority: &str, path: &str, body: &[u8]) -> anyhow::Result<HttpResponse> {
-    request(authority, "POST", path, body)
+/// `POST path` with `body` against `authority`, optionally bearer-authenticated.
+pub fn post(
+    authority: &str,
+    path: &str,
+    body: &[u8],
+    token: Option<&str>,
+) -> anyhow::Result<HttpResponse> {
+    request(authority, "POST", path, body, token)
 }
 
-fn request(authority: &str, method: &str, path: &str, body: &[u8]) -> anyhow::Result<HttpResponse> {
+fn request(
+    authority: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    token: Option<&str>,
+) -> anyhow::Result<HttpResponse> {
     let mut stream =
         TcpStream::connect(authority).with_context(|| format!("connecting to {authority}"))?;
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: {}\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{auth}Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
         body.len()
     );
@@ -118,8 +136,11 @@ pub struct PushResult {
 // --- client operations -------------------------------------------------------
 
 /// Fetch the server's queue-visible refs (`name -> commit`).
-pub fn fetch_refs(authority: &str) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-    let resp = get(authority, "/refs")?;
+pub fn fetch_refs(
+    authority: &str,
+    token: Option<&str>,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let resp = get(authority, "/refs", token)?;
     if resp.status != 200 {
         anyhow::bail!("remote {authority}: GET /refs returned {}", resp.status);
     }
@@ -127,8 +148,8 @@ pub fn fetch_refs(authority: &str) -> anyhow::Result<std::collections::BTreeMap<
 }
 
 /// Fetch one object's canonical bytes by id.
-pub fn fetch_object(authority: &str, id: &str) -> anyhow::Result<Vec<u8>> {
-    let resp = get(authority, &format!("/object/{id}"))?;
+pub fn fetch_object(authority: &str, id: &str, token: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let resp = get(authority, &format!("/object/{id}"), token)?;
     if resp.status != 200 {
         anyhow::bail!(
             "remote {authority}: GET /object/{id} returned {}",
@@ -139,9 +160,13 @@ pub fn fetch_object(authority: &str, id: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Push a payload; returns the server's result (its land message, or an error).
-pub fn push(authority: &str, payload: &PushPayload) -> anyhow::Result<PushResult> {
+pub fn push(
+    authority: &str,
+    payload: &PushPayload,
+    token: Option<&str>,
+) -> anyhow::Result<PushResult> {
     let body = serde_json::to_vec(payload)?;
-    let resp = post(authority, "/push", &body)?;
+    let resp = post(authority, "/push", &body, token)?;
     // The server encodes application-level refusals as `{ok:false}` with 200;
     // a non-200 is a transport/parse failure.
     if resp.status != 200 {
@@ -159,19 +184,29 @@ pub fn push(authority: &str, payload: &PushPayload) -> anyhow::Result<PushResult
 /// Serve `repo_path` over HTTP at `addr` until interrupted. Prints the bound
 /// address (useful when `addr` ends in `:0`). One thread per connection; writes
 /// serialize on the repository's advisory lock, so concurrent pushes are safe.
-pub fn serve(repo_path: PathBuf, addr: &str) -> anyhow::Result<()> {
+///
+/// If `token` is `Some`, every request must carry `Authorization: Bearer <token>`
+/// or it is answered `401`; `None` serves openly (loopback / trusted network).
+pub fn serve(repo_path: PathBuf, addr: &str, token: Option<String>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
     let bound = listener.local_addr()?;
-    println!("omo serve: {} on http://{bound}", repo_path.display());
+    let auth = if token.is_some() {
+        " (authenticated)"
+    } else {
+        ""
+    };
+    println!("omo serve: {} on http://{bound}{auth}", repo_path.display());
     // Flush so a parent process reading stdout sees the address immediately.
     std::io::stdout().flush().ok();
 
+    let token = std::sync::Arc::new(token);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let repo_path = repo_path.clone();
+                let token = std::sync::Arc::clone(&token);
                 std::thread::spawn(move || {
-                    if let Err(e) = handle(&stream, &repo_path) {
+                    if let Err(e) = handle(&stream, &repo_path, token.as_deref()) {
                         let _ = write_response(&stream, 500, b"", &e.to_string());
                     }
                 });
@@ -182,8 +217,19 @@ pub fn serve(repo_path: PathBuf, addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle(stream: &TcpStream, repo_path: &std::path::Path) -> anyhow::Result<()> {
-    let (method, path, body) = read_request(stream)?;
+fn handle(
+    stream: &TcpStream,
+    repo_path: &std::path::Path,
+    token: Option<&str>,
+) -> anyhow::Result<()> {
+    let (method, path, bearer, body) = read_request(stream)?;
+    // Bearer-token gate: when the server was started with a token, every request
+    // must present it. Unauthenticated servers (`token == None`) skip the check.
+    if let Some(expected) = token {
+        if bearer.as_deref() != Some(expected) {
+            return write_response(stream, 401, b"", "Unauthorized");
+        }
+    }
     match (method.as_str(), path.as_str()) {
         ("GET", "/refs") => {
             let refs = serve_refs(repo_path)?;
@@ -242,7 +288,11 @@ fn serve_object(repo_path: &std::path::Path, id: &str) -> anyhow::Result<Option<
     Ok(Some(repo.read_object(&oid)?.serialize()))
 }
 
-fn read_request(mut stream: &TcpStream) -> anyhow::Result<(String, String, Vec<u8>)> {
+/// Parse a request into `(method, path, bearer-token, body)`. The bearer token
+/// is the value after `Authorization: Bearer `, if that header is present.
+fn read_request(
+    mut stream: &TcpStream,
+) -> anyhow::Result<(String, String, Option<String>, Vec<u8>)> {
     // Read until the header terminator, then the Content-Length body.
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -264,16 +314,22 @@ fn read_request(mut stream: &TcpStream) -> anyhow::Result<(String, String, Vec<u
     let method = parts.next().unwrap_or("").to_owned();
     let path = parts.next().unwrap_or("").to_owned();
 
-    let content_length: usize = lines
-        .find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
+    let mut content_length = 0usize;
+    let mut bearer = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        if k.eq_ignore_ascii_case("content-length") {
+            content_length = v.trim().parse().unwrap_or(0);
+        } else if k.eq_ignore_ascii_case("authorization") {
+            bearer = v
+                .trim()
+                .strip_prefix("Bearer ")
+                .map(|t| t.trim().to_owned());
+        }
+    }
 
     let mut body = buf[header_end + 4..].to_vec();
     while body.len() < content_length {
@@ -284,7 +340,7 @@ fn read_request(mut stream: &TcpStream) -> anyhow::Result<(String, String, Vec<u
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(content_length);
-    Ok((method, path, body))
+    Ok((method, path, bearer, body))
 }
 
 fn write_response(

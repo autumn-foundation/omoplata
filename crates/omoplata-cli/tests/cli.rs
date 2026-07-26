@@ -1963,9 +1963,19 @@ fn reconcile_uses_change_true_base_not_current_head() {
 /// Spawn `omo serve` on a free loopback port over `repo`, returning the child
 /// and its `http://host:port` URL (read from the daemon's first stdout line).
 fn spawn_serve(repo: &std::path::Path) -> (std::process::Child, String) {
+    spawn_serve_token(repo, None)
+}
+
+/// Like [`spawn_serve`], but with an optional bearer token (`--token`).
+fn spawn_serve_token(repo: &std::path::Path, token: Option<&str>) -> (std::process::Child, String) {
     use std::io::BufRead;
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omo"))
-        .args(["serve", "--addr", "127.0.0.1:0", "--repo"])
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omo"));
+    cmd.args(["serve", "--addr", "127.0.0.1:0"]);
+    if let Some(t) = token {
+        cmd.args(["--token", t]);
+    }
+    let mut child = cmd
+        .arg("--repo")
         .arg(repo)
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1981,6 +1991,8 @@ fn spawn_serve(repo: &std::path::Path) -> (std::process::Child, String) {
         .next()
         .expect("startup line has a URL")
         .trim()
+        // The authenticated banner appends " (authenticated)".
+        .trim_end_matches(" (authenticated)")
         .to_owned();
     (child, format!("http://{authority}"))
 }
@@ -2091,6 +2103,84 @@ fn push_over_http_refused_by_server_policy() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not approved"));
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn authed_serve_rejects_missing_and_wrong_token() {
+    // A server that requires a bearer token.
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    land_change(a, "base", FOO, "s0");
+    let (mut server, url) = spawn_serve_token(a, Some("s3cret"));
+
+    // A fetch with no token is rejected (the daemon answers 401).
+    let dir_c = tempdir().unwrap();
+    let c = dir_c.path();
+    omo().arg("init").arg(c).assert().success();
+    omo()
+        .args(["fetch", &url, "--repo"])
+        .arg(c)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"));
+
+    // A fetch with the *wrong* token is likewise rejected.
+    omo()
+        .args(["fetch", &url, "--repo"])
+        .arg(c)
+        .env("OMO_TOKEN", "nope")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("401"));
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
+fn authed_serve_accepts_correct_token() {
+    // A token-guarded server with a base landed on trunk.
+    let dir_a = tempdir().unwrap();
+    let a = dir_a.path();
+    omo().arg("init").arg(a).assert().success();
+    land_change(a, "base", FOO, "s0");
+    let (mut server, url) = spawn_serve_token(a, Some("s3cret"));
+
+    // The client presents the token via `omo remote add --token`, then pushes.
+    let dir_b = tempdir().unwrap();
+    let b = dir_b.path();
+    omo().arg("init").arg(b).assert().success();
+    omo()
+        .args([
+            "remote", "add", "origin", &url, "--token", "s3cret", "--repo",
+        ])
+        .arg(b)
+        .assert()
+        .success();
+    submit_shared(b, "wd", &format!("{FOO}{BAR}"), "sub-b");
+    omo()
+        .args(["push", "origin", "sub-b", "--repo"])
+        .arg(b)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("landed in queue trunk"));
+
+    // A different client presents the token via the OMO_TOKEN env var and
+    // fetches the now-landed state.
+    let dir_c = tempdir().unwrap();
+    let c = dir_c.path();
+    omo().arg("init").arg(c).assert().success();
+    omo()
+        .args(["fetch", &url, "--repo"])
+        .arg(c)
+        .env("OMO_TOKEN", "s3cret")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("into remotes/"));
 
     let _ = server.kill();
     let _ = server.wait();

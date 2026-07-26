@@ -19,13 +19,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::WorkError;
 
-/// A registered remote: a name and the path to another omoplata repository.
+/// A registered remote: a name, the target of another omoplata repository (a
+/// filesystem path or an `http://host:port` URL), and an optional bearer token
+/// for a networked `omo serve` authority that requires authentication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remote {
     /// The remote's unique name (e.g. `origin`).
     pub name: String,
-    /// Path to the remote's repository root (the dir holding `.omoplata`).
+    /// The remote's repository root path, or an `http://` URL of a serve daemon.
     pub path: PathBuf,
+    /// A bearer token sent as `Authorization: Bearer <token>` to an
+    /// authenticated `omo serve` daemon. `None` for an open or local remote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// The set of remotes registered for a repository, persisted at
@@ -69,12 +75,17 @@ impl RemoteRegistry {
     ///
     /// [`WorkError::RemoteExists`] if a remote with `name` is already
     /// registered.
-    pub fn add(&mut self, name: impl Into<String>, path: PathBuf) -> Result<&Remote, WorkError> {
+    pub fn add(
+        &mut self,
+        name: impl Into<String>,
+        path: PathBuf,
+        token: Option<String>,
+    ) -> Result<&Remote, WorkError> {
         let name = name.into();
         if self.get(&name).is_some() {
             return Err(WorkError::RemoteExists(name));
         }
-        self.remotes.push(Remote { name, path });
+        self.remotes.push(Remote { name, path, token });
         let idx = self.remotes.len() - 1;
         Ok(&self.remotes[idx])
     }
