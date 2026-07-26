@@ -111,10 +111,14 @@ omo land sub-a sub-b sub-c --repo trunk
 ```
 
 Two agents who both edited `src/lib.rs` but touched **different definitions**
-batch cleanly. Two who touched the **same** definition are refused as a batch,
-naming the collision (`src/lib.rs (fn priority_of)`) — land them separately so
-they serialize. This refusal is a feature: it is the "no silent wrong answer"
-guarantee at the landing layer.
+batch cleanly. Landing **auto-reconciles** (ADR-0010 Phase 3): the batch is
+structurally merged against the queue's pre-land base and the `reconciled/<queue>`
+merged trunk advances in the same transaction — so both agents' work survives
+(not last-wins), *line-disjoint* edits to one definition merge, and an
+*incompatible* same-definition pair rides through as a **conflict value** on a
+permissive queue (`omo switch reconciled/trunk` to see the merged trunk). A
+strict queue refuses to keep carried values — release lines stay clean. Use
+`omo reconcile` explicitly only to preview a merge without landing.
 
 ## Merging content: propose, then let the kernel check
 

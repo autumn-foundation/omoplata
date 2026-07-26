@@ -24,9 +24,9 @@ use omoplata_sem::{
 };
 use omoplata_store::{EntryKind, Object, ObjectId, Repository};
 use omoplata_work::{
-    absorb, auto_snapshot, land_batch_in_queue, land_submission_in_queue, BatchGates, MapContext,
-    OpKind, OpLog, QueueGates, QueuePolicy, QueueRegistry, RebaseEngine, RemoteRegistry, Stack,
-    Workspace, WorkspaceRegistry,
+    absorb, auto_snapshot, land_submission_in_queue, BatchGates, MapContext, OpKind, OpLog,
+    QueueGates, QueuePolicy, QueueRegistry, RebaseEngine, RemoteRegistry, Stack, Workspace,
+    WorkspaceRegistry,
 };
 
 /// omoplata: a version control system with a verified merge kernel.
@@ -1325,35 +1325,65 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
         );
     }
 
-    if let [sub] = subs.as_slice() {
-        let single = QueueGates {
-            carried_values: gates.carried_values,
-            validated: gates.validated,
-        };
-        let result = OpLog::mutate_locked(&repo, |op_log| {
-            land_submission_in_queue(sub, &policy, &single, &mut cg, op_log)
-        })?;
+    // Auto-wire reconciliation (ADR-0010, Phase 3): fold the landing content
+    // against the queue's *pre-land* base (its true shared ancestor) into the
+    // merged trunk. This keeps `reconciled/<queue>` a real merge of concurrent
+    // same-file work instead of a last-wins overlay, and it decides conflicts
+    // *structurally* — sharper than the definition-support batch check: two
+    // line-disjoint edits to one definition merge, incompatible ones become
+    // conflict values (§5.4) instead of refusing the batch.
+    let rec = reconcile_core(&repo, &registry, &refs, &policy, &subs)?;
+    if rec.carried > 0 && !policy.allow_carried {
+        anyhow::bail!(
+            "queue {} refuses carried conflict values ({} after reconciling the landing); \
+             land on a permissive queue or resolve the conflicting definition(s) first: {}",
+            policy.name,
+            rec.carried,
+            rec.conflicted.join(", ")
+        );
+    }
+
+    // Land each submission (per-change refs) and advance the reconciled head in
+    // one locked transaction, so the merged trunk moves with the landing.
+    let single = QueueGates {
+        carried_values: gates.carried_values,
+        validated: gates.validated,
+    };
+    let results = OpLog::mutate_locked(&repo, |op_log| {
+        let mut out = Vec::with_capacity(subs.len());
+        for sub in &subs {
+            out.push(land_submission_in_queue(
+                sub, &policy, &single, &mut cg, op_log,
+            )?);
+        }
+        write_reconciled_head(op_log, &policy.name, &rec.tip);
+        Ok(out)
+    })?;
+
+    if let [result] = results.as_slice() {
         println!(
             "landed submission {}: {}",
             result.submission_id, result.message
         );
     } else {
-        // Tier-0 batch (§5.10): pairwise-disjoint submissions validate as one
-        // and land in a single locked op-log transaction; an overlap refuses
-        // the whole batch with the colliding paths named.
-        let sub_refs: Vec<&Submission> = subs.iter().collect();
-        let results = OpLog::mutate_locked(&repo, |op_log| {
-            land_batch_in_queue(&sub_refs, &policy, &gates, &mut cg, op_log)
-        })?;
         println!(
-            "batched {} pairwise-disjoint submission(s) into queue {} (validated as one)",
+            "landed {} submission(s) on queue {}, reconciled into reconciled/{} ({})",
             results.len(),
-            policy.name
+            policy.name,
+            policy.name,
+            rec.tip
         );
-        for result in results {
+        for result in &results {
             println!("  landed {}: {}", result.submission_id, result.message);
         }
     }
+    let clean = rec.files - rec.conflicted.len();
+    eprintln!(
+        "reconciled/{}: {clean} file(s) merged clean, {} carrying {} conflict value(s)",
+        policy.name,
+        rec.conflicted.len(),
+        rec.carried
+    );
 
     // Mechanical backport offers (ADR-0009): every sibling queue this landing
     // did not target. The offer is advisory; `omo backport` carries the
@@ -1385,16 +1415,32 @@ fn cmd_land(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::R
 /// `reconciled/<queue>` head (switch onto it with `omo switch`), subject to the
 /// queue's carried-conflict rule. Returns exit 2 when the result carries
 /// conflict values (landable, resolve later), 0 when clean.
-fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::Result<i32> {
-    let repo = Repository::open(resolve(repo)?)?;
-    let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
-    let policy = registry.resolve(&queue)?;
-    let subs: Vec<Submission> = ids
-        .iter()
-        .map(|id| load_submission(&repo, &SubmissionId::new(id)))
-        .collect::<anyhow::Result<_>>()?;
+/// The result of folding a set of submissions into one merged tree against a
+/// queue's landed base (ADR-0010, Phase 3).
+struct Reconciliation {
+    /// The merged tree's object id.
+    tip: ObjectId,
+    /// How many files the merged tree contains.
+    files: usize,
+    /// Total conflict values (§5.4) the merged content carries.
+    carried: usize,
+    /// The paths whose merge produced a conflict.
+    conflicted: Vec<String>,
+}
 
-    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
+/// Fold `subs` through the Tier-2 structural driver against `queue`'s current
+/// landed base — their **shared ancestor** — snapshot the merged tree, and
+/// report the carried conflict values. Pure computation: it writes no ref and
+/// lands nothing, so callers run it *before* landing (when the base is the true
+/// pre-batch trunk). Edits to different definitions of one file combine; edits
+/// to the same definition ride through as conflict values rather than refusing.
+fn reconcile_core(
+    repo: &Repository,
+    registry: &QueueRegistry,
+    refs: &std::collections::BTreeMap<String, CommitId>,
+    policy: &QueuePolicy,
+    subs: &[Submission],
+) -> anyhow::Result<Reconciliation> {
     let scratch = repo
         .control_dir()
         .join("tmp")
@@ -1403,12 +1449,11 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
     std::fs::create_dir_all(&base_dir)
         .with_context(|| format!("creating {}", base_dir.display()))?;
 
-    let run = || -> anyhow::Result<(ObjectId, usize, usize, Vec<String>)> {
-        // The shared base: the queue's landed content, keyed by path.
+    let run = || -> anyhow::Result<Reconciliation> {
         let base = materialize_queue_base(
-            &repo,
-            &registry,
-            &refs,
+            repo,
+            registry,
+            refs,
             &policy.name,
             &scratch.join("base-refs"),
             None,
@@ -1428,7 +1473,7 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
                 };
                 let dir = scratch.join(format!("sub-{i}"));
                 std::fs::create_dir_all(&dir)?;
-                omoplata_work::materialize(&repo, &oid, &dir)?;
+                omoplata_work::materialize(repo, &oid, &dir)?;
                 for file in files_under(&dir) {
                     if let Ok(text) = std::fs::read_to_string(&file) {
                         let rel = file
@@ -1443,7 +1488,6 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
             contributions.push(files);
         }
 
-        // Every path any submission touched.
         let mut paths: BTreeSet<String> = BTreeSet::new();
         for files in &contributions {
             paths.extend(files.keys().cloned());
@@ -1477,7 +1521,6 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
             reconciled.insert(path.clone(), acc);
         }
 
-        // Materialize the reconciled content and snapshot it into a tree.
         for (path, text) in &reconciled {
             let p = base_dir.join(path);
             if let Some(parent) = p.parent() {
@@ -1485,9 +1528,8 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
             }
             std::fs::write(&p, text)?;
         }
-        let tip = omoplata_work::snapshot(&repo, &base_dir)?;
+        let tip = omoplata_work::snapshot(repo, &base_dir)?;
 
-        // Count the conflict values the reconciled content carries (§5.4).
         let mut carried = 0usize;
         for (path, text) in &reconciled {
             if path.ends_with(".rs") {
@@ -1496,49 +1538,78 @@ fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyh
                 }
             }
         }
-        Ok((tip, reconciled.len(), carried, conflicted))
+        Ok(Reconciliation {
+            tip,
+            files: reconciled.len(),
+            carried,
+            conflicted,
+        })
     };
 
-    let outcome = run();
+    let out = run();
     let _ = std::fs::remove_dir_all(&scratch);
-    let (tip, file_count, carried, conflicted) = outcome?;
+    out
+}
+
+/// Point `reconciled/<queue>` at a merged tree, appending a `SetRef` op.
+fn write_reconciled_head(op_log: &mut OpLog, queue: &str, tip: &ObjectId) {
+    op_log.set_ref(
+        format!("reconciled/{queue}"),
+        Some(CommitId::new(tip.to_string())),
+        None,
+    );
+}
+
+fn cmd_reconcile(repo: Option<PathBuf>, ids: Vec<String>, queue: String) -> anyhow::Result<i32> {
+    let repo = Repository::open(resolve(repo)?)?;
+    let registry = QueueRegistry::load(QueueRegistry::path_in(&repo))?;
+    let policy = registry.resolve(&queue)?;
+    let subs: Vec<Submission> = ids
+        .iter()
+        .map(|id| load_submission(&repo, &SubmissionId::new(id)))
+        .collect::<anyhow::Result<_>>()?;
+
+    let refs = OpLog::load(oplog_path(&repo))?.refs_now();
+    let rec = reconcile_core(&repo, &registry, &refs, &policy, &subs)?;
 
     // A strict queue keeps no carried values; a permissive one does (§5.4).
-    if carried > 0 && !policy.allow_carried {
+    if rec.carried > 0 && !policy.allow_carried {
         anyhow::bail!(
-            "queue {} refuses carried conflict values ({carried} present after reconciliation); \
+            "queue {} refuses carried conflict values ({} present after reconciliation); \
              reconcile against a permissive queue or resolve the conflicts first",
-            policy.name
+            policy.name,
+            rec.carried
         );
     }
 
-    let refname = format!("reconciled/{}", policy.name);
-    let tip_commit = CommitId::new(tip.to_string());
     OpLog::mutate_locked(&repo, |op_log| {
-        op_log.set_ref(refname.clone(), Some(tip_commit.clone()), None);
+        write_reconciled_head(op_log, &policy.name, &rec.tip);
         Ok(())
     })?;
 
-    let clean = file_count - conflicted.len();
+    let clean = rec.files - rec.conflicted.len();
     println!(
-        "reconciled {} submission(s) on {} into {refname} ({tip}): \
-         {clean} file(s) merged clean, {} carrying {carried} conflict value(s)",
+        "reconciled {} submission(s) on {} into reconciled/{} ({}): \
+         {clean} file(s) merged clean, {} carrying {} conflict value(s)",
         subs.len(),
         policy.name,
-        conflicted.len()
+        policy.name,
+        rec.tip,
+        rec.conflicted.len(),
+        rec.carried
     );
-    for path in &conflicted {
+    for path in &rec.conflicted {
         println!(
             "  conflict values in {path} (resolve with `omo merge-file` / edit, then re-land)"
         );
     }
-    if carried > 0 {
+    if rec.carried > 0 {
         eprintln!(
-            "reconciled/{}: carries {carried} conflict value(s) — landable, resolve later (§5.4)",
-            policy.name
+            "reconciled/{}: carries {} conflict value(s) — landable, resolve later (§5.4)",
+            policy.name, rec.carried
         );
     }
-    Ok(i32::from(carried > 0) * 2)
+    Ok(i32::from(rec.carried > 0) * 2)
 }
 
 /// `omo backport <id> --to <queue>` — land an already-landed submission into a
@@ -2323,12 +2394,33 @@ fn cmd_push(
         );
     }
 
+    // Reconcile the pushed content into the remote's merged trunk against its
+    // pre-land base (ADR-0010, Phase 3), and refuse if a strict remote queue
+    // would have to keep carried conflict values.
+    let rec = reconcile_core(
+        &remote_repo,
+        &remote_registry,
+        &remote_refs,
+        &policy,
+        &[sub.clone()],
+    )?;
+    if rec.carried > 0 && !policy.allow_carried {
+        anyhow::bail!(
+            "remote queue {} refuses carried conflict values ({} after reconciling the push): {}",
+            policy.name,
+            rec.carried,
+            rec.conflicted.join(", ")
+        );
+    }
+
     let result = OpLog::mutate_locked(&remote_repo, |op_log| {
-        land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)
+        let landed = land_submission_in_queue(&sub, &policy, &gates, &mut cg, op_log)?;
+        write_reconciled_head(op_log, &policy.name, &rec.tip);
+        Ok(landed)
     })?;
     println!(
-        "pushed {} to {name} (queue {}): {}",
-        result.submission_id, policy.name, result.message
+        "pushed {} to {name} (queue {}): {} (reconciled/{} advanced to {})",
+        result.submission_id, policy.name, result.message, policy.name, rec.tip
     );
     Ok(())
 }
