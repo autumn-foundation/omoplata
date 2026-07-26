@@ -1814,3 +1814,94 @@ fn reconcile_strict_queue_refuses_carried_values() {
         .failure()
         .stderr(predicate::str::contains("refuses carried conflict values"));
 }
+
+// --- Auto-wired reconciliation: land/push maintain the merged trunk ----------
+
+#[test]
+fn land_batch_auto_reconciles_into_merged_trunk() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    land_change(root, "base", &format!("{FOO}{BAR}"), "sub0");
+
+    // Two agents add different functions to the same file, then land together —
+    // no explicit `omo reconcile` step.
+    submit_shared(root, "a", &format!("{FOO}{BAR}{BAZ}"), "sub-a");
+    submit_shared(root, "b", &format!("{FOO}{BAR}{QUX}"), "sub-b");
+    omo()
+        .args(["land", "sub-a", "sub-b", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reconciled into reconciled/trunk"));
+
+    // The reconciled head is auto-maintained and holds *both* additions.
+    omo()
+        .args([
+            "switch",
+            "reconciled/trunk",
+            "--workspace",
+            "a",
+            "--force",
+            "--repo",
+        ])
+        .arg(root)
+        .assert()
+        .success();
+    let merged = std::fs::read_to_string(root.join("wc-a").join("shared.rs")).unwrap();
+    for f in ["fn foo", "fn bar", "fn baz", "fn qux"] {
+        assert!(
+            merged.contains(f),
+            "{f} missing from merged trunk: {merged}"
+        );
+    }
+}
+
+#[test]
+fn land_same_definition_batch_carries_values_on_permissive_queue() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    land_change(root, "base", FOO, "sub0");
+
+    // Two agents edit the same function incompatibly. On permissive trunk the
+    // batch still lands — the conflict rides through as a carried value (git
+    // would reject the second as a non-fast-forward).
+    submit_shared(root, "a", "fn foo() -> i32 {\n    111\n}\n", "sub-a");
+    submit_shared(root, "b", "fn foo() -> i32 {\n    999\n}\n", "sub-b");
+    omo()
+        .args(["land", "sub-a", "sub-b", "--repo"])
+        .arg(root)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("1 conflict value(s)"));
+}
+
+#[test]
+fn land_same_definition_batch_refuses_on_strict_queue() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    omo().arg("init").arg(root).assert().success();
+    omo()
+        .args(["queue", "add", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+    submit_shared(root, "base", FOO, "sub0");
+    omo()
+        .args(["land", "sub0", "--queue", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .success();
+
+    // The same-definition batch would carry a value; a strict release queue
+    // refuses it (release lines stay clean).
+    submit_shared(root, "a", "fn foo() -> i32 {\n    111\n}\n", "sub-a");
+    submit_shared(root, "b", "fn foo() -> i32 {\n    999\n}\n", "sub-b");
+    omo()
+        .args(["land", "sub-a", "sub-b", "--queue", "release-1", "--repo"])
+        .arg(root)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refuses carried conflict values"));
+}

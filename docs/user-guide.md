@@ -453,19 +453,27 @@ and mutates nothing. The one thing still taken on trust is approval
 than re-deriving who approved it; attested approval is the next hardening.
 
 When two developers change the **same file**, git makes the second one rebase or
-rejects the push as a non-fast-forward. omoplata **merges** — `omo reconcile`:
+rejects the push as a non-fast-forward. omoplata **merges** — and it does so
+*automatically as part of landing*. `omo land` (and `omo push`) fold the landing
+content through the Tier-2 structural driver against the queue's pre-land base —
+the real common ancestor of simultaneous work — and advance the merged trunk
+(`reconciled/<queue>`) in the same transaction:
 
 ```console
-$ omo reconcile sub-a sub-b
-reconciled 2 submission(s) on trunk into reconciled/trunk (sha256:58f2…): 1 file(s) merged clean, 0 carrying 0 conflict value(s)
+$ omo land sub-a sub-b
+landed 2 submission(s) on queue trunk, reconciled into reconciled/trunk (sha256:58f2…)
+  landed sub-a: Submission sub-a landed in queue trunk
+  landed sub-b: Submission sub-b landed in queue trunk
 ```
 
-It folds the submissions through the Tier-2 structural driver against the queue's
-current landed state — their **shared base**, the real common ancestor of
-simultaneous work. Edits to *different* definitions of one file combine into a
-single merged tree (something a last-wins overlay could never represent); edits
-to the *same* definition ride through as first-class **conflict values** (§5.4)
-instead of refusing:
+Edits to *different* definitions of one file both survive in the merged tree
+(something a last-wins overlay could never represent — `omo switch
+reconciled/trunk` to see all of them); *line-disjoint* edits to the *same*
+definition merge structurally; and an *incompatible* same-definition pair rides
+through as a first-class **conflict value** (§5.4) on a permissive queue instead
+of refusing — a strict queue refuses to keep it, so release lines stay clean.
+`omo reconcile <id…>` runs the same fold *without* landing, to preview a merge or
+produce a merged trunk on demand:
 
 ```console
 $ omo reconcile sub-a sub-b
@@ -473,15 +481,13 @@ reconciled 2 submission(s) on trunk into reconciled/trunk (sha256:8c10…): 0 fi
   conflict values in shared.rs (resolve with `omo merge-file` / edit, then re-land)
 ```
 
-The merged tree is written to a `reconciled/<queue>` head you can `omo switch`
-onto; a strict queue refuses to keep carried values, a permissive one keeps them
-for later resolution (exit 2 = landable, carrying values). This is **Phase 3's
-primitive** — the git-beating move. Two pieces of the phase remain: *auto-wiring*
-reconciliation into `push`/batch-landing so the authority always presents a
-merged trunk, and *cross-time base tracking* so a change made against an older
-head reconciles against its true base rather than the current head (the store
-records no commit parents, ADR-0002, so that base isn't available yet — it
-conservatively surfaces a few extra conflict values until then).
+This is the git-beating move, and it's on by default. One piece of the phase
+remains: *cross-time base tracking* — the fold is exact when the inputs were made
+against the current landed state (the simultaneous case); a change made against
+an *older* head reconciles against the current head rather than its true base
+(the store records no commit parents, ADR-0002, so that base isn't available
+yet), conservatively surfacing a few extra conflict values until a per-change
+base pointer exists.
 
 The transport today is the local path (a shared mount or sibling clone);
 networked transports follow, exactly as git interop began at `file://`. The full

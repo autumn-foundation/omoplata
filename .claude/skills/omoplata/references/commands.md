@@ -42,7 +42,7 @@ outcomes go to **stderr**.
 | `omo remote add <name> <path> [--repo DIR]` | Register another omoplata repo as a named remote (local-path transport, ADR-0010). `omo remote list` / `omo remote remove <name>` manage them. |
 | `omo fetch <remote> [--repo DIR]` | Replicate a remote's landed (`public/*`) state into local `remotes/<name>/*` refs (copies the object closure; idempotent). Then `omo switch <name>/<change>` drops onto a teammate's remote-landed work — no git import/export. Private `ws/*` refs are not fetched; land to share. |
 | `omo push <remote> <id> [--queue Q] [--repo DIR]` | Land a local submission on a remote through *its* policy (ADR-0010 Phase 2 — the remote is the landing authority). Replicates the submission's content, then runs the remote's approval/carried/validator/disjointness gates against the remote's landed state and lands under its lock, or refuses. The remote re-validates; it does not trust the client. Default queue `trunk`. |
-| `omo reconcile <id...> [--queue Q] [--repo DIR]` | Fold several submissions into one merged tree against a queue's landed base (their shared ancestor), carrying same-definition conflicts as **values** (§5.4) rather than refusing — the git-beating move (git rejects a non-fast-forward; omoplata merges). Disjoint definitions of one file combine; writes a `reconciled/<queue>` head to `omo switch` onto. Exit 0 clean, 2 carrying values; a strict queue refuses carried values. ADR-0010 Phase 3. |
+| `omo reconcile <id...> [--queue Q] [--repo DIR]` | Reconcile *without* landing: fold submissions into one merged tree against a queue's landed base, carrying same-definition conflicts as **values** (§5.4) rather than refusing (git rejects a non-fast-forward; omoplata merges), and write a `reconciled/<queue>` head to `omo switch` onto. `omo land`/`omo push` do this automatically in the landing transaction; use `reconcile` only to preview or build a merged trunk without landing. Exit 0 clean, 2 carrying values; strict queue refuses. ADR-0010 Phase 3. |
 | `omo absorb <change...> [--workspace WS] [--repo DIR]` | Route working-copy edits into stack changes by touched definition identity (§5.9). |
 | `omo reorder <index> [--workspace WS] [--repo DIR]` | Swap adjacent stack changes (disjoint/commuting swap cleanly; else a conflict value is carried). |
 
@@ -76,14 +76,17 @@ A refused landing (any gate) mutates nothing and exits 2 with an explanatory
 
 ### Batch landing (definition-granular Tier-0)
 
-`omo land a b c` batches when the submissions are **pairwise-disjoint at
-definition granularity** relative to the queue's current landed state: a
-submission's *support* for a file is the set of definitions it changed vs the
-landed base. `impl`/`mod`/`trait` containers compare by their shell (members
-elided), so adding different methods to one `impl` is disjoint. Overlap on a
-shared definition refuses the **whole** batch, naming the definition. Disjoint
-support licenses order-independence (I3′): the batch validates as one and lands
-in a single locked transaction.
+`omo land a b c` lands the submissions in one locked transaction and
+**auto-reconciles** them against the queue's pre-land base (ADR-0010 Phase 3):
+the merged trunk (`reconciled/<queue>`) advances in the same transaction. Two
+agents editing different definitions of one file both land and both survive;
+*line-disjoint* edits to one definition merge structurally; an *incompatible*
+same-definition pair rides through as a conflict value (§5.4) on a permissive
+queue and is refused on a strict one (release lines stay clean). This is sharper
+than the old definition-support batch check, which refused any pair touching a
+shared definition — support granularity still describes the *disjoint* case
+(`impl`/`mod`/`trait` containers compare by their shell, so different methods on
+one `impl` are disjoint), but a shared definition is now merged, not refused.
 
 ### Per-queue refs
 

@@ -1,7 +1,7 @@
 # ADR-0010: Distributed omoplata — remotes, replication, and remote landing authority
 
-**Status:** accepted (Phases 1–2 implemented; Phase 3 primitive `omo reconcile`
-implemented — auto-wiring and cross-time base tracking remain).
+**Status:** accepted (Phases 1–2 implemented; Phase 3 implemented — `omo reconcile`
+plus auto-wiring into `omo land`/`omo push`; cross-time base tracking remains).
 
 ## Context
 
@@ -131,15 +131,26 @@ remote preserves the whole model.
   concurrent changes to one file now merge into one tree instead of one silently
   winning.
 
-  **Still open on this phase.** (a) *Auto-wiring*: making `omo push` / batch
-  landing reconcile by default (rather than an explicit `reconcile` step), so the
-  authority always presents a merged trunk. (b) *Cross-time base tracking*: the
-  shared-base fold is exactly right when all inputs were made against the current
-  landed state; a change made against an **older** head has no recorded base
-  (the store has no commit parents — ADR-0002), so reconciling it against the
+  **Auto-wired.** `omo land` and `omo push` reconcile automatically: each
+  computes the merge against the queue's *pre-land* base (its true shared
+  ancestor, since the reconciliation runs before the landing writes anything) and
+  advances the `reconciled/<queue>` head in the *same* locked transaction as the
+  landing. No explicit `omo reconcile` step is needed — the authority always
+  presents a merged trunk. This also **sharpens batch landing** (the ADR-0009
+  future-work item): landing decides conflicts *structurally* rather than by the
+  coarse definition-support check, so two line-disjoint edits to one definition
+  now merge and land instead of refusing, while an incompatible pair rides
+  through as a conflict value on a permissive queue (a strict queue still refuses
+  to keep carried values, keeping release lines clean). `omo reconcile` remains
+  as the explicit primitive for reconciling without landing.
+
+  **Still open on this phase — cross-time base tracking.** The shared-base fold
+  is exactly right when the inputs were made against the current landed state
+  (the simultaneous case). A change made against an **older** head has no recorded
+  base (the store has no commit parents — ADR-0002), so reconciling it against the
   current head over-approximates and conservatively surfaces more conflict values
-  than a true three-way against its real base would. A per-change base pointer
-  (or an op-log-derived base) is the missing piece, and the natural next step.
+  than a true three-way against its real base would. A per-change base pointer (or
+  an op-log-derived base) is the missing piece, and the natural next step.
 
 ## Consequences
 
@@ -159,9 +170,8 @@ remote preserves the whole model.
 - Multi-master op-log reconciliation between independent authorities.
 - Attested approval — the remote trusts the submission's recorded approval
   (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
-- Auto-wired reconciliation: `omo push` / batch landing reconciling by default
-  so the authority always presents a merged trunk (the `omo reconcile` primitive
-  ships; wiring it into the landing path is the next step).
 - Cross-time base tracking: reconciling a change made against an older head using
   its true base rather than the current head (needs a per-change base pointer;
-  the store has no commit parents today).
+  the store has no commit parents today). `omo reconcile` and the auto-wired
+  `land`/`push` merge against the current landed state — exact for simultaneous
+  work, conservative (extra conflict values) for a change built on an older head.
