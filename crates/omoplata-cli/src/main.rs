@@ -437,13 +437,19 @@ enum Command {
     /// Exposes the repo at `--addr` so remote clients can
     /// `omo fetch http://<addr>` its landed state and
     /// `omo push http://<addr> <id>` submissions through its policy — the
-    /// landing authority, now off-box. HTTP only, no TLS or auth: for loopback
-    /// or a trusted network. Runs until interrupted.
+    /// landing authority, now off-box. HTTP only; terminate TLS at a fronting
+    /// proxy/tunnel. With `--token` (or `OMO_TOKEN`) every request must present
+    /// `Authorization: Bearer <token>`; without it, the server is open (for
+    /// loopback or a trusted network). Runs until interrupted.
     Serve {
         /// Address to bind, e.g. `127.0.0.1:8080` (`:0` picks a free port,
         /// printed on startup).
         #[arg(long, default_value = "127.0.0.1:0")]
         addr: String,
+        /// Require this bearer token on every request. Falls back to the
+        /// `OMO_TOKEN` environment variable; unset means an open server.
+        #[arg(long)]
+        token: Option<String>,
         /// Repository directory (defaults to current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -671,8 +677,13 @@ enum RemoteCommand {
     Add {
         /// The remote name, e.g. `origin`.
         name: String,
-        /// Path to the remote repository root (the dir holding `.omoplata`).
+        /// Path to the remote repository root (the dir holding `.omoplata`),
+        /// or an `http://host:port` URL of an `omo serve` daemon.
         path: PathBuf,
+        /// Bearer token for an authenticated `omo serve` remote, sent as
+        /// `Authorization: Bearer <token>`. Omit for open or local remotes.
+        #[arg(long)]
+        token: Option<String>,
         /// Repository directory (defaults to the current directory).
         #[arg(long)]
         repo: Option<PathBuf>,
@@ -829,7 +840,12 @@ fn run() -> anyhow::Result<i32> {
             QueueCommand::Remove { name, repo } => cmd_queue_remove(repo, name).map(|()| 0),
         },
         Command::Remote { action } => match action {
-            RemoteCommand::Add { name, path, repo } => cmd_remote_add(repo, name, path).map(|()| 0),
+            RemoteCommand::Add {
+                name,
+                path,
+                token,
+                repo,
+            } => cmd_remote_add(repo, name, path, token).map(|()| 0),
             RemoteCommand::List { repo } => cmd_remote_list(repo).map(|()| 0),
             RemoteCommand::Remove { name, repo } => cmd_remote_remove(repo, name).map(|()| 0),
         },
@@ -840,7 +856,7 @@ fn run() -> anyhow::Result<i32> {
             queue,
             repo,
         } => cmd_push(repo, remote, id, queue).map(|()| 0),
-        Command::Serve { addr, repo } => cmd_serve(repo, addr).map(|()| 0),
+        Command::Serve { addr, token, repo } => cmd_serve(repo, addr, token).map(|()| 0),
 
         Command::Ref { action } => match action {
             RefCommand::Set { name, commit, repo } => cmd_ref_set(repo, name, commit).map(|()| 0),
@@ -2262,19 +2278,36 @@ fn cmd_queue_remove(repo: Option<PathBuf>, name: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `omo remote add <name> <path>` — register a remote (ADR-0010).
-fn cmd_remote_add(repo: Option<PathBuf>, name: String, path: PathBuf) -> anyhow::Result<()> {
+/// `omo remote add <name> <path> [--token T]` — register a remote (ADR-0010).
+fn cmd_remote_add(
+    repo: Option<PathBuf>,
+    name: String,
+    path: PathBuf,
+    token: Option<String>,
+) -> anyhow::Result<()> {
     let repo = Repository::open(resolve(repo)?)?;
-    // Store the path canonicalized when it exists, so the remote resolves from
-    // any working directory; fall back to the given path otherwise.
-    let stored = path.canonicalize().unwrap_or_else(|_| path.clone());
-    let (name, stored_for_reg) = (name, stored.clone());
+    // An `http://` URL is stored verbatim; a filesystem path is canonicalized
+    // when it exists, so the remote resolves from any working directory.
+    let stored = if path.to_string_lossy().starts_with("http://") {
+        path.clone()
+    } else {
+        path.canonicalize().unwrap_or_else(|_| path.clone())
+    };
+    let (name, stored_for_reg, token) = (name, stored.clone(), token);
     RemoteRegistry::mutate_locked(&repo, move |reg| {
-        reg.add(name, stored_for_reg)?;
+        reg.add(name, stored_for_reg, token)?;
         Ok(())
     })?;
     println!("added remote {}", stored.display());
     Ok(())
+}
+
+/// The bearer token to present to a remote: the registered remote's stored
+/// token, else the `OMO_TOKEN` environment variable, else `None` (open remote).
+fn resolve_token(registered: Option<&str>) -> Option<String> {
+    registered
+        .map(str::to_owned)
+        .or_else(|| std::env::var("OMO_TOKEN").ok().filter(|t| !t.is_empty()))
 }
 
 /// `omo remote list` — print `name  <path>` for each registered remote.
@@ -2321,9 +2354,13 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
     // A registered name wins; otherwise treat the argument as a target (path or
     // http:// URL), named by itself, so `omo fetch ../peer` works without a
     // prior `remote add`.
-    let (name, target) = match registry.get(&remote) {
-        Some(r) => (r.name.clone(), r.path.to_string_lossy().into_owned()),
-        None => (remote.clone(), remote.clone()),
+    let (name, target, token) = match registry.get(&remote) {
+        Some(r) => (
+            r.name.clone(),
+            r.path.to_string_lossy().into_owned(),
+            resolve_token(r.token.as_deref()),
+        ),
+        None => (remote.clone(), remote.clone(), resolve_token(None)),
     };
 
     // The remote's landed (`public/*`) refs, and a way to pull each object — over
@@ -2331,7 +2368,7 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
     type Puller = Box<dyn FnMut(&ObjectId) -> anyhow::Result<usize>>;
     let (public, mut pull): (Vec<(String, CommitId)>, Puller) =
         if let Some(authority) = sync::http_authority(&target) {
-            let refs = sync::fetch_refs(&authority)?;
+            let refs = sync::fetch_refs(&authority, token.as_deref())?;
             let public = refs
                 .into_iter()
                 .filter(|(k, _)| k.starts_with("public/"))
@@ -2339,8 +2376,9 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
                 .collect();
             let local = Repository::open(&repo_path)?;
             let authority = authority.clone();
+            let token = token.clone();
             let pull = move |oid: &ObjectId| -> anyhow::Result<usize> {
-                pull_closure_http(&authority, &local, oid)
+                pull_closure_http(&authority, token.as_deref(), &local, oid)
             };
             (public, Box::new(pull))
         } else {
@@ -2393,6 +2431,7 @@ fn cmd_fetch(repo: Option<PathBuf>, remote: String) -> anyhow::Result<()> {
 /// many objects were newly written (content-addressed, so re-fetch is cheap).
 fn pull_closure_http(
     authority: &str,
+    token: Option<&str>,
     local: &Repository,
     root: &ObjectId,
 ) -> anyhow::Result<usize> {
@@ -2412,7 +2451,7 @@ fn pull_closure_http(
             }
             continue;
         }
-        let bytes = sync::fetch_object(authority, &id.to_string())?;
+        let bytes = sync::fetch_object(authority, &id.to_string(), token)?;
         let obj =
             Object::deserialize(&bytes).map_err(|e| anyhow::anyhow!("remote object {id}: {e}"))?;
         if let Object::Tree(tree) = &obj {
@@ -2453,9 +2492,13 @@ fn cmd_push(
 
     // Resolve the remote (a registered name wins; otherwise a bare target).
     let registry = RemoteRegistry::load(RemoteRegistry::path_in(&local))?;
-    let (name, target) = match registry.get(&remote) {
-        Some(r) => (r.name.clone(), r.path.to_string_lossy().into_owned()),
-        None => (remote.clone(), remote.clone()),
+    let (name, target, token) = match registry.get(&remote) {
+        Some(r) => (
+            r.name.clone(),
+            r.path.to_string_lossy().into_owned(),
+            resolve_token(r.token.as_deref()),
+        ),
+        None => (remote.clone(), remote.clone(), resolve_token(None)),
     };
 
     let sub = load_submission(&local, &SubmissionId::new(&id))?;
@@ -2491,7 +2534,7 @@ fn cmd_push(
                 .collect(),
             objects,
         };
-        let result = sync::push(&authority, &payload)?;
+        let result = sync::push(&authority, &payload, token.as_deref())?;
         if !result.ok {
             anyhow::bail!("{}", result.message);
         }
@@ -2658,12 +2701,16 @@ fn gather_closure(
 }
 
 /// `omo serve` — run the networked landing-authority daemon (ADR-0010).
-fn cmd_serve(repo: Option<PathBuf>, addr: String) -> anyhow::Result<()> {
+///
+/// `token` (else the `OMO_TOKEN` environment variable) enables bearer-token
+/// auth; unset serves openly for loopback / a trusted network.
+fn cmd_serve(repo: Option<PathBuf>, addr: String, token: Option<String>) -> anyhow::Result<()> {
     let repo_path = resolve(repo)?;
     // Fail fast if it is not an omoplata repository.
     Repository::open(&repo_path)
         .with_context(|| format!("{} is not an omoplata repository", repo_path.display()))?;
-    sync::serve(repo_path, &addr)
+    let token = token.or_else(|| std::env::var("OMO_TOKEN").ok().filter(|t| !t.is_empty()));
+    sync::serve(repo_path, &addr, token)
 }
 
 /// One-line human summary of a queue policy.

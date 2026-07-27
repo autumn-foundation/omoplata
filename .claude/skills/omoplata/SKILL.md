@@ -80,7 +80,11 @@ omo push origin sub-7 --queue trunk   # land YOUR submission on the remote's que
 
 A remote is a filesystem path (shared mount / sibling clone) *or* an
 `http://host:port` URL of an `omo serve` daemon — same commands, same semantics.
-The HTTP transport is plaintext, no auth (loopback / trusted network).
+The HTTP transport takes an **optional bearer token** (`omo serve --token <t>`;
+clients pass `omo remote add --token <t>` or set `OMO_TOKEN`) — a missing/wrong
+token gets `401`. **TLS is not built in**: front it with a proxy/tunnel and point
+`omo` at the plaintext side (a token on a bare HTTP hop only makes sense behind
+one, or on a trusted network).
 
 `fetch` is read-only replication of *landed* (`public/*`) state (private `ws/*`
 tips are not fetched — land to share). `push` is the write path: the **remote is

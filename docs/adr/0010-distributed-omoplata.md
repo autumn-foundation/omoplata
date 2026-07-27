@@ -6,8 +6,10 @@ remote landing authority (`omo push` / `omo serve`), and reconciliation
 **cross-time base tracking** (a change reconciles against the trunk it was
 authored on, recovered from the op log) and a **networked HTTP transport**
 (`omo serve` is the landing authority off-box; `fetch`/`push` speak to it over
-`http://`). Remaining future work is TLS + authentication on that transport, and
-attested approval; see Non-goals.
+`http://`). The transport now supports **optional bearer-token authentication**
+(`omo serve --token`; clients send it via `omo remote add --token` or the
+`OMO_TOKEN` env var); **TLS is terminated by a fronting proxy/tunnel** rather
+than built in. Remaining future work is attested approval; see Non-goals.
 
 ## Context
 
@@ -100,8 +102,17 @@ logic:
   now genuinely off-box.
 
 Replication is idempotent either way, since equal content has equal id. The HTTP
-transport is an MVP: **no TLS, no authentication** — for loopback or a trusted
-network; TLS + auth are the productionization follow-on. A git-compatible
+transport supports **optional bearer-token authentication**: `omo serve --token
+<t>` (or `OMO_TOKEN`) requires `Authorization: Bearer <t>` on every request and
+answers `401` otherwise; an open server (no token) accepts all comers, for
+loopback or a trusted network. Clients present the token per-remote (`omo remote
+add --token`) or via the `OMO_TOKEN` env var. **TLS is deliberately not built
+in**: terminate it at a fronting proxy or tunnel (nginx/caddy, an SSH tunnel, a
+service mesh) and point `omo` at the local plaintext side — this keeps the
+project's single-dependency-family posture (no crypto stack) and never
+hand-rolls TLS. Auth over plaintext HTTP still leaks the token on the wire, so a
+token is only meaningful behind such a terminator or on a trusted segment. A
+git-compatible
 `push`/`receive-pack` path stays possible for interop but is *lossy at the
 boundary* (git carries commits/trees/refs, not op-log entries, queue policy, or
 certificates), so it can never be the full-fidelity substrate — only the native
@@ -193,13 +204,13 @@ git, mirroring how git interop itself began at `file://`, ADR-0005).
 
 ## Non-goals (for now)
 
-- Networked (http/ssh) transports; `git push` / `receive-pack` encoding.
 - Multi-master op-log reconciliation between independent authorities.
-- Attested approval — the remote trusts the submission's recorded approval
-  (Phase 2 ships the landing gate; verifying *who* approved is later hardening).
-- **TLS and authentication** on the HTTP transport (the wire itself is
-  implemented; it is plaintext and unauthenticated, so loopback/trusted-network
-  only for now), and an ssh transport or a git-compatible `push`/`receive-pack`
-  path for interop.
+- **Built-in TLS.** The transport speaks plaintext HTTP by design; TLS is
+  terminated at a fronting proxy/tunnel (see the transport section). Bearer-token
+  auth *is* implemented (`omo serve --token`, `OMO_TOKEN`), but a token over
+  plaintext HTTP is only meaningful behind such a terminator or on a trusted
+  segment.
+- An ssh transport, and a git-compatible `push`/`receive-pack` path for interop.
 - Attested approval: the authority verifying *who* approved a submission, rather
-  than honouring the recorded approval (Phase 2's known limitation).
+  than honouring the recorded approval (the standing Phase 2 limitation — the
+  landing gate is enforced, but approval authenticity is taken on trust).
