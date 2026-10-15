@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-cli"
 version.workspace = true
+description = "omo, the command-line interface for the omoplata version control system"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

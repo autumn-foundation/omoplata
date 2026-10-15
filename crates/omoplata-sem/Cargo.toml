@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-sem"
 version.workspace = true
+description = "omoplata's semantic layer: embeddings for duplicate-work detection and similarity search"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-algebra"
 version.workspace = true
+description = "omoplata's verified merge core: patch algebra, commutation checking, and three-way merge with conflicts as values"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

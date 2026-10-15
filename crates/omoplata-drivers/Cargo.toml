@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-drivers"
 version.workspace = true
+description = "Tier-2 structural merge drivers for omoplata: syntax-tree-aware merging of conflicts that survive line merge"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

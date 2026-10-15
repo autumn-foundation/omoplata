@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-identity"
 version.workspace = true
+description = "omoplata's two-tier identity layer: stable change ids and definition-level identity across rebases and edits"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-work"
 version.workspace = true
+description = "omoplata's working model: mutable repository state, workspaces, and a bi-temporal operation log"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

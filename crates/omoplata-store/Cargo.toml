@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-store"
 version.workspace = true
+description = "Content-addressed object store and tree model for the omoplata version control system"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

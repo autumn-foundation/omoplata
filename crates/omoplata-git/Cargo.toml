@@ -1,6 +1,7 @@
 [package]
 name = "omoplata-git"
 version.workspace = true
+description = "Git object format and wire protocol interoperability for omoplata, with a round-trip gate"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
