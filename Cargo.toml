@@ -24,3 +24,12 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fs4 = "1"
+
+# Internal crates: path for local builds, version for crates.io publishing.
+omoplata-algebra = { path = "crates/omoplata-algebra", version = "0.1.0" }
+omoplata-drivers = { path = "crates/omoplata-drivers", version = "0.1.0" }
+omoplata-git = { path = "crates/omoplata-git", version = "0.1.0" }
+omoplata-identity = { path = "crates/omoplata-identity", version = "0.1.0" }
+omoplata-sem = { path = "crates/omoplata-sem", version = "0.1.0" }
+omoplata-store = { path = "crates/omoplata-store", version = "0.1.0" }
+omoplata-work = { path = "crates/omoplata-work", version = "0.1.0" }

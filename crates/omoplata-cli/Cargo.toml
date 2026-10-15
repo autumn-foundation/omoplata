@@ -19,13 +19,13 @@ fastembed = ["omoplata-sem/fastembed"]
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
-omoplata-store = { path = "../omoplata-store" }
-omoplata-algebra = { path = "../omoplata-algebra" }
-omoplata-drivers = { path = "../omoplata-drivers" }
-omoplata-git = { path = "../omoplata-git" }
-omoplata-identity = { path = "../omoplata-identity" }
-omoplata-sem = { path = "../omoplata-sem" }
-omoplata-work = { path = "../omoplata-work" }
+omoplata-store = { workspace = true }
+omoplata-algebra = { workspace = true }
+omoplata-drivers = { workspace = true }
+omoplata-git = { workspace = true }
+omoplata-identity = { workspace = true }
+omoplata-sem = { workspace = true }
+omoplata-work = { workspace = true }
 tempfile = "3"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,5 +37,5 @@ predicates = "3"
 tempfile = "3"
 # Used by the concurrency stress test to load and assert on the op log written
 # by the spawned `omo` child processes.
-omoplata-store = { path = "../omoplata-store" }
-omoplata-work = { path = "../omoplata-work" }
+omoplata-store = { workspace = true }
+omoplata-work = { workspace = true }

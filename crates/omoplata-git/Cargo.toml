@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
-omoplata-store = { path = "../omoplata-store" }
+omoplata-store = { workspace = true }
 flate2 = "1"
 sha1 = "0.10"
 

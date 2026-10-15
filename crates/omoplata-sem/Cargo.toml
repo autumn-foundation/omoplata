@@ -14,5 +14,5 @@ fastembed = ["dep:fastembed"]
 
 [dependencies]
 thiserror = { workspace = true }
-omoplata-identity = { path = "../omoplata-identity" }
+omoplata-identity = { workspace = true }
 fastembed = { version = "5", optional = true }
